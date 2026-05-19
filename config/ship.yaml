@@ -1,0 +1,58 @@
+# 战舰世界副炮流Bot - 船只配置
+# 启动时选择加载哪个船
+
+# === 波美拉尼亚 (Pommern) - 德系BB ===
+pommern:
+  name: "Pommern"
+  type: "BB"
+  nation: "german"
+  has_torpedoes: true
+  has_smoke: false
+
+  main_gun:
+    reload: 26          # 主炮装填秒数
+    range: 24           # 主炮射程km
+    shell_speed: 800    # 炮弹速度m/s (用于提前量)
+
+  secondary:
+    range: 11.5         # 副炮射程km (满配)
+    reload: 3           # 副炮装填秒数
+
+  torpedo:
+    range: 6            # 鱼雷射程km
+    reload: 90          # 鱼雷装填秒数
+
+  navigation:
+    speed: 30           # 最高航速节
+
+  strategy:
+    secondary_lock_distance: 12000   # 进入副炮射程就锁定 (米)
+    torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
+    torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
+    main_gun_shoot_threshold: 0.8    # 准心偏移容差
+
+# === 那不勒斯 (Napoli) - 意系巡洋 ===
+napoli:
+  name: "Napoli"
+  type: "CA"
+  nation: "italian"
+  has_torpedoes: false
+  has_smoke: true
+
+  main_gun:
+    reload: 16          # 主炮装填秒数
+    range: 18           # 主炮射程km
+    shell_speed: 900    # 炮弹速度m/s
+
+  secondary:
+    range: 12           # 副炮射程km (满配)
+    reload: 2.5         # 副炮装填秒数
+
+  navigation:
+    speed: 36           # 最高航速节
+
+  strategy:
+    secondary_lock_distance: 12000
+    main_gun_shoot_threshold: 0.8
+    torpedo_avoid_distance: 3000
+    smoke_threshold: 0.5    # 血量<50%放烟
