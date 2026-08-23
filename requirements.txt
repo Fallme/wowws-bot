@@ -1,7 +1,8 @@
 mss>=9.0.0
 opencv-python>=4.8.0
 numpy>=1.24.0
-pydirectinput>=1.0.4
 vgamepad>=0.1.0
 pyyaml>=6.0
-paddleocr>=2.7.0
+pywin32>=306
+rapidocr==3.8.1
+onnxruntime-gpu[cuda,cudnn]==1.29.0

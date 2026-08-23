@@ -1,0 +1,36 @@
+# 副炮船弹道数据 (简化)
+# 仅包含副炮相关参数，主炮弹道不在本项目范围内
+{
+  "secondary_ballistics": {
+    "german_150mm": {
+      "shell_speed_mps": 875,
+      "max_range_km": 11.3,
+      "reload_sec": 4.0,
+      "salvo_size": 6,
+      "dispersion_10km_m": 120,
+      "he_damage": 1700,
+      "he_penetration_mm": 38,
+      "he_fire_chance": 0.05
+    },
+    "french_130mm": {
+      "shell_speed_mps": 800,
+      "max_range_km": 8.0,
+      "reload_sec": 5.0,
+      "salvo_size": 3,
+      "dispersion_8km_m": 90,
+      "he_damage": 1500,
+      "he_penetration_mm": 22,
+      "he_fire_chance": 0.06
+    },
+    "italian_135mm": {
+      "shell_speed_mps": 820,
+      "max_range_km": 8.0,
+      "reload_sec": 5.0,
+      "salvo_size": 3,
+      "dispersion_8km_m": 95,
+      "sap_damage": 2100,
+      "sap_penetration_mm": 70,
+      "he_fire_chance": 0.01
+    }
+  }
+}

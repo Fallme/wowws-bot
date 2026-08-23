@@ -4,6 +4,7 @@
 # === 波美拉尼亚 (Pommern) - 德系BB ===
 pommern:
   name: "Pommern"
+  display_name: "波美拉尼亚"
   type: "BB"
   nation: "german"
   has_torpedoes: true
@@ -15,7 +16,7 @@ pommern:
     shell_speed: 800    # 炮弹速度m/s (用于提前量)
 
   secondary:
-    range: 11.5         # 副炮射程km (满配)
+    range: 11.4         # 副炮射程km (满配)
     reload: 3           # 副炮装填秒数
 
   torpedo:
@@ -26,7 +27,43 @@ pommern:
     speed: 30           # 最高航速节
 
   strategy:
-    secondary_lock_distance: 12000   # 进入副炮射程就锁定 (米)
+    # 真实公里距离由敌舰标签 OCR 提供；以下为波美拉尼亚实距状态带。
+    preferred_side: 1                 # 1=right orbit, -1=left orbit
+    opening_seconds: 55
+    disengage_health: 0.28              # 兼容字段；站点逻辑不再因低血量主动掉头
+    brake_start_distance_km: 13.0
+    ideal_outer_distance_km: 11.2
+    ideal_inner_distance_km: 7.0
+    too_close_distance_km: 4.5
+    distance_ocr_min_confidence: 0.78
+    distance_stable_frames: 2
+    distance_maximum_spread_km: 0.45
+    distance_stale_seconds: 5.0
+    distance_ocr_interval_seconds: 0.18
+    # OCR 暂时不可用时按小地图每格 5 km 换算，不再使用经验比例猜距。
+    secondary_enter_distance: 0.18   # 兼容旧事件回放
+    ideal_outer_distance: 0.15       # 兼容旧事件回放
+    ideal_inner_distance: 0.10       # 兼容旧事件回放
+    too_close_distance: 0.07         # 兼容旧事件回放
+    island_warning_distance: 0.040   # 约 2.8 km，只在前向航路冲突时绕行
+    island_emergency_distance: 0.020 # 约 1.4 km，允许短暂倒车脱困
+    capture_throttle: 0.36           # 进入中央占领点后约 1/2 航速留点
+    enemy_steering_weight: 0.28      # 圈外敌人仅占航向修正的 28%
+    center_steering_gain: 1.35       # 中央点航向控制增益
+    straight_opening_seconds: 4.0    # 先建立短航迹，随后立即转向中央点
+    enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
+    manual_intervention_pause_seconds: 5.0
+    manual_intervention_latch_seconds: 15.0
+    secondary_target_distance_km: 10.0
+    secondary_inner_distance_km: 7.0
+    capture_zone_match_ratio: 0.08
+    capture_arrival_distance_km: 4.5
+    course_minimum_travel_pixels: 5.0
+    post_battle_grace_seconds: 900
+    damage_control_cooldown_seconds: 80
+    heal_threshold: 0.50
+    heal_cooldown_seconds: 80
+    heal_max_uses: 3
     torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
     torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
     main_gun_shoot_threshold: 0.8    # 准心偏移容差
@@ -34,6 +71,7 @@ pommern:
 # === 那不勒斯 (Napoli) - 意系巡洋 ===
 napoli:
   name: "Napoli"
+  display_name: "那不勒斯"
   type: "CA"
   nation: "italian"
   has_torpedoes: false
@@ -45,14 +83,49 @@ napoli:
     shell_speed: 900    # 炮弹速度m/s
 
   secondary:
-    range: 12           # 副炮射程km (满配)
+    range: 10.5         # 副炮射程km (满配)
     reload: 2.5         # 副炮装填秒数
 
   navigation:
     speed: 36           # 最高航速节
 
   strategy:
-    secondary_lock_distance: 12000
+    preferred_side: -1
+    opening_seconds: 48
+    disengage_health: 0.24              # 兼容字段；站点逻辑不再因低血量主动掉头
+    brake_start_distance_km: 13.5
+    ideal_outer_distance_km: 11.7
+    ideal_inner_distance_km: 7.5
+    too_close_distance_km: 4.8
+    distance_ocr_min_confidence: 0.78
+    distance_stable_frames: 2
+    distance_maximum_spread_km: 0.45
+    distance_stale_seconds: 5.0
+    distance_ocr_interval_seconds: 0.18
+    secondary_enter_distance: 0.18
+    ideal_outer_distance: 0.15
+    ideal_inner_distance: 0.10
+    too_close_distance: 0.07
+    island_warning_distance: 0.040
+    island_emergency_distance: 0.020
+    capture_throttle: 0.36
+    enemy_steering_weight: 0.28
+    center_steering_gain: 1.35
+    straight_opening_seconds: 4.0
+    enable_minimap_torpedo_evasion: true
+    manual_intervention_pause_seconds: 5.0
+    manual_intervention_latch_seconds: 15.0
+    secondary_target_distance_km: 10.0
+    secondary_inner_distance_km: 7.0
+    capture_zone_match_ratio: 0.08
+    capture_arrival_distance_km: 4.5
+    course_minimum_travel_pixels: 5.0
+    post_battle_grace_seconds: 900
+    damage_control_cooldown_seconds: 80
+    heal_threshold: 0.55
+    heal_cooldown_seconds: 80
+    heal_max_uses: 3
+    auto_smoke: true
     main_gun_shoot_threshold: 0.8
     torpedo_avoid_distance: 3000
     smoke_threshold: 0.5    # 血量<50%放烟

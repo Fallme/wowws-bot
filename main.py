@@ -1,424 +1,822 @@
-"""战舰世界副炮流Bot v3 - 完全自动后台挂机
-完全不抢焦点、不移动鼠标、不干扰正常工作。
-使用 PostMessage 后台点击 + 虚拟手柄战斗控制。
-"""
+"""World of Warships bot entry point and high-level lifecycle."""
 
-import sys
-import time
-import yaml
-import logging
 import ctypes
+import logging
+import os
+import time
+from pathlib import Path
 
-# === DPI 感知 (必须最早设置) ===
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
-
-import mss
-import cv2
-import numpy as np
-import vgamepad as vg
-import win32gui
-import win32con
-from core.window import find_game_window
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("wowws_bot.log", encoding="utf-8"),
-    ],
+from bot import BattleBot
+from config_loader import load_ship_config, ship_key_from_env
+from core.calibration import (
+    AUTOMATIC_PREFLIGHT_KEY,
+    CalibrationStore,
+    InputCalibration,
 )
-logger = logging.getLogger("bot")
+from core.input import configured_input_backend
+from core.feedback import SafetyFault
+from core.frame_guard import CaptureFault
+from core.launcher import launch_game
+from core.results import BattleRewards, ResultRewardReader
+from core.ui import ScreenState
+from core.window import activate_window, find_game_window, get_window_rect, physical_click
+from port_navigator import (
+    confirm_no_commander,
+    enter_battle,
+    ensure_requested_mode,
+    handle_post_battle,
+    queue_next_battle,
+    select_requested_ship,
+)
+from runtime_control import RunLimits, RuntimeReporter
+
+BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger("runner")
 
 
-def load_config(path, key):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)[key]
-
-
-# ==================== 后台点击 (PostMessage) ====================
-
-def bg_click(hwnd, rel_x, rel_y):
-    """后台发送点击消息 - 不移动鼠标、不抢焦点"""
-    lparam = (int(rel_y) << 16) | (int(rel_x) & 0xFFFF)
+def configure_dpi_awareness():
+    """Enable physical-pixel window coordinates before capture begins."""
     try:
-        ctypes.windll.user32.PostMessageW(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
-        time.sleep(0.05)
-        ctypes.windll.user32.PostMessageW(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            logger.debug("Unable to enable DPI awareness", exc_info=True)
+
+
+def configure_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(BASE_DIR / "wowws_bot.log", encoding="utf-8"),
+        ],
+    )
+
+
+def wait_for_game_window(timeout: float = 60.0, poll_interval: float = 1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        windows = find_game_window()
+        if windows:
+            return windows[0]
+        time.sleep(poll_interval)
+    return None
+
+
+def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
+    """Wait through login/splash/loading until an actionable screen is visible."""
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    last_state = ScreenState.UNKNOWN
+    while time.monotonic() < deadline:
+        try:
+            image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        except CaptureFault as error:
+            logger.info("游戏仍在启动，画面暂不可用: %s", error)
+            time.sleep(2)
+            continue
+        last_state = bot.vision.classify_screen(image)
+        if last_state in {
+            ScreenState.PORT,
+            ScreenState.BATTLE,
+            ScreenState.RESULTS,
+        }:
+            return image, last_state
+        time.sleep(2)
+    return None, last_state
+
+
+def automatic_input_preflight(bot, title, rect, screen_state, store=None):
+    """Safely validate capture, focus and input dispatch before matchmaking.
+
+    No combat action is sent in port.  We release all movement keys and verify
+    that the same game window remains capturable.  Actual throttle acceptance
+    is then verified by the existing closed-loop minimap feedback in battle.
+    """
+    store = store or CalibrationStore()
+    if screen_state not in {ScreenState.PORT, ScreenState.BATTLE, ScreenState.RESULTS}:
+        raise SafetyFault(f"自动自检无法确认当前游戏界面: {screen_state.value}")
+    if not activate_window(bot.hwnd):
+        raise SafetyFault("无法激活游戏窗口，输入自检未通过")
+    time.sleep(0.4)
+    bot.gamepad.stop()
+    verification_frame = bot.vision.grab(bot.hwnd)
+    verified_state = bot.vision.classify_screen(verification_frame)
+    if verified_state == ScreenState.UNKNOWN:
+        raise SafetyFault("输入释放后无法确认游戏画面，自动自检未通过")
+
+    window_size = [rect[2] - rect[0], rect[3] - rect[1]]
+    capture_backend = getattr(bot.vision.screen_capture, "last_backend", "unknown")
+    record = InputCalibration(
+        backend=configured_input_backend(),
+        game_title=title,
+        resolution=window_size,
+        observations={
+            AUTOMATIC_PREFLIGHT_KEY: {
+                "passed": True,
+                "screen": verified_state.value,
+                "capture_backend": capture_backend,
+                "input_check": "safe_release_dispatched",
+                "battle_feedback": "required",
+                "source": "automatic_runtime_preflight",
+            }
+        },
+    )
+    status = store.save(record)
+    if not status.valid:
+        raise SafetyFault(f"自动自检记录校验失败: {status.reason}")
+    return status
+
+
+def wait_while_loading(bot: BattleBot, timeout: float = 120.0, should_stop=None):
+    deadline = time.monotonic() + timeout
+    image = bot.vision.grab(bot.hwnd, allow_stale=True)
+    while (
+        bot.vision.classify_screen(image) == ScreenState.LOADING
+        and time.monotonic() < deadline
+    ):
+        if should_stop and should_stop():
+            break
+        time.sleep(2)
+        image = bot.vision.grab(bot.hwnd, allow_stale=True)
+    return image
+
+
+def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
+    """Normalize the current menu state and request matchmaking."""
+    logger.info("检查当前界面")
+    time.sleep(1)
+    image = wait_while_loading(bot, should_stop=should_stop)
+    if should_stop and should_stop():
+        return False
+    state = bot.vision.classify_screen(image)
+
+    if state == ScreenState.BATTLE:
+        logger.info("已处于战斗 HUD，直接接管当前战斗")
+        return True
+
+    if state == ScreenState.RESULTS:
+        logger.info("检测到结算界面，按状态导航返回港口")
+        handle_post_battle(bot.hwnd, vision=bot.vision)
+        time.sleep(2)
+        # Result and port screens can legitimately remain pixel-identical for
+        # several seconds; freshness is only a combat safety requirement.
+        image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        state = bot.vision.classify_screen(image)
+
+    if state != ScreenState.PORT:
+        logger.warning("当前界面为 %s，等待下一轮识别", state.value)
+        return False
+
+    logger.info("已确认港口，准备点击“加入战斗”")
+    activate_window(bot.hwnd)
+    time.sleep(1)
+    if configure_port:
+        ship_key = os.environ.get("WOWS_SHIP", "pommern")
+        mode = os.environ.get("WOWS_MODE", "asymmetric")
+        if not select_requested_ship(bot.hwnd, ship_key, vision=bot.vision):
+            logger.warning("未能安全选择目标舰船")
+            return False
+        if not ensure_requested_mode(bot.hwnd, mode, vision=bot.vision):
+            logger.warning("未能安全选择目标战斗模式")
+            return False
+    if not enter_battle(bot.hwnd, vision=bot.vision, configure_port=False):
+        logger.warning("未能安全定位“加入战斗”按钮")
+        return False
+    time.sleep(5)
+    return True
+
+
+def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
+    logger.info("等待战斗 HUD")
+    deadline = time.monotonic() + timeout
+    commander_confirmed = False
+    last_state = None
+    last_activation = 0.0
+    while time.monotonic() < deadline:
+        if should_stop and should_stop():
+            return False
+        now = time.monotonic()
+        if (
+            now - last_activation >= 2.0
+            and int(ctypes.windll.user32.GetForegroundWindow() or 0) != bot.hwnd
+        ):
+            activate_window(bot.hwnd)
+            note_activity = getattr(
+                getattr(bot, "gamepad", None),
+                "note_automation_activity",
+                None,
+            )
+            if note_activity is not None:
+                note_activity()
+            last_activation = now
+        time.sleep(0.20)
+        image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        state = bot.vision.classify_screen(image)
+        if state != last_state:
+            logger.info(
+                "等待战斗识别: %s | 截图=%s",
+                state.value,
+                getattr(
+                    getattr(bot.vision, "screen_capture", None),
+                    "last_backend",
+                    "unknown",
+                ),
+            )
+            last_state = state
+        if state == ScreenState.BATTLE:
+            logger.info("战斗 HUD 首帧已确认，立即接管移动")
+            return True
+        if (
+            state == ScreenState.UNKNOWN
+            and not commander_confirmed
+            and confirm_no_commander(bot.hwnd, image, bot.vision)
+        ):
+            commander_confirmed = True
+            time.sleep(0.25)
+            continue
+    logger.warning("等待战斗开始超时")
+    return False
+
+
+def run_battle(bot: BattleBot, should_stop=None, progress=None):
+    bot.reset()
+    activate_window(bot.hwnd)
+    autopilot_set = configure_opening_autopilot(bot)
+    if not autopilot_set:
+        reassert = getattr(bot.gamepad, "reassert_full_speed", None)
+        if reassert is not None:
+            reassert()
+        else:
+            bot.gamepad.full_speed()
+    # Seed intervention monitoring after our focus and initial throttle input,
+    # otherwise the opening Alt/W events can be mistaken for player control.
+    intervention = getattr(bot, "intervention", None)
+    if intervention is not None:
+        intervention.reset()
+    if autopilot_set:
+        logger.info("进入战斗，已交由游戏自动航行驶向中央点位")
+    else:
+        bot.last_movement_reason = "自动航行设置失败，四档全速直行"
+        logger.warning("战术地图自动航行设置失败，临时使用四档全速直行")
+    last_progress = 0.0
+    last_activation = time.monotonic()
+    while bot.combat_tick() != "ended":
+        if should_stop and should_stop():
+            logger.info("收到停止请求，终止当前控制")
+            return False
+        now = time.monotonic()
+        if (
+            now - last_activation >= 5.0
+            and bot.current_movement_mode != "manual_pause"
+            and int(ctypes.windll.user32.GetForegroundWindow() or 0) != bot.hwnd
+        ):
+            activate_window(bot.hwnd)
+            note_activity = getattr(bot.gamepad, "note_automation_activity", None)
+            if note_activity is not None:
+                note_activity()
+            last_activation = now
+        if progress and now - last_progress >= 1.0:
+            progress(bot)
+            last_progress = now
+        time.sleep(0.3)
+    logger.info("战斗结束")
+    return True
+
+
+def tactical_map_local_point(
+    width: int,
+    height: int,
+    normalized_target: tuple[float, float],
+) -> tuple[int, int]:
+    """Map minimap-normalized coordinates onto the centred tactical map."""
+    map_size = min(float(width), float(height)) * 0.94
+    left = (float(width) - map_size) / 2.0
+    top = (float(height) - map_size) / 2.0
+    target_x = max(0.05, min(float(normalized_target[0]), 0.95))
+    target_y = max(0.05, min(float(normalized_target[1]), 0.95))
+    return (
+        int(round(left + target_x * map_size)),
+        int(round(top + target_y * map_size)),
+    )
+
+
+def configure_opening_autopilot(bot: BattleBot) -> bool:
+    """Set one game-native autopilot destination on the tactical map."""
+    toggle_map = getattr(bot.gamepad, "toggle_tactical_map", None)
+    enable = getattr(bot, "enable_opening_autopilot", None)
+    if toggle_map is None or enable is None or not hasattr(bot, "vision"):
+        return False
+    try:
+        image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        if bot.vision.classify_screen(image) != ScreenState.BATTLE:
+            return False
+        height, width = image.shape[:2]
+        normalized_target = (0.5, 0.5)
+        target_label = "地图中心"
+        minimap = bot.vision.find_minimap(image)
+        if minimap is not None:
+            zone = bot.vision.find_central_capture_zone(minimap)
+            if zone is not None:
+                normalized_target = (
+                    zone.center[0] / max(minimap.shape[1], 1),
+                    zone.center[1] / max(minimap.shape[0], 1),
+                )
+                target_label = "中央占领点"
+        local_x, local_y = tactical_map_local_point(
+            width,
+            height,
+            normalized_target,
+        )
+        toggle_map()
+        time.sleep(0.65)
+        rect = get_window_rect(bot.hwnd)
+        if not physical_click(
+            rect["left"] + local_x,
+            rect["top"] + local_y,
+            extra_delay=0.1,
+        ):
+            toggle_map()
+            return False
+        time.sleep(0.35)
+        toggle_map()
+        time.sleep(0.35)
+        enable(target_label)
+        logger.info(
+            "[SYSTEM] 战术地图自动航行: %s | local=(%s,%s)",
+            target_label,
+            local_x,
+            local_y,
+        )
         return True
     except Exception:
+        logger.exception("设置战术地图自动航行失败")
+        try:
+            toggle_map()
+        except Exception:
+            pass
         return False
 
 
-def bg_click_center(hwnd):
-    """点击窗口中心 (用于'继续'按钮)"""
-    ct = ctypes.wintypes.RECT()
-    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(ct))
-    cx = ct.right // 2
-    cy = ct.bottom // 2
-    return bg_click(hwnd, cx, cy)
+def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 12):
+    """Read rewards before any result-page navigation occurs."""
+    if bot.distance_ocr_service is not None:
+        bot.distance_ocr_service.close()
+    fallback = BattleRewards(
+        provider=str(getattr(reader.backend, "execution_provider", "custom"))
+    )
+    for attempt in range(max(1, attempts)):
+        if attempt == 0 and bot.last_analysis is not None:
+            image = bot.last_analysis.image
+        else:
+            time.sleep(0.5)
+            image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        if bot.vision.classify_screen(image) != ScreenState.RESULTS:
+            continue
+        rewards = reader.read(image)
+        fallback = rewards
+        if rewards.recognized:
+            return rewards
+    return fallback
 
 
-def bg_click_top_center(hwnd):
-    """点击窗口顶部中间 (用于'加入战斗'按钮)"""
-    ct = ctypes.wintypes.RECT()
-    ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(ct))
-    cx = ct.right // 2
-    return bg_click(hwnd, cx, 37)
-
-
-# ==================== 虚拟手柄 ====================
-
-class Gamepad:
-    def __init__(self):
-        self.gp = vg.VX360Gamepad()
-        self._lx = 0.0
-        self._ly = 0.0
-
-    def _update(self):
-        self.gp.left_joystick(x_value=int(self._lx * 32767),
-                               y_value=int(self._ly * 32767))
-        self.gp.update()
-
-    def steer_left(self, a=0.7):
-        self._lx = -a; self._update()
-
-    def steer_right(self, a=0.7):
-        self._lx = a; self._update()
-
-    def straight(self):
-        self._lx = 0.0; self._update()
-
-    def full_speed(self):
-        self._ly = 1.0; self._update()
-
-    def stop(self):
-        self._lx = 0.0; self._ly = 0.0; self._update()
-
-    def fire(self):
-        self.gp.right_trigger(value=255); self.gp.update()
-        time.sleep(0.1)
-        self.gp.right_trigger(value=0); self.gp.update()
-
-    def lock(self):
-        self.gp.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-        time.sleep(0.1)
-        self.gp.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-        self.gp.update()
-
-    def torpedo(self):
-        self.gp.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-        time.sleep(0.1)
-        self.gp.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-        self.gp.update()
-
-    def smoke(self):
-        self.gp.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-        time.sleep(0.1)
-        self.gp.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-        self.gp.update()
-
-
-# ==================== 截图分析 ====================
-
-class Vision:
-    def __init__(self):
-        self.sct = mss.MSS()
-        self.red_lo1 = np.array([0, 120, 100])
-        self.red_hi1 = np.array([10, 255, 255])
-        self.red_lo2 = np.array([160, 120, 100])
-        self.red_hi2 = np.array([180, 255, 255])
-        self.yellow_lo = np.array([15, 100, 100])
-        self.yellow_hi = np.array([35, 255, 255])
-        self.green_lo = np.array([35, 100, 100])
-        self.green_hi = np.array([85, 255, 255])
-
-    def grab(self, hwnd):
-        """后台截图 - 不移动窗口、不抢焦点"""
-        ct = ctypes.wintypes.RECT()
-        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(ct))
-        mon = {"left": ct.left, "top": ct.top,
-               "width": ct.right - ct.left, "height": ct.bottom - ct.top}
-        return np.array(self.sct.grab(mon))[:, :, :3]
-
-    def find_enemies(self, minimap):
-        hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.red_lo1, self.red_hi1) | \
-               cv2.inRange(hsv, self.red_lo2, self.red_hi2)
-        k = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        result = []
-        for c in cnts:
-            if cv2.contourArea(c) < 15:
-                continue
-            M = cv2.moments(c)
-            if M["m00"] == 0:
-                continue
-            result.append((int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])))
-        return result
-
-    def has_torpedoes(self, minimap):
-        hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.yellow_lo, self.yellow_hi)
-        k = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return any(cv2.contourArea(c) > 50 for c in cnts)
-
-    def reload_ready(self, area):
-        if area is None or area.size == 0:
+def return_to_port(bot: BattleBot, attempts: int = 5):
+    logger.info("等待结算并返回港口")
+    for attempt in range(1, attempts + 1):
+        image = bot.vision.grab(bot.hwnd, allow_stale=True)
+        state = bot.vision.classify_screen(image)
+        if state == ScreenState.PORT:
+            logger.info("已返回港口")
+            return True
+        logger.info("返回港口检查 (%s/%s): %s", attempt, attempts, state.value)
+        if state == ScreenState.RESULTS:
+            handle_post_battle(bot.hwnd, vision=bot.vision)
+        elif state in {ScreenState.ESCAPE_MENU, ScreenState.EXIT_CONFIRMATION}:
+            handle_post_battle(bot.hwnd, vision=bot.vision, max_steps=1)
             return False
-        hsv = cv2.cvtColor(area, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.green_lo, self.green_hi)
-        total = mask.shape[0] * mask.shape[1]
-        return (np.count_nonzero(mask) / max(total, 1)) > 0.3
+        time.sleep(3)
+    logger.warning("未能确认已返回港口；未执行盲点操作")
+    return False
 
-    def health_pct(self, area):
-        if area is None or area.size == 0:
-            return 0.5
-        hsv = cv2.cvtColor(area, cv2.COLOR_BGR2HSV)
-        mask = (cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255])) |
-                cv2.inRange(hsv, np.array([100, 50, 50]), np.array([130, 255, 255])) |
-                cv2.inRange(hsv, np.array([0, 50, 100]), np.array([20, 255, 255])))
-        filled = np.count_nonzero(np.sum(mask > 0, axis=0))
-        return min(filled / max(mask.shape[1], 1), 1.0)
 
-    def battle_ended(self, img):
-        h, w = img.shape[:2]
-        c = img[h // 3:2 * h // 3, w // 3:2 * w // 3]
-        gray = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
-        _, b = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        return (np.count_nonzero(b) / max(b.size, 1)) > 0.08
-
-    def in_battle(self, img):
-        """检测是否在战斗中 (小地图有内容 + 整体不是菜单)"""
-        h, w = img.shape[:2]
-        mm = img[max(0, h - 300):h - 20, max(0, w - 300):w - 20]
-        if mm.size == 0:
+def wait_for_web_resume(limits, reporter, *, resume_state="preparing"):
+    """Freeze workflow actions while preserving the exact lifecycle step."""
+    if not limits.pause_requested():
+        return True
+    logger.info("[USER] 网页手动暂停；保留当前流程位置和舰船操纵状态")
+    reporter.update(
+        "paused",
+        "网页已暂停，不再下发新系统指令",
+        paused_by_user=True,
+        manual_intervention_latched=True,
+        movement_mode="manual_pause",
+        movement_reason="保持现有船速与舵位，等待网页继续",
+    )
+    while limits.pause_requested():
+        if limits.stop_requested():
             return False
-        # 小地图标准差 > 25 说明有内容
-        return mm.std() > 25
-
-    def in_port(self, img):
-        """检测是否在港口 (看顶部是否有橙色战斗按钮)"""
-        h, w = img.shape[:2]
-        top = img[0:80, w // 2 - 200:w // 2 + 200]
-        hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([5, 100, 150]), np.array([25, 255, 255]))
-        return np.count_nonzero(mask) > 500
-
-
-# ==================== 主 Bot ====================
-
-class Bot:
-    def __init__(self, hwnd, ship_cfg):
-        self.hwnd = hwnd
-        self.ship = ship_cfg
-        self.vision = Vision()
-        self.gp = Gamepad()
-        self.strategy = ship_cfg.get("strategy", {})
-
-        # 状态
-        self.smoke_used = False
-        self.last_fire = 0
-        self.last_lock = 0
-        self.torpedo_evade_until = 0
-        self.tick = 0
-
-    def reset(self):
-        self.smoke_used = False
-        self.last_fire = 0
-        self.last_lock = 0
-        self.torpedo_evade_until = 0
-        self.tick = 0
-        self.gp.stop()
-
-    def analyze(self):
-        img = self.vision.grab(self.hwnd)
-        h, w = img.shape[:2]
-        s = {"img": img, "h": h, "w": w, "enemies": [], "torps": False,
-             "reload": False, "hp": 0.5, "ended": False, "in_battle": False}
-
-        # 小地图
-        mm = img[max(0, h - 300):h - 20, max(0, w - 300):w - 20]
-        if mm.size > 0:
-            s["enemies"] = self.vision.find_enemies(mm)
-            s["torps"] = self.vision.has_torpedoes(mm)
-
-        # 装填条
-        rl = img[h - 130:h - 100, w // 2 - 200:w // 2 + 200]
-        s["reload"] = self.vision.reload_ready(rl)
-
-        # 血条
-        hp = img[h - 170:h - 140, w // 2 - 250:w // 2 + 250]
-        s["hp"] = self.vision.health_pct(hp)
-
-        # 战斗结束
-        s["ended"] = self.vision.battle_ended(img) and self.tick > 5
-        s["in_battle"] = self.vision.in_battle(img)
-
-        return s
-
-    def combat_tick(self):
-        s = self.analyze()
-        h, w, now = s["h"], s["w"], time.time()
-
-        if s["ended"]:
-            return "ended"
-
-        # 鱼雷规避
-        if s["torps"] and now > self.torpedo_evade_until:
-            logger.info("规避鱼雷!")
-            self.gp.steer_left(0.9)
-            time.sleep(1.0)
-            self.gp.steer_right(0.9)
-            time.sleep(0.8)
-            self.gp.straight()
-            self.torpedo_evade_until = now + 3
-
-        # 全速
-        self.gp.full_speed()
-
-        # 找最近敌人并转向
-        enemies = s["enemies"]
-        if enemies:
-            cx, cy = w // 2, h // 2
-            nearest = min(enemies, key=lambda e: ((e[0] - cx) ** 2 + (e[1] - cy) ** 2) ** 0.5)
-            dx = nearest[0] - cx
-            if abs(dx) > 40:
-                amt = min(abs(dx) / 250, 1.0)
-                (self.gp.steer_right if dx > 0 else self.gp.steer_left)(amt)
-            else:
-                self.gp.straight()
-
-            # 副炮锁定 (3秒一次)
-            if now - self.last_lock > 3:
-                self.gp.lock()
-                self.last_lock = now
-                logger.info(f"[{self.tick:03d}] 副炮锁定")
-
-            # 主炮射击
-            if s["reload"] and now - self.last_fire > 2:
-                self.gp.fire()
-                self.last_fire = now
-                logger.info(f"[{self.tick:03d}] 主炮开火!")
-
-        # 烟雾 (只放一次)
-        smoke_thr = self.strategy.get("smoke_threshold", 0.5)
-        if self.ship.get("has_smoke") and not self.smoke_used and 0 < s["hp"] < smoke_thr:
-            self.gp.smoke()
-            self.smoke_used = True
-            logger.info(f"释放烟雾 (HP: {s['hp']:.0%})")
-
-        # 鱼雷 (Pommern)
-        if self.ship.get("has_torpedoes") and s["reload"] and now - self.last_fire > 3:
-            self.gp.torpedo()
-            logger.info("鱼雷发射!")
-
-        logger.info(f"[{self.tick:03d}] HP:{s['hp']:.0%} 装填:{'OK' if s['reload'] else '中'} "
-                     f"敌人:{len(enemies)} 鱼雷:{'有' if s['torps'] else '无'}")
-        self.tick += 1
-        return "combat"
+        time.sleep(0.15)
+    logger.info("[SYSTEM] 网页继续，立即重新识别当前画面并接续原流程")
+    reporter.update(
+        resume_state,
+        "正在快速识别当前状态并继续原操作",
+        paused_by_user=False,
+        manual_intervention_latched=False,
+    )
+    return True
 
 
-def main():
-    ship_key = "napoli"
-    ship_cfg = load_config("config/ship.yaml", ship_key)
-    logger.info(f"船: {ship_cfg['name']} | 副炮射程: {ship_cfg['secondary']['range']}km")
-    logger.info(f"有烟雾: {ship_cfg.get('has_smoke', False)}")
-    logger.info("Bot v3 - 完全自动后台挂机模式")
+def run():
+    configure_dpi_awareness()
+    configure_logging()
 
-    # 等待游戏窗口
-    logger.info("搜索战舰世界窗口...")
-    windows = None
-    for _ in range(60):
-        windows = find_game_window()
-        if windows:
-            break
-        time.sleep(1)
+    ship_key = ship_key_from_env()
+    ship_config = load_ship_config(ship_key)
+    mode = os.environ.get("WOWS_MODE", "asymmetric").strip().lower() or "asymmetric"
+    if mode not in {"asymmetric", "cooperative"}:
+        logger.error("不支持的战斗模式: %s", mode)
+        return 1
+    limits = RunLimits.from_env()
+    reporter = RuntimeReporter(limits, ship=ship_key, mode=mode)
+    logger.info(
+        "舰船: %s | 副炮射程: %skm",
+        ship_config["name"],
+        ship_config["secondary"]["range"],
+    )
+    logger.info("搜索战舰世界窗口")
+    reporter.update("starting", "正在搜索游戏窗口")
+    window = wait_for_game_window(timeout=2)
+    if window is None:
+        result = launch_game()
+        if not result.started:
+            logger.error("无法自动启动游戏: %s", result.detail)
+            reporter.update(
+                "failed",
+                "无法自动启动游戏",
+                error="game_launch_failed",
+            )
+            return 1
+        logger.info("已请求自动启动游戏: %s (%s)", result.method, result.detail)
+        reporter.update("launching_game", "正在通过 Steam 启动战舰世界")
+        launch_timeout = float(os.environ.get("WOWS_GAME_LAUNCH_TIMEOUT", "300"))
+        window = wait_for_game_window(timeout=launch_timeout)
+    if window is None:
+        logger.error("未找到游戏窗口")
+        reporter.update("failed", "未找到游戏窗口", error="game_window_not_found")
+        return 1
 
-    if not windows:
-        logger.error("未找到游戏窗口!")
-        return
+    hwnd, title, rect = window
+    logger.info("找到游戏窗口: %s", title)
+    logger.info("窗口坐标: %s", rect)
+    activate_window(hwnd)
+    bot = BattleBot(hwnd, ship_config)
+    reward_reader = ResultRewardReader(bot.distance_reader.backend)
+    # Steam may expose the game window before login and port loading finish.
+    reporter.update("entering_game", "游戏已启动，正在等待港口界面")
+    screen_timeout = float(os.environ.get("WOWS_GAME_SCREEN_TIMEOUT", "300"))
+    initial_frame, initial_state = wait_for_recognized_screen(
+        bot,
+        timeout=screen_timeout,
+    )
+    if initial_state == ScreenState.UNKNOWN:
+        reporter.update(
+            "failed",
+            "启动前无法可靠识别游戏画面",
+            error="preflight_screen_unknown",
+            safety_state="blocked",
+            calibration_valid=True,
+        )
+        bot.stop()
+        return 2
 
-    hwnd, title = windows[0]
-    logger.info(f"找到游戏窗口: {title}")
-    bot = Bot(hwnd, ship_cfg)
+    reporter.update("preparing", "正在执行港口画面与输入自动自检")
+    try:
+        calibration = automatic_input_preflight(
+            bot,
+            title,
+            rect,
+            initial_state,
+        )
+    except (SafetyFault, CaptureFault) as error:
+        logger.error("自动自检失败: %s", error)
+        reporter.update(
+            "failed",
+            "自动自检失败，需要人工检查游戏窗口后重试",
+            error=str(error),
+            safety_state="blocked",
+            calibration_valid=False,
+        )
+        bot.stop()
+        return 2
+    capture_backend = getattr(bot.vision.screen_capture, "last_backend", "unknown")
+    reporter.update(
+        "preparing",
+        "自动自检通过，正在准备战斗",
+        calibration_valid=True,
+        frame_status="ok",
+        capture_backend=capture_backend,
+    )
+    logger.info("自动自检通过: %s | 捕获后端: %s", calibration.reason, capture_backend)
 
-    logger.info("=" * 50)
-    logger.info("Bot 就绪! 开始自动循环...")
-    logger.info("=" * 50)
+    logger.info("Bot 就绪，按 Ctrl+C 随时停止")
+    started_at = time.monotonic()
+    completed_rounds = 0
+    current_round = 0
+    port_configured = False
+    battle_already_ready = initial_state == ScreenState.BATTLE
+    preparation_failures = 0
+
+    def should_stop():
+        return limits.reached(completed_rounds, started_at)
+
+    def user_stop_requested():
+        return limits.stop_requested()
 
     try:
-        while True:
-            # === 阶段1: 在港口 -> 点击加入战斗 ===
-            logger.info("检查当前状态...")
-            img = bot.vision.grab(hwnd)
-            time.sleep(1)
-
-            # 检查是否在港口
-            if bot.vision.in_port(img):
-                logger.info("在港口，点击'加入战斗'...")
-                bg_click_top_center(hwnd)
-                time.sleep(3)
-                # 确认是否进入匹配 (按钮文字变化)
-                logger.info("等待匹配...")
-                time.sleep(5)
-
-            # === 阶段2: 等待战斗开始 ===
-            logger.info("等待战斗开始...")
-            start = time.time()
-            while time.time() - start < 180:  # 最多等3分钟
-                time.sleep(2)
-                img = bot.vision.grab(hwnd)
-                if bot.vision.in_battle(img):
-                    logger.info("战斗开始!")
-                    time.sleep(2)  # 等UI稳定
+        while not should_stop():
+            if not wait_for_web_resume(limits, reporter):
+                break
+            current_round = completed_rounds + 1
+            logger.info("=== 第 %s 局 ===", current_round)
+            reporter.update(
+                "preparing",
+                "正在准备下一局",
+                current_round=current_round,
+                completed_rounds=completed_rounds,
+            )
+            prepared = battle_already_ready
+            battle_already_ready = False
+            if not prepared:
+                prepared = prepare_battle(
+                    bot,
+                    should_stop=should_stop,
+                    configure_port=not port_configured,
+                ) and wait_for_battle(bot, should_stop=should_stop)
+            if not prepared:
+                if should_stop():
                     break
-            else:
-                logger.warning("等待超时，重试...")
+                preparation_failures += 1
+                if preparation_failures >= 5:
+                    logger.error("连续 %s 次准备失败，停止运行", preparation_failures)
+                    reporter.update(
+                        "failed",
+                        "连续准备失败，已安全停止",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        error="prepare_retry_limit_reached",
+                    )
+                    return 1
+                time.sleep(min(2 * preparation_failures, 8))
                 continue
+            preparation_failures = 0
+            port_configured = True
+            reporter.update(
+                "battle",
+                "战斗已开始，等待闭环反馈",
+                current_round=current_round,
+                completed_rounds=completed_rounds,
+                safety_state="armed",
+                calibration_valid=True,
+                movement_verified=False,
+            )
+            def report_battle_progress(active_bot):
+                quality = active_bot.vision.last_frame_quality
+                analysis = active_bot.last_analysis
+                reporter.update(
+                    "battle",
+                    "闭环控制已确认"
+                    if active_bot.movement_verified
+                    else "等待舰船位移反馈",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    safety_state="verified"
+                    if active_bot.movement_verified
+                    else "armed",
+                    calibration_valid=True,
+                    movement_verified=active_bot.movement_verified,
+                    frame_status=quality.reason if quality else "unknown",
+                    capture_backend=getattr(
+                        active_bot.vision.screen_capture,
+                        "last_backend",
+                        "unknown",
+                    ),
+                    target_distance_km=None
+                    if analysis is None
+                    else analysis.minimap_distance_km,
+                    distance_source="unknown"
+                    if analysis is None
+                    else "minimap_grid"
+                    if analysis.minimap_distance_km is not None
+                    else "unknown",
+                    minimap_distance_km=None
+                    if analysis is None
+                    else analysis.minimap_distance_km,
+                    distance_confidence=0.0
+                    if analysis is None
+                    else analysis.distance_confidence,
+                    target_track_id=""
+                    if analysis is None or analysis.target_track_id is None
+                    else analysis.target_track_id,
+                    ocr_status=active_bot.ocr_status,
+                    ocr_provider=active_bot.ocr_provider,
+                    movement_mode=active_bot.current_movement_mode,
+                    movement_reason=active_bot.last_movement_reason,
+                    capture_point_distance_km=None
+                    if analysis is None
+                    else analysis.capture_point_distance_km,
+                    inside_capture_point=False
+                    if analysis is None
+                    else analysis.inside_capture_point,
+                    route_phase="unplanned"
+                    if analysis is None
+                    else analysis.route_phase,
+                    route_progress=0.0
+                    if analysis is None
+                    else analysis.route_progress,
+                    route_waypoint=0
+                    if analysis is None
+                    else analysis.route_waypoint,
+                    route_arrived=False
+                    if analysis is None
+                    else analysis.route_arrived,
+                    manual_intervention_latched=(
+                        active_bot.manual_intervention_latched
+                    ),
+                    manual_intervention_seconds=(
+                        active_bot.manual_intervention_seconds
+                    ),
+                    stop_after_current=bool(
+                        limits.duration_seconds
+                        and time.monotonic() - started_at
+                        >= limits.duration_seconds
+                    ),
+                )
 
-            # === 阶段3: 战斗循环 ===
-            bot.reset()
-            logger.info("进入战斗!")
-
-            while True:
-                result = bot.combat_tick()
-                if result == "ended":
-                    logger.info("战斗结束!")
+            if not run_battle(
+                bot,
+                # A time limit is a soft boundary: finish the active battle.
+                # Only an explicit user stop interrupts combat immediately.
+                should_stop=user_stop_requested,
+                progress=report_battle_progress,
+            ):
+                if user_stop_requested():
+                    reporter.update(
+                        "stopped",
+                        "已按用户要求安全停止",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                    )
+                    return 0
+                break
+            if not wait_for_web_resume(
+                limits,
+                reporter,
+                resume_state="collecting_rewards",
+            ):
+                break
+            reporter.update(
+                "collecting_rewards",
+                "战斗结束，正在使用 OCR 统计本局收益",
+                current_round=current_round,
+                completed_rounds=completed_rounds,
+                rewards_status="reading",
+            )
+            rewards = collect_battle_rewards(bot, reward_reader)
+            if rewards.recognized:
+                logger.info(
+                    "本局收益: 银币=%s 舰船经验=%s 全局经验=%s (%s)",
+                    rewards.credits,
+                    rewards.ship_xp,
+                    rewards.free_xp,
+                    rewards.provider,
+                )
+                reporter.update(
+                    "collecting_rewards",
+                    "本局收益已自动统计",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status="recognized",
+                    rewards_round=current_round,
+                    last_rewards=rewards.resource_values(),
+                )
+            else:
+                logger.warning("结算页收益 OCR 未通过，本局不写入错误数据")
+                reporter.update(
+                    "collecting_rewards",
+                    "未能可靠识别本局收益，战斗循环继续",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status="unrecognized",
+                    rewards_round=current_round,
+                    last_rewards={},
+                )
+            completed_rounds += 1
+            if should_stop():
+                reporter.update(
+                    "returning",
+                    "运行计划已完成，正在返回港口",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                )
+                return_to_port(bot)
+                time.sleep(2)
+                reporter.update(
+                    "completed",
+                    "运行计划已完成",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    movement_mode="idle",
+                    movement_reason="计划已完成，控制已安全释放",
+                    route_phase="unplanned",
+                    route_progress=0.0,
+                    route_waypoint=0,
+                    route_arrived=False,
+                    inside_capture_point=False,
+                )
+                return 0
+            reporter.update(
+                "requeueing",
+                "战斗结束，正在自动进入下一局",
+                current_round=current_round,
+                completed_rounds=completed_rounds,
+            )
+            if not wait_for_web_resume(
+                limits,
+                reporter,
+                resume_state="requeueing",
+            ):
+                break
+            if queue_next_battle(bot.hwnd, vision=bot.vision):
+                if wait_for_battle(bot, should_stop=should_stop):
+                    battle_already_ready = True
+                    continue
+                if should_stop():
                     break
-                time.sleep(0.5)
-
-            # === 阶段4: 结算 -> 点击继续 ===
-            logger.info("等待结算画面...")
-            time.sleep(8)
-
-            logger.info("点击'继续'...")
-            bg_click_center(hwnd)
-            time.sleep(3)
-
-            # 再点一次确保
-            bg_click_center(hwnd)
-            time.sleep(5)
-
-            logger.info("准备下一局...")
-            time.sleep(3)
-
+                logger.error("已点击继续战斗，但未能确认下一局 HUD，安全停止")
+                reporter.update(
+                    "failed",
+                    "下一局已排队，但未能确认战斗 HUD",
+                    current_round=current_round + 1,
+                    completed_rounds=completed_rounds,
+                    error="requeue_battle_not_confirmed",
+                    safety_state="tripped",
+                )
+                return 2
+            logger.warning("无法直接继续战斗，回港后使用常规入口重试")
+            return_to_port(bot)
+            time.sleep(2)
+        manually_stopped = user_stop_requested()
+        reporter.update(
+            "stopped" if manually_stopped else "completed",
+            "已按用户要求安全停止" if manually_stopped else "运行计划已完成",
+            current_round=current_round,
+            completed_rounds=completed_rounds,
+            movement_mode="idle",
+            movement_reason="控制已安全释放",
+            route_phase="unplanned",
+            route_progress=0.0,
+            route_waypoint=0,
+            route_arrived=False,
+            inside_capture_point=False,
+        )
+        return 0
     except KeyboardInterrupt:
         logger.info("用户中断")
+        reporter.update(
+            "stopped",
+            "已停止",
+            current_round=current_round,
+            completed_rounds=completed_rounds,
+        )
+        return 0
+    except (SafetyFault, CaptureFault) as error:
+        logger.error("安全熔断: %s", error)
+        reporter.update(
+            "failed",
+            "安全熔断，所有控制已释放",
+            current_round=current_round,
+            completed_rounds=completed_rounds,
+            error=str(error),
+            safety_state="tripped",
+            calibration_valid=True,
+        )
+        return 2
+    except Exception as error:
+        logger.exception("运行失败")
+        reporter.update(
+            "failed",
+            "运行发生错误",
+            current_round=current_round,
+            completed_rounds=completed_rounds,
+            error=str(error),
+        )
+        return 1
     finally:
-        bot.gp.stop()
+        bot.stop()
         logger.info("Bot 已停止")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run())

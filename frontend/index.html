@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081116" />
+    <meta name="description" content="战舰世界本地自动作战控制台" />
+    <title>战舰自动化控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="masthead">
+        <div class="brand-lockup">
+          <span class="brand-monogram">W</span>
+          <div><p>LOCAL BATTLE AUTOMATION</p><h1>战舰自动化控制台</h1></div>
+        </div>
+        <div class="system-chip" id="systemChip">
+          <span class="pulse"></span>
+          <div><small>系统状态</small><strong id="systemStatus">待机</strong></div>
+          <time id="clock">--:--:--</time>
+        </div>
+      </header>
+
+      <section class="command-grid">
+        <article class="deck-card preset-card">
+          <div class="section-title"><span>01</span><div><small>MISSION PRESET</small><h2>预设设置</h2></div></div>
+          <div class="control-group"><label>战斗模式</label><div class="choice-grid" id="modeGrid"></div></div>
+          <div class="control-group">
+            <div class="label-row"><label>选择舰船</label><span id="shipCount">0 艘</span></div>
+            <div class="ship-list" id="shipList"></div>
+          </div>
+          <div class="control-group stop-plan">
+            <label>自动停止</label>
+            <div class="tab-switch" role="group" aria-label="自动停止条件">
+              <button class="limit-tab active" data-limit="rounds">完整对局</button>
+              <button class="limit-tab" data-limit="duration">运行时长</button>
+              <button class="limit-tab" data-limit="continuous">不限</button>
+            </div>
+            <div class="number-control" id="numberControl">
+              <button id="minusBtn" aria-label="减少">−</button>
+              <input id="limitValue" type="number" min="1" max="100" value="5" />
+              <span id="limitUnit">局</span>
+              <button id="plusBtn" aria-label="增加">+</button>
+            </div>
+            <p id="limitHint">完整结束 5 局后返回港口并停止</p>
+          </div>
+          <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
+          <div class="human-alert" id="interventionCard" hidden><strong>需要人工检查</strong><p id="interventionMessage"></p><button id="retryBtn">问题处理后重试</button></div>
+          <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong>手动操作保持中</strong><p>已保持原有油门与舵，系统不会继续下发新指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
+          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动作战</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>安全停止</button></div>
+          <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
+        </article>
+
+        <article class="deck-card live-card">
+          <div class="section-title"><span>02</span><div><small>LIVE OPERATION</small><h2>当前状态</h2></div><em id="liveBadge">OFFLINE</em></div>
+          <div class="operation-hero">
+            <div class="route-visual" id="routeVisual">
+              <div class="route-ring ring-one"></div><div class="route-ring ring-two"></div>
+              <div class="route-line"><i id="routeLine"></i></div>
+              <span class="route-node start">出生</span><span class="ship-marker">▲</span><span class="route-node goal">点位</span>
+            </div>
+            <div class="operation-copy"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
+          </div>
+          <div class="progress-panel">
+            <div class="progress-head"><div><small>计划进度</small><strong id="roundDisplay">0 / 5 局</strong></div><div><small>运行时间</small><strong id="elapsedTime">00:00:00</strong></div></div>
+            <div class="progress-track"><span id="progressBar"></span></div><p><span id="progressMessage">等待任务启动</span><b id="progressPercent">0%</b></p>
+          </div>
+          <div class="telemetry-grid">
+            <div><small>航线阶段</small><strong id="routePhase">未规划</strong></div><div><small>航线进度</small><strong id="routeProgress">0%</strong></div>
+            <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>最近敌舰</small><strong id="targetDistance">—</strong></div>
+            <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
+            <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
+          </div>
+          <details class="log-drawer"><summary>查看实时日志 <span id="runId">—</span></summary><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></details>
+        </article>
+
+        <article class="deck-card totals-card">
+          <div class="section-title"><span>03</span><div><small>TASK TOTAL</small><h2>本组累计</h2></div><em class="task-badge" id="taskBadge">暂无任务</em></div>
+          <p class="task-note" id="taskNote">开始任务后从零累计，完成后保留；下一次开始时自动重置。</p>
+          <div class="task-reward-grid">
+            <div class="reward-total credits"><small>银币</small><strong id="creditsTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total ship-xp"><small>经验</small><strong id="shipXpTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total free-xp"><small>全局经验</small><strong id="freeXpTotal">0</strong><span>本组累计</span></div>
+          </div>
+        </article>
+      </section>
+    </main>
+    <div class="toast" id="toast" role="status"></div><script src="/app.js" defer></script>
+  </body>
+</html>

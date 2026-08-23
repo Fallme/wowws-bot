@@ -12,6 +12,10 @@ env/
 # Logs & snapshots
 *.log
 snapshots/
+debug/
+data/
+training_assets/
+/*.png
 
 # IDE
 .vscode/
