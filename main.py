@@ -367,6 +367,11 @@ def run_battle(
             enable = getattr(bot, "enable_opening_autopilot", None)
             if enable is not None:
                 enable("恢复的游戏自动航线")
+        else:
+            # A recovered battle must use the same opening rule as a freshly
+            # detected battle: establish native autopilot first, then let the
+            # Q/E controller take over only after the game route ends.
+            autopilot_set = configure_opening_autopilot(bot)
     else:
         autopilot_set = configure_opening_autopilot(bot)
 
@@ -390,8 +395,8 @@ def run_battle(
         bot.last_movement_reason = "已重新识别当前战斗，游戏自动航行仍开启，禁止Q/E"
         logger.info("恢复当前战斗，确认原生自动航行仍开启，不发送W/Q/E")
     elif resume_existing:
-        bot.last_movement_reason = "已重新识别当前战斗，按小地图恢复向点位/地图中心航行"
-        logger.info("恢复当前战斗，自动航行未开启，通用驾驶按小地图接管")
+        bot.last_movement_reason = "恢复战斗的自动航行设置失败，通用驾驶向点位/地图中心接管"
+        logger.info("恢复当前战斗，自动航行未生效，通用驾驶按小地图接管")
     elif autopilot_set:
         logger.info("进入战斗，已交由游戏自动航行驶向最近占领点远端")
     else:
@@ -997,8 +1002,6 @@ def run():
     completed_rounds = 0
     current_round = 0
     port_configured = False
-    battle_already_ready = initial_state == ScreenState.BATTLE
-    resume_current_battle = initial_state == ScreenState.BATTLE
     preparation_failures = 0
     battle_recovery_failures = 0
 
@@ -1009,7 +1012,7 @@ def run():
         return limits.stop_requested()
 
     try:
-        while resume_current_battle or not should_stop():
+        while not should_stop():
             if not wait_for_web_resume(limits, reporter, bot):
                 break
             current_round = completed_rounds + 1
@@ -1020,27 +1023,49 @@ def run():
                 current_round=current_round,
                 completed_rounds=completed_rounds,
             )
-            prepared = battle_already_ready
-            battle_already_ready = False
-            resuming_this_battle = bool(prepared and resume_current_battle)
-            resume_current_battle = False
-            if not prepared:
-                configured_this_attempt = not port_configured
+            # Never reuse the previous loop's workflow flag.  A pause,
+            # capture retry, or a player action may have moved the game to a
+            # different page.  Confirm the live scene first and only then
+            # invoke the matching continuation path.
+            current_scene = recover_current_scene(
+                bot,
+                attempts=5,
+                stable_frames=2,
+                poll_interval=0.2,
+            )
+            prepared = False
+            resuming_this_battle = False
+            if current_scene == ScreenState.BATTLE:
+                prepared = True
+                resuming_this_battle = True
+                logger.info("当前已在战斗中：跳过选船，直接配置自动航行并接管")
+            elif current_scene == ScreenState.LOADING:
+                logger.info("当前处于加载中：等待 HUD 后进入战斗控制")
+                prepared = wait_for_battle(bot, should_stop=should_stop)
+            elif current_scene == ScreenState.RESULTS:
+                logger.info("当前处于结算页：先回港，再从港口流程继续")
+                return_to_port(bot, attempts=3)
+                port_configured = False
+                continue
+            elif current_scene == ScreenState.PORT:
+                # In the port we must always validate the selected ship and
+                # battle mode before joining.  Do not retain a stale success
+                # flag from a prior round.
+                configured_this_attempt = True
                 battle_queued = prepare_battle(
                     bot,
                     should_stop=should_stop,
                     configure_port=configured_this_attempt,
                 )
-                # Selection and mode verification have already succeeded once
-                # prepare_battle clicks Join Battle. Preserve that fact even
-                # if loading/HUD recognition times out, so recovery never
-                # scrolls through and reselects the ship a second time.
                 if battle_queued and configured_this_attempt:
                     port_configured = True
                 prepared = battle_queued and wait_for_battle(
-                    bot,
-                    should_stop=should_stop,
+                    bot, should_stop=should_stop
                 )
+            else:
+                logger.warning("当前场景仍未知，按全局规则尝试 Esc 返回港口")
+                return_to_port(bot, attempts=3)
+                port_configured = False
             if not prepared:
                 if should_stop():
                     break
@@ -1054,8 +1079,7 @@ def run():
                     completed_rounds=completed_rounds,
                 )
                 if recovered_state == ScreenState.BATTLE:
-                    battle_already_ready = True
-                    resume_current_battle = True
+                    logger.info("准备恢复确认已在战斗中，下一循环直接接管")
                     continue
                 if recovered_state == ScreenState.LOADING:
                     logger.info("准备恢复确认正在加载，继续等待战斗 HUD")
@@ -1065,8 +1089,7 @@ def run():
                             timeout=45.0,
                             should_stop=should_stop,
                         ):
-                            battle_already_ready = True
-                            resume_current_battle = True
+                            logger.info("加载恢复已确认 HUD，下一循环直接进入战斗")
                             continue
                     except (SafetyFault, CaptureFault) as error:
                         logger.info("准备恢复等待 HUD 时画面仍不稳定: %s", error)
@@ -1278,8 +1301,6 @@ def run():
                             safety_state="blocked",
                         )
                         return 2
-                    battle_already_ready = True
-                    resume_current_battle = True
                     logger.info("恢复场景仍为战斗，下一循环继续当前驾驶")
                     continue
                 if recovered_state == ScreenState.RESULTS:
@@ -1368,8 +1389,6 @@ def run():
                     last_rewards={},
                 )
                 if post_battle_state == ScreenState.BATTLE:
-                    battle_already_ready = True
-                    resume_current_battle = True
                     logger.info("战斗仍在进行，下一循环继续当前战斗")
                 else:
                     logger.warning("异常/未知页面优先尝试返回港口")
@@ -1445,7 +1464,6 @@ def run():
                 break
             if queue_next_battle(bot.hwnd, vision=bot.vision):
                 if wait_for_battle(bot, should_stop=should_stop):
-                    battle_already_ready = True
                     continue
                 if should_stop():
                     break
@@ -1460,8 +1478,7 @@ def run():
                 )
                 recovered_state = recover_current_scene(bot)
                 if recovered_state == ScreenState.BATTLE:
-                    battle_already_ready = True
-                    resume_current_battle = True
+                    logger.info("下一局 HUD 已确认，下一循环重新确认场景后接管")
                 elif recovered_state == ScreenState.RESULTS:
                     return_to_port(bot, attempts=2)
                     port_configured = False

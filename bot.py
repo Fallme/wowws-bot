@@ -263,6 +263,11 @@ class BattleBot:
         self._island_avoidance_until = 0.0
         self._island_avoidance_rudder = 0.0
         self._capture_zone = None
+        # Terrain and capture circles do not move during a match.  Freeze the
+        # first reliable minimap interpretation and use it as a separate
+        # static layer; only ship/contact markers are allowed to update later.
+        self._battle_map_islands: list[dict[str, Any]] = []
+        self._battle_capture_zones = []
         self._unknown_since = None
         self._ended_state_streak = 0
         self._post_battle_grace_seconds = float(
@@ -339,6 +344,8 @@ class BattleBot:
         self._manual_intervention_active = False
         self._manual_intervention_latched = False
         if not preserve_movement:
+            self._battle_map_islands = []
+            self._battle_capture_zones = []
             self.opening_autopilot_active = False
             self.opening_autopilot_target = ""
             self.opening_autopilot_target_normalized = None
@@ -591,8 +598,15 @@ class BattleBot:
                 island_outline_finder = getattr(
                     self.vision, "find_minimap_island_outlines", None
                 )
-                if island_outline_finder is not None:
-                    analysis.minimap_islands = island_outline_finder(minimap)
+                if island_outline_finder is not None and not self._battle_map_islands:
+                    detected_islands = island_outline_finder(minimap)
+                    if detected_islands:
+                        self._battle_map_islands = list(detected_islands)
+                        logger.info(
+                            "已锁定本局小地图山体图层: %s 个轮廓",
+                            len(self._battle_map_islands),
+                        )
+                analysis.minimap_islands = list(self._battle_map_islands)
                 if len(minimap_enemies) > 16:
                     logger.warning(
                         "拒绝异常小地图检测: %s 个敌舰候选", len(minimap_enemies)
@@ -640,8 +654,17 @@ class BattleBot:
                     # white or hostile red point wins over a friendly green
                     # point, then the nearest eligible point is selected.
                     zone_finder = getattr(self.vision, "find_capture_zones", None)
-                    if zone_finder is not None:
-                        minimap_zones = zone_finder(minimap, player=player)
+                    if self._battle_capture_zones:
+                        minimap_zones = list(self._battle_capture_zones)
+                    elif zone_finder is not None:
+                        detected_zones = zone_finder(minimap, player=player)
+                        if detected_zones:
+                            self._battle_capture_zones = list(detected_zones)
+                            logger.info(
+                                "已锁定本局占领点图层: %s 个点位",
+                                len(self._battle_capture_zones),
+                            )
+                        minimap_zones = list(self._battle_capture_zones)
                     analysis.capture_zones = [
                         {
                             "label": zone.label,
@@ -672,19 +695,13 @@ class BattleBot:
                             else self.vision.find_central_capture_zone(minimap)
                         )
                     if detected_zone is not None:
-                        active_state = getattr(
-                            self.route_planner.zone,
-                            "state",
-                            "unknown",
-                        )
                         self.route_planner.observe_zone(
                             detected_zone,
                             minimap.shape,
-                            allow_retarget=(
-                                active_state == "friendly"
-                                and getattr(detected_zone, "state", "unknown")
-                                in {"neutral", "hostile", "unknown"}
-                            ),
+                            # The point geometry is frozen for this match.
+                            # Ownership can change visually, but must not make
+                            # the route jump between circles every frame.
+                            allow_retarget=False,
                         )
                     self._capture_zone = self.route_planner.zone
                     if self._capture_zone is not None:
@@ -747,11 +764,19 @@ class BattleBot:
                             self.opening_autopilot_target_normalized
                         )
                         analysis.navigation_source = "native_autopilot"
-                island_risk = (
-                    None
-                    if pose is None or course_heading is None
-                    else self.vision.find_island_risk(minimap, navigation_pose)
-                )
+                island_risk = None
+                if pose is not None and course_heading is not None:
+                    try:
+                        island_risk = self.vision.find_island_risk(
+                            minimap,
+                            navigation_pose,
+                            island_outlines=self._battle_map_islands,
+                        )
+                    except TypeError:
+                        # Compatibility with test/custom Vision adapters.
+                        island_risk = self.vision.find_island_risk(
+                            minimap, navigation_pose
+                        )
                 if island_risk is not None:
                     island_sample = (
                         island_risk.distance,

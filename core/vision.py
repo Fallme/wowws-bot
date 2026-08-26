@@ -593,7 +593,7 @@ class Vision:
                 best = (angle, point)
         return None if best is None else best[1]
 
-    def find_island_risk(self, minimap, pose):
+    def find_island_risk(self, minimap, pose, *, island_outlines=None):
         """Measure solid terrain inside a forward navigation corridor.
 
         Thin range rings and grid lines are rejected by component density.
@@ -604,7 +604,26 @@ class Vision:
             return None
         height, width = minimap.shape[:2]
         scale = min(width, height)
-        diagonal = max(math.hypot(width, height), 1.0)
+        if island_outlines:
+            # A match's coastline is immutable.  Rasterize the frozen browser
+            # layer instead of re-segmenting animated rings, contacts or smoke
+            # on every control frame.
+            terrain = np.zeros((height, width), dtype=np.uint8)
+            for outline in island_outlines:
+                points = outline.get("points", []) if isinstance(outline, dict) else []
+                polygon = []
+                for point in points:
+                    if not isinstance(point, (tuple, list)) or len(point) < 2:
+                        continue
+                    polygon.append(
+                        [
+                            int(round(float(point[0]) * max(width - 1, 1))),
+                            int(round(float(point[1]) * max(height - 1, 1))),
+                        ]
+                    )
+                if len(polygon) >= 3:
+                    cv2.fillPoly(terrain, [np.asarray(polygon, dtype=np.int32)], 255)
+            return self._measure_island_risk(terrain, pose)
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         hue = hsv[:, :, 0].astype(np.float64)
         saturation = hsv[:, :, 1]
@@ -705,8 +724,16 @@ class Vision:
                         continue
                 terrain[labels == label] = 255
 
-        if not np.any(terrain):
+        return self._measure_island_risk(terrain, pose)
+
+    def _measure_island_risk(self, terrain, pose):
+        """Evaluate a frozen/rasterized terrain layer against live heading."""
+        if terrain is None or pose is None or not np.any(terrain):
             return None
+        height, width = terrain.shape[:2]
+        scale = min(width, height)
+        diagonal = max(math.hypot(width, height), 1.0)
+        player_x, player_y = pose.position
         terrain = cv2.dilate(
             terrain,
             np.ones((5, 5), np.uint8),

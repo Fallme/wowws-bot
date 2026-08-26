@@ -98,6 +98,30 @@ def activate_window(hwnd):
             user32.SetForegroundWindow(int(hwnd))
             user32.SetActiveWindow(int(hwnd))
             user32.SetFocus(int(hwnd))
+            # Some full-screen DirectX windows ignore SetForegroundWindow
+            # while another desktop app owns the foreground lock.  This Win32
+            # activation fallback changes z-order only (SWP_NOMOVE/NOSIZE),
+            # never the game's coordinates or size.
+            if not _foreground_matches(hwnd):
+                try:
+                    user32.SwitchToThisWindow(int(hwnd), True)
+                except Exception:
+                    pass
+                try:
+                    win32gui.SetWindowPos(
+                        int(hwnd),
+                        win32con.HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        win32con.SWP_NOMOVE
+                        | win32con.SWP_NOSIZE
+                        | win32con.SWP_SHOWWINDOW,
+                    )
+                    win32gui.SetForegroundWindow(int(hwnd))
+                except Exception:
+                    logger.debug("DirectX foreground fallback failed", exc_info=True)
         finally:
             if attached_game:
                 user32.AttachThreadInput(current_thread, int(game_thread), False)
@@ -106,6 +130,7 @@ def activate_window(hwnd):
         time.sleep(0.14)
         return _foreground_matches(hwnd)
     except Exception:
+        logger.debug("游戏窗口前台激活异常", exc_info=True)
         return False
 
 
