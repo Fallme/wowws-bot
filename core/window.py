@@ -7,6 +7,7 @@ import time
 
 import win32con
 import win32gui
+import win32process
 
 
 logger = logging.getLogger("window")
@@ -34,6 +35,21 @@ def _enable_dpi_awareness():
 _enable_dpi_awareness()
 
 
+def _foreground_matches(hwnd) -> bool:
+    """Treat a foreground child/owned game surface as the game window itself."""
+    try:
+        foreground = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        if foreground == int(hwnd):
+            return True
+        if not foreground:
+            return False
+        return int(win32gui.GetAncestor(foreground, win32con.GA_ROOT)) == int(
+            win32gui.GetAncestor(int(hwnd), win32con.GA_ROOT)
+        )
+    except Exception:
+        return False
+
+
 def activate_window(hwnd):
     """Foreground the game and keep it maximized, without dragging it."""
     try:
@@ -43,12 +59,49 @@ def activate_window(hwnd):
         if win32gui.IsIconic(int(hwnd)) or not ctypes.windll.user32.IsZoomed(int(hwnd)):
             ctypes.windll.user32.ShowWindow(int(hwnd), win32con.SW_MAXIMIZE)
             time.sleep(0.18)
-        # Do not synthesize Alt.  It can be observed by the game as a global
-        # keyboard action during its startup transition.  SetForegroundWindow
-        # changes activation only and leaves the game rect untouched.
-        ctypes.windll.user32.SetForegroundWindow(int(hwnd))
-        time.sleep(0.08)
-        return int(ctypes.windll.user32.GetForegroundWindow() or 0) == int(hwnd)
+        # Windows blocks plain SetForegroundWindow when the automation process
+        # is not the foreground owner.  Temporarily joining the foreground and
+        # game input queues is the documented activation route.  This changes
+        # activation only: it never posts a mouse event or changes geometry.
+        user32 = ctypes.windll.user32
+        foreground = int(user32.GetForegroundWindow() or 0)
+        current_thread = int(user32.GetCurrentThreadId() or 0)
+        foreground_thread = 0
+        game_thread = 0
+        attached_foreground = False
+        attached_game = False
+        try:
+            if foreground:
+                foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+            game_thread, _ = win32process.GetWindowThreadProcessId(int(hwnd))
+            if foreground_thread and foreground_thread != current_thread:
+                attached_foreground = bool(
+                    user32.AttachThreadInput(
+                        current_thread,
+                        int(foreground_thread),
+                        True,
+                    )
+                )
+            if game_thread and game_thread != current_thread:
+                attached_game = bool(
+                    user32.AttachThreadInput(current_thread, int(game_thread), True)
+                )
+            try:
+                # ASFW_ANY is advisory only.  The result is still checked below.
+                user32.AllowSetForegroundWindow(0xFFFFFFFF)
+            except Exception:
+                pass
+            win32gui.BringWindowToTop(int(hwnd))
+            user32.SetForegroundWindow(int(hwnd))
+            user32.SetActiveWindow(int(hwnd))
+            user32.SetFocus(int(hwnd))
+        finally:
+            if attached_game:
+                user32.AttachThreadInput(current_thread, int(game_thread), False)
+            if attached_foreground:
+                user32.AttachThreadInput(current_thread, int(foreground_thread), False)
+        time.sleep(0.14)
+        return _foreground_matches(hwnd)
     except Exception:
         return False
 
@@ -87,7 +140,7 @@ def ensure_game_window_foreground(hwnd) -> bool:
         logger.warning("目标窗口不是可见的战舰世界窗口: hwnd=%s", hwnd)
         return False
     for attempt in range(3):
-        if int(ctypes.windll.user32.GetForegroundWindow() or 0) == int(hwnd):
+        if _foreground_matches(hwnd):
             return True
         logger.info("游戏不在前台，切换到《战舰世界》窗口 (%s/3)", attempt + 1)
         activate_window(hwnd)
