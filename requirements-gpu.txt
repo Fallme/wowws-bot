@@ -1,0 +1,3 @@
+# Optional NVIDIA acceleration. The one-click launcher installs this when an
+# NVIDIA driver is present; a failed install keeps the CPU runtime available.
+onnxruntime-gpu[cuda,cudnn]==1.29.0

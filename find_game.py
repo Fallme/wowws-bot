@@ -7,7 +7,7 @@ import cv2
 from core.window import find_game_window
 from dxgi_capture import ScreenCapture
 
-SNAPSHOT_DIR = Path(r"E:\aimemo\docs\screenshots\wowws_bot\manual")
+SNAPSHOT_DIR = Path(__file__).resolve().parent / "runtime" / "manual"
 
 
 def main():

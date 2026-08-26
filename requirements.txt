@@ -5,4 +5,4 @@ vgamepad>=0.1.0
 pyyaml>=6.0
 pywin32>=306
 rapidocr==3.8.1
-onnxruntime-gpu[cuda,cudnn]==1.29.0
+onnxruntime==1.29.0

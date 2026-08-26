@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.ocr import TargetDistanceReader, ViewportTargetTracker
 from core.vision import Vision
 
-DEFAULT_REPORT_ROOT = Path(r"E:\aimemo\docs\screenshots\wowws_bot")
+DEFAULT_REPORT_ROOT = PROJECT_ROOT / "runtime" / "ocr_reports"
 
 
 def evaluate_image(path: Path, vision: Vision, reader: TargetDistanceReader):

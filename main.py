@@ -24,6 +24,7 @@ from core.window import (
     ensure_game_window_foreground,
     find_game_window,
     get_client_rect,
+    maximize_game_window,
     physical_click,
     window_message_click,
 )
@@ -900,6 +901,11 @@ def run():
     hwnd, title, rect = window
     logger.info("找到游戏窗口: %s", title)
     logger.info("窗口坐标: %s", rect)
+    reporter.update("starting", "已找到游戏窗口，正在默认最大化")
+    if maximize_game_window(hwnd):
+        logger.info("已在启动时最大化游戏窗口；后续切换不再改动窗口位置")
+    else:
+        logger.warning("未能确认游戏窗口最大化；后续仍不会改变窗口位置")
     bot = BattleBot(hwnd, ship_config)
     reward_reader = ResultRewardReader(bot.distance_reader.backend)
     # Steam may expose the game window before login and port loading finish.

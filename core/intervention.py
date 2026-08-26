@@ -9,10 +9,9 @@ from pathlib import Path
 import time
 
 
-# ``activate_window`` emits an Alt press/release around SetForegroundWindow.
-# On some Windows/game combinations GetLastInputInfo publishes that event a
-# little before the controller can record its own marker.  The old 120 ms
-# tolerance therefore classified our focus maintenance as player input.
+# Foreground maintenance can update GetLastInputInfo shortly before the
+# controller records its own marker.  Keep a short tolerance so that system
+# focus activity is not mistaken for the player's keyboard intervention.
 AUTOMATION_TICK_TOLERANCE_MS = 400
 
 

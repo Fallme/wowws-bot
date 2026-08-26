@@ -34,7 +34,7 @@ logger = logging.getLogger("bot")
 DEFAULT_DEBUG_ROOT = Path(
     os.environ.get(
         "WOWS_DEBUG_DIR",
-        r"E:\aimemo\docs\screenshots\wowws_bot",
+        str(Path(__file__).resolve().parent / "runtime" / "debug"),
     )
 )
 

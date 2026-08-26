@@ -35,23 +35,35 @@ _enable_dpi_awareness()
 
 
 def activate_window(hwnd):
-    """Foreground the game window without changing its normal placement.
-
-    ``SW_RESTORE`` was previously sent on *every* control tick.  Besides
-    producing an unnecessary visual jump, Windows may restore a borderless
-    game to a different monitor/work-area.  Restore only an actually
-    minimized window; a visible normal/maximized game only needs foreground
-    activation.
-    """
+    """Foreground the game and keep it maximized, without dragging it."""
     try:
-        if win32gui.IsIconic(int(hwnd)):
-            ctypes.windll.user32.ShowWindow(int(hwnd), win32con.SW_RESTORE)
-            time.sleep(0.12)
-        ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+        # The user requested a consistent maximized game window whenever the
+        # automation returns to it.  SW_MAXIMIZE changes only the standard
+        # window state; no SetWindowPos/MoveWindow/drag operation is used.
+        if win32gui.IsIconic(int(hwnd)) or not ctypes.windll.user32.IsZoomed(int(hwnd)):
+            ctypes.windll.user32.ShowWindow(int(hwnd), win32con.SW_MAXIMIZE)
+            time.sleep(0.18)
+        # Do not synthesize Alt.  It can be observed by the game as a global
+        # keyboard action during its startup transition.  SetForegroundWindow
+        # changes activation only and leaves the game rect untouched.
         ctypes.windll.user32.SetForegroundWindow(int(hwnd))
-        ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)  # Alt up
         time.sleep(0.08)
-        return True
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:
+        return False
+
+
+def maximize_game_window(hwnd) -> bool:
+    """Maximize on startup; foreground returns use the same standard state."""
+    try:
+        if not win32gui.IsWindow(int(hwnd)):
+            return False
+        # This is deliberately separate from ``activate_window``.  The caller
+        # invokes it once while a run starts.  Later activation also keeps this
+        # maximized state, but never uses positional window APIs.
+        ctypes.windll.user32.ShowWindow(int(hwnd), win32con.SW_MAXIMIZE)
+        time.sleep(0.18)
+        return bool(ctypes.windll.user32.IsZoomed(int(hwnd)))
     except Exception:
         return False
 
