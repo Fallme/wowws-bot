@@ -111,6 +111,8 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
     """Wait through login/splash/loading until an actionable screen is visible."""
     deadline = time.monotonic() + max(1.0, float(timeout))
     last_state = ScreenState.UNKNOWN
+    previous_state = ScreenState.UNKNOWN
+    consecutive = 0
     while time.monotonic() < deadline:
         try:
             image = bot.vision.grab(bot.hwnd, allow_stale=True)
@@ -119,11 +121,16 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
             time.sleep(2)
             continue
         last_state = bot.vision.classify_screen(image)
+        if last_state == previous_state:
+            consecutive += 1
+        else:
+            previous_state = last_state
+            consecutive = 1
         if last_state in {
             ScreenState.PORT,
             ScreenState.BATTLE,
             ScreenState.RESULTS,
-        }:
+        } and consecutive >= 2:
             return image, last_state
         time.sleep(2)
     return None, last_state
@@ -203,8 +210,22 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
     state = bot.vision.classify_screen(image)
 
     if state == ScreenState.BATTLE:
-        logger.info("已处于战斗 HUD，直接接管当前战斗")
-        return True
+        # A direct takeover is safe only after a stable HUD confirmation.
+        # A single broad visual match must never skip ship/mode/matchmaking.
+        confirmed_state = recover_current_scene(
+            bot,
+            attempts=3,
+            stable_frames=2,
+            poll_interval=0.20,
+        )
+        if confirmed_state == ScreenState.BATTLE:
+            logger.info("已连续确认战斗 HUD，直接接管当前战斗")
+            return True
+        logger.warning(
+            "战斗 HUD 未连续确认（复核=%s），不进入驾驶逻辑",
+            confirmed_state.value,
+        )
+        state = confirmed_state
 
     if state == ScreenState.RESULTS:
         logger.info("检测到结算界面，按状态导航返回港口")
@@ -261,6 +282,7 @@ def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
     commander_confirmed = False
     last_state = None
     result_frames = 0
+    battle_frames = 0
     while time.monotonic() < deadline:
         if should_stop and should_stop():
             return False
@@ -278,8 +300,9 @@ def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
                 ),
             )
             last_state = state
-        if state == ScreenState.BATTLE:
-            logger.info("战斗 HUD 首帧已确认，立即接管移动")
+        battle_frames = battle_frames + 1 if state == ScreenState.BATTLE else 0
+        if battle_frames >= 3:
+            logger.info("战斗 HUD 已连续确认，开始接管移动")
             return True
         result_frames = result_frames + 1 if state == ScreenState.RESULTS else 0
         if result_frames >= 3:

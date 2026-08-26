@@ -49,6 +49,13 @@ class ScreenStateRegressionTests(unittest.TestCase):
             image = cv2.imread(str(self.FIXTURE_ROOT / filename))
             self.assertTrue(self.vision._is_port_ship_bar(image), filename)
 
+    def test_positive_port_controls_take_precedence_over_battle_candidate(self):
+        """A port must never become battle merely because its lower UI is textured."""
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+        self.assertIsNotNone(image)
+        self.assertTrue(self.vision.in_port(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.PORT)
+
     def test_escape_menu_overrides_broad_loading_signal(self):
         self.assertEqual(
             self.classify(self.FIXTURE_ROOT / "escape_menu.png"),

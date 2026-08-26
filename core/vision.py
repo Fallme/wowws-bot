@@ -1161,10 +1161,12 @@ class Vision:
             colorful_ratio * 100,
             edge_ratio * 100,
         )
-        # Commander-less ships make much of the grid gray; live 2560x1600
-        # ports can fall near 0.20 colour coverage even though the carousel is
-        # fully visible. The dense edge structure remains stable.
-        return colorful_ratio > 0.16 and edge_ratio > 0.125
+        # Commander-less ships make much of the grid gray; live ports can
+        # have modest colour coverage even when the carousel is fully visible.
+        # The dense full-width card-edge pattern remains the distinguishing
+        # signal.  The prior colour threshold was high enough that a normal
+        # selected-ship port could fall through into the loose battle guard.
+        return colorful_ratio > 0.10 and edge_ratio > 0.13
 
     def in_port(self, image):
         battle_button = self._crop_region(image, PORT_BATTLE_BUTTON)
@@ -1394,11 +1396,10 @@ class Vision:
         if self._is_port_reward_overlay(image):
             return ScreenState.UNKNOWN
         loading_seen = self.in_loading(image)
-        # Battle HUD evidence wins over overlapping result/port colour bands.
-        # This prevents an active match from being ended by a false button hit.
-        battle_seen = self._has_battle_hud(image)
-        if battle_seen and not self._is_port_ship_bar(image):
-            return ScreenState.BATTLE
+        # Resolve explicit menu pages before considering battle.  A port has
+        # dense bottom cards and a real "加入战斗" action; a battle HUD must
+        # never override that positive evidence.  The old ordering did the
+        # reverse and let incidental port texture become a combat state.
         if self.in_results(image):
             return ScreenState.RESULTS
         port_seen = self.in_port(image)
@@ -1408,7 +1409,10 @@ class Vision:
             return ScreenState.EXIT_CONFIRMATION
         if self.in_escape_menu(image):
             return ScreenState.ESCAPE_MENU
-        if battle_seen:
+        # Battle is deliberately the final actionable state.  ``_has_battle_hud``
+        # is a visual candidate only; lifecycle callers separately require
+        # consecutive battle frames before they issue combat controls.
+        if self._has_battle_hud(image):
             return ScreenState.BATTLE
         if loading_seen:
             return ScreenState.LOADING
