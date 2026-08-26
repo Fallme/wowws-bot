@@ -84,25 +84,19 @@
               </div>
             </div>
             <div class="telemetry-panel">
-              <div class="live-tabs" role="tablist" aria-label="当前状态内容">
-                <button class="live-tab active" data-live-tab="telemetry" role="tab" aria-selected="true">状态标签</button>
-                <button class="live-tab" data-live-tab="logs" role="tab" aria-selected="false">实时日志</button>
+              <div class="telemetry-grid">
+                <div><small>航线阶段</small><strong id="routePhase">未规划</strong></div><div><small>航线进度</small><strong id="routeProgress">0%</strong></div>
+                <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>最近敌舰</small><strong id="targetDistance">—</strong></div>
+                <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
+                <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
+                <div><small>自动航行</small><strong id="autopilotStatus">未开启</strong></div><div><small>当前舵位</small><strong id="rudderStatus">中舵</strong></div>
+                <div><small>小地图态势</small><strong id="mapSituation">等待识别</strong></div><div><small>导航依据</small><strong id="navigationStatus">—</strong></div>
+                <div><small>舰体状态</small><strong id="shipStatus">生命 —</strong></div><div><small>实时航速</small><strong id="speedStatus">—</strong></div>
+                <div><small>小地图航向</small><strong id="headingStatus">—</strong></div><div><small>消耗品状态</small><strong id="consumableStatus">等待识别</strong></div>
               </div>
-              <div class="live-tab-pane" data-live-pane="telemetry" role="tabpanel">
-                <div class="telemetry-grid">
-                  <div><small>航线阶段</small><strong id="routePhase">未规划</strong></div><div><small>航线进度</small><strong id="routeProgress">0%</strong></div>
-                  <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>最近敌舰</small><strong id="targetDistance">—</strong></div>
-                  <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
-                  <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
-                  <div><small>自动航行</small><strong id="autopilotStatus">未开启</strong></div><div><small>当前舵位</small><strong id="rudderStatus">中舵</strong></div>
-                  <div><small>小地图态势</small><strong id="mapSituation">等待识别</strong></div><div><small>导航依据</small><strong id="navigationStatus">—</strong></div>
-                  <div><small>舰体状态</small><strong id="shipStatus">生命 —</strong></div><div><small>实时航速</small><strong id="speedStatus">—</strong></div>
-                  <div><small>小地图航向</small><strong id="headingStatus">—</strong></div><div><small>消耗品状态</small><strong id="consumableStatus">等待识别</strong></div>
-                </div>
-              </div>
-              <div class="live-tab-pane log-pane" data-live-pane="logs" role="tabpanel" hidden><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></div>
             </div>
           </div>
+          <div class="log-pane" aria-label="实时日志"><div class="log-pane-heading"><span>实时日志</span><small>自动刷新</small></div><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></div>
           <div class="run-id-line">运行编号 <span id="runId">—</span></div>
         </article>
 
