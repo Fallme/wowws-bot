@@ -4,10 +4,10 @@
 
 ## 一键启动
 
-首次使用直接双击：
+所有使用者只需双击：
 
 ```text
-install_and_start.bat
+one_click_run.bat
 ```
 
 它会自动完成以下步骤：
@@ -17,7 +17,7 @@ install_and_start.bat
 3. 检测 NVIDIA 显卡；可用时安装 GPU OCR 运行时，失败或没有显卡时自动使用 CPU OCR。
 4. 启动本地控制面板并打开浏览器。
 
-之后直接双击 `start_control_panel.bat` 即可打开控制面板。首次安装需要联网，并要求已安装 Python 3.10 或更高版本、Steam 和《战舰世界》。
+首次运行需要联网，并要求已安装 Python 3.10 或更高版本、Steam 和《战舰世界》。之后仍只需要双击同一个 `one_click_run.bat`：它会检测控制台是否已经运行，避免重复启动服务。
 
 ## 使用方式
 
@@ -47,7 +47,7 @@ runtime/ocr_reports/  OCR 离线评估报告
 
 ## 打包给其他人
 
-将项目推送到 Git 后，其他人下载或克隆仓库并双击 `install_and_start.bat` 即可完成安装。若需要生成一个独立压缩包，在项目根目录运行：
+将项目推送到 Git 后，其他人下载或克隆仓库并双击 `one_click_run.bat` 即可完成安装。若需要生成一个独立压缩包，在项目根目录运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\build_release.ps1
