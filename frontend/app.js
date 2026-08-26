@@ -83,18 +83,20 @@ function renderTaskTotals(run){
       : `${state.config?.ships[run.ship]?.name||run.ship} · ${labels[run.mode]||run.mode}；本组完成后保留，开始新任务时归零。`
     : "开始任务后从零累计，完成后保留；下一次开始时自动重置。";
 }
-function renderTaskHistory(run,history){
-  const entries=(Array.isArray(history)?history:[]).filter(item=>run&&item.run_id===run.id).sort((a,b)=>Number(b.round_no||0)-Number(a.round_no||0));
-  const outcomeLabels={victory:"胜利",defeat:"战败",unknown:"结果待确认"};
-  $("#historySummary").textContent=entries.length?`已记录 ${entries.length} 局`:"暂无结算记录";
+function renderTaskHistory(current,runs){
+  const allRuns=Array.isArray(runs)?runs:[];
+  const previous=state.running&&current?allRuns.filter(item=>item.id!==current.id):allRuns;
+  const entries=previous.slice(0,4),status={completed:"完成",stopped:"已停止",failed:"异常",running:"进行中"};
+  $("#historySummary").textContent=entries.length?`最近 ${entries.length} 组`:"暂无历史任务";
   $("#taskHistory").replaceChildren(...(entries.length?entries.map(item=>{
-    const row=document.createElement("article"),outcome=["victory","defeat"].includes(item.outcome)?item.outcome:"unknown";
-    row.className=`history-row ${outcome}`;
-    const rewards=item.rewards_recognized?`银币 ${number(item.credits)} · 经验 ${number(item.ship_xp)} · 全局 ${number(item.free_xp)}`:"收益识别中，未写入累计";
-    row.innerHTML=`<div><strong>第 ${Number(item.round_no||0)} 局</strong><small>${rewards}</small></div><b>${outcomeLabels[outcome]}</b>`;
+    const row=document.createElement("article"),ship=state.config?.ships[item.ship]?.name||item.ship||"未知舰船";
+    const started=Number(item.started_at||0)?new Date(Number(item.started_at)*1000).toLocaleDateString("zh-CN",{month:"2-digit",day:"2-digit"}):"—";
+    const rounds=Number(item.completed_rounds||0),wins=Number(item.victories||0),losses=Number(item.defeats||0);
+    row.className=`history-row task ${item.status||"unknown"}`;
+    row.innerHTML=`<div><strong>${ship} · ${labels[item.mode]||item.mode||"—"}</strong><small>${started} · ${rounds} 局 · 胜 ${wins} / 负 ${losses}</small></div><b>${status[item.status]||"已记录"}</b>`;
     return row;
-  }):[Object.assign(document.createElement("p"),{className:"history-empty",textContent:"本组完成结算后，会在这里记录每局胜负与收益。"})]));
+  }):[Object.assign(document.createElement("p"),{className:"history-empty",textContent:"完成过的自动作战任务会显示在这里。"})]));
 }
-async function loadDashboard(){const data=await api("/api/dashboard");const runs=data.runs||[];const current=(state.runId&&runs.find(run=>run.id===state.runId))||runs[0]||null;renderTaskTotals(current);renderTaskHistory(current,data.history||[]);}
+async function loadDashboard(){const data=await api("/api/dashboard");const runs=data.runs||[];const current=(state.runId&&runs.find(run=>run.id===state.runId))||runs[0]||null;renderTaskTotals(current);renderTaskHistory(current,runs);}
 async function init(){state.config=await api("/api/config");state.calibration=state.config.calibration;const savedShip=readSaved(customStorage.selected);if(savedShip==="custom"||state.config.ships[savedShip])state.ship=savedShip;if(state.ship!=="custom"&&!state.config.ships[state.ship])state.ship=Object.keys(state.config.ships)[0];const savedCustom=state.config.custom_ship||{};$("#customShipName").value=readSaved(customStorage.name,savedCustom.name||"");$("#customSecondaryRange").value=readSaved(customStorage.range,String(savedCustom.secondary_range||10));$("#customShipName").oninput=saveCustomShip;$("#customSecondaryRange").oninput=saveCustomShip;renderConfig();renderCalibration();updateLimit();renderPrimaryAction();await pollStatus();await loadDashboard();$("#startBtn").onclick=primaryAction;$("#retryBtn").onclick=startRun;$("#manualResumeBtn").onclick=resumeAutomation;$("#stopBtn").onclick=stopRun;$("#limitValue").oninput=updateLimit;$("#quickBattle").onchange=updateLimit;$("#minusBtn").onclick=()=>{$("#limitValue").stepDown();updateLimit();};$("#plusBtn").onclick=()=>{$("#limitValue").stepUp();updateLimit();};document.querySelectorAll(".limit-tab").forEach(button=>button.onclick=()=>{state.limitType=button.dataset.limit;$("#limitValue").max=state.limitType==="rounds"?100:1440;updateLimit();});setInterval(pollStatus,1000);setInterval(loadDashboard,5000);setInterval(()=>$("#clock").textContent=new Date().toLocaleTimeString("zh-CN",{hour12:false}),1000);}
 init().catch(error=>toast(error.message,true));

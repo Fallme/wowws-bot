@@ -376,7 +376,11 @@ class ControlStore:
                     COALESCE(SUM(e.steel), 0) AS steel,
                     COALESCE(SUM(e.doubloons), 0) AS doubloons,
                     COALESCE(SUM(e.free_xp), 0) AS free_xp,
-                    COALESCE(SUM(e.elite_xp), 0) AS elite_xp
+                    COALESCE(SUM(e.elite_xp), 0) AS elite_xp,
+                    (SELECT COUNT(*) FROM battle_history h
+                     WHERE h.run_id = r.id AND h.outcome = 'victory') AS victories,
+                    (SELECT COUNT(*) FROM battle_history h
+                     WHERE h.run_id = r.id AND h.outcome = 'defeat') AS defeats
                     FROM runs r LEFT JOIN resource_entries e ON e.run_id = r.id
                     GROUP BY r.id ORDER BY r.started_at DESC LIMIT 20"""
                 )
