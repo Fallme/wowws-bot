@@ -39,6 +39,17 @@ def test_result_reward_reader_extracts_credits_and_experience():
     assert rewards.provider == "CUDAExecutionProvider"
 
 
+def test_result_reader_classifies_coloured_result_headline_without_reward_ocr():
+    image = np.zeros((900, 1800, 3), dtype=np.uint8)
+    # BGR gold matching the victory headline in the upper-left result area.
+    image[100:165, 130:410] = (50, 190, 250)
+    assert ResultRewardReader.read_outcome(image) == "victory"
+
+    image[:] = 0
+    image[100:165, 130:410] = (70, 75, 240)
+    assert ResultRewardReader.read_outcome(image) == "defeat"
+
+
 def test_result_reward_reader_rejects_missing_credit_value():
     class EmptyBackend:
         def recognize(self, _image):
@@ -48,6 +59,29 @@ def test_result_reward_reader_rejects_missing_credit_value():
         np.full((1600, 2560, 3), 80, dtype=np.uint8)
     )
 
+    assert not rewards.recognized
+
+
+def test_result_reward_reader_rejects_clipped_one_digit_credit_fragment():
+    class ClippedBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("8", 0.99, ((10, 0),))],
+                [OcrToken("503", 0.99, ((10, 0),))],
+                [OcrToken("63", 0.99, ((10, 0),))],
+            )
+            value = values[self.calls]
+            self.calls += 1
+            return value
+
+    rewards = ResultRewardReader(ClippedBackend()).read(
+        np.full((1600, 2560, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.credits == 8
     assert not rewards.recognized
 
 
@@ -124,3 +158,59 @@ def test_wide_result_profile_moves_rewards_left_and_lower():
 
     assert wide.left < standard.left
     assert wide.top > standard.top
+
+
+def test_ship_xp_region_keeps_four_digit_group_and_accepts_soft_trailing_group():
+    class FourDigitBackend:
+        execution_provider = "CUDAExecutionProvider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("102", 0.99, ((10, 0),)), OcrToken("692", 0.98, ((80, 0),))],
+                [OcrToken("1", 0.98, ((10, 0),)), OcrToken("143☆", 0.52, ((48, 0),))],
+                [OcrToken("136☆", 0.96, ((10, 0),))],
+            )
+            value = values[self.calls]
+            self.calls += 1
+            return value
+
+    rewards = ResultRewardReader(FourDigitBackend()).read(
+        np.full((1600, 2560, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.recognized
+    assert rewards.ship_xp == 1_143
+    assert RESULT_REWARD_REGIONS["ship_xp"].right >= 0.37
+
+
+def test_overlapping_partial_ocr_hypothesis_does_not_prefix_value():
+    class OverlappingBackend:
+        execution_provider = "CUDAExecutionProvider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("198", 0.99, ((5, 2), (45, 2), (45, 22), (5, 22))),
+                 OcrToken("363", 0.98, ((52, 2), (102, 2), (102, 22), (52, 22)))],
+                [OcrToken("1", 0.97, ((5, 2), (15, 2), (15, 22), (5, 22))),
+                 OcrToken("143", 0.96, ((22, 2), (62, 2), (62, 22), (22, 22)))],
+                [OcrToken("19", 0.92, ((0, 2), (42, 2), (42, 22), (0, 22))),
+                 OcrToken("198", 0.89, ((12, 2), (146, 2), (146, 22), (12, 22)))],
+            )
+            value = values[self.calls]
+            self.calls += 1
+            return value
+
+    rewards = ResultRewardReader(OverlappingBackend()).read(
+        np.full((870, 1827, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.recognized
+    assert rewards.credits == 198_363
+    assert rewards.ship_xp == 1_143
+    assert rewards.free_xp == 198

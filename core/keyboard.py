@@ -121,8 +121,12 @@ class KeyboardController:
     MAX_NOTCH = 4
     MAX_RUDDER_NOTCH = 2
 
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, *, focus_guard=None):
         self.device = backend or SendInputBackend()
+        # Native key injection is global in Windows.  The caller supplies a
+        # guard bound to the verified game HWND so no W/Q/E/R/T/M input can be
+        # delivered to a browser or another monitor's active application.
+        self._focus_guard = focus_guard
         self._throttle_notch = 0
         self._rudder_notch = 0
         self.last_dispatch: KeyboardDispatch | None = None
@@ -151,6 +155,10 @@ class KeyboardController:
             rudder_notch=self._rudder_notch,
         )
 
+    def _ensure_target_focus(self):
+        if self._focus_guard is not None and not self._focus_guard():
+            raise RuntimeError("游戏窗口不在前台，拒绝发送键盘操作")
+
     def _set_throttle_notch(self, target: int):
         target = max(-self.MAX_NOTCH, min(int(target), self.MAX_NOTCH))
         delta = target - self._throttle_notch
@@ -173,6 +181,7 @@ class KeyboardController:
         self._rudder_notch = target
 
     def set_movement(self, throttle: float, rudder: float):
+        self._ensure_target_focus()
         throttle = self._clamp(throttle)
         rudder = self._clamp(rudder)
         self._set_throttle_notch(self._notch_for(throttle))
@@ -199,6 +208,7 @@ class KeyboardController:
         dropped while the controller cache still advances to notch four.
         Reasserting is harmless because the in-game telegraph clamps at FULL.
         """
+        self._ensure_target_focus()
         self.device.key_up("s")
         for _ in range(self.MAX_NOTCH):
             self.device.tap("w")
@@ -206,6 +216,7 @@ class KeyboardController:
         self._record("full_speed_reassert", 1.0, 0.0)
 
     def toggle_tactical_map(self):
+        self._ensure_target_focus()
         self.device.tap("m")
         self._record(
             "toggle_tactical_map",
@@ -220,28 +231,40 @@ class KeyboardController:
         self.reassert_full_speed()
 
     def fire(self):
+        self._ensure_target_focus()
         self.device.left_click()
         self._record("main_fire", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
     def lock(self):
+        self._ensure_target_focus()
         # X is the native target-lock command.  It is deterministic and avoids
         # clicking an unverified screen coordinate.
         self.device.tap("x")
         self._record("target_lock", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
     def torpedo(self):
+        self._ensure_target_focus()
         self.device.tap("3")
         self._record("torpedo", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
     def smoke(self):
+        self._ensure_target_focus()
         self.device.tap("4")
         self._record("smoke", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
+    def escape(self):
+        """Open/back out of a game menu inside the already-focused client."""
+        self._ensure_target_focus()
+        self.device.tap("esc")
+        self._record("escape", self._throttle_notch / self.MAX_NOTCH, 0.0)
+
     def damage_control(self):
+        self._ensure_target_focus()
         self.device.tap("r")
         self._record("damage_control", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
     def heal(self):
+        self._ensure_target_focus()
         self.device.tap("t")
         self._record("repair_party", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
@@ -265,6 +288,7 @@ class KeyboardController:
 
     def stop(self):
         """Release rudder and set the engine telegraph back to STOP."""
+        self._ensure_target_focus()
         self._set_rudder(0.0)
         self._set_throttle_notch(0)
         # Release all movement keys even if an earlier injection was interrupted.

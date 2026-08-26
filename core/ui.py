@@ -35,11 +35,14 @@ class RelativeRegion:
 
 
 PORT_BATTLE_BUTTON = RelativeRegion(0.455, 0.002, 0.545, 0.043)
-PORT_MODE_SELECTOR = RelativeRegion(0.548, 0.002, 0.675, 0.043)
+# Current-mode emblem and label immediately to the right of ``加入战斗``.
+# Keep the region tight: the previous wide box clicked the empty header area
+# to the right of the label at 2560x1600.
+PORT_MODE_SELECTOR = RelativeRegion(0.535, 0.002, 0.625, 0.050)
 # Battle-type selection screen.  The standard PvE card is the first card in
 # the upper row.  Event cards can move between slots, so asymmetric battles
 # are located by their purple emblem inside the search area instead.
-BATTLE_TYPE_COOPERATIVE_CARD = RelativeRegion(0.305, 0.225, 0.445, 0.430)
+BATTLE_TYPE_COOPERATIVE_CARD = RelativeRegion(0.340, 0.255, 0.425, 0.430)
 BATTLE_TYPE_SEARCH_AREA = RelativeRegion(0.120, 0.170, 0.880, 0.580)
 BATTLE_TYPE_BACK_BUTTON = RelativeRegion(0.000, 0.010, 0.075, 0.075)
 

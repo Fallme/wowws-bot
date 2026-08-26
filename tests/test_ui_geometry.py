@@ -4,6 +4,7 @@ from core.ui import (
     BATTLE_TYPE_COOPERATIVE_CARD,
     MINIMAP_REGION,
     PORT_BATTLE_BUTTON,
+    PORT_MODE_SELECTOR,
     SHIP_NAME_TEMPLATES,
 )
 
@@ -25,10 +26,18 @@ class UiGeometryTests(unittest.TestCase):
         self.assertGreaterEqual(y2 - y1, 680)
 
     def test_cooperative_card_is_upper_left_mode_card(self):
-        x, y = BATTLE_TYPE_COOPERATIVE_CARD.center(2560, 1440)
+        x, y = BATTLE_TYPE_COOPERATIVE_CARD.center(2560, 1600)
 
-        self.assertTrue(780 <= x <= 980)
-        self.assertTrue(400 <= y <= 520)
+        self.assertTrue(950 <= x <= 1000)
+        self.assertTrue(530 <= y <= 570)
+
+    def test_mode_selector_is_immediately_right_of_battle_button(self):
+        battle_x, _ = PORT_BATTLE_BUTTON.center(2560, 1600)
+        mode_x, mode_y = PORT_MODE_SELECTOR.center(2560, 1600)
+
+        self.assertTrue(1450 <= mode_x <= 1530)
+        self.assertGreater(mode_x, battle_x)
+        self.assertTrue(20 <= mode_y <= 45)
 
     def test_only_supported_ship_templates_are_exposed(self):
         self.assertEqual(set(SHIP_NAME_TEMPLATES), {"napoli", "pommern"})

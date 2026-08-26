@@ -19,7 +19,14 @@ from core.frame_guard import CaptureFault
 from core.launcher import launch_game
 from core.results import BattleRewards, ResultRewardReader
 from core.ui import ScreenState
-from core.window import activate_window, find_game_window, get_window_rect, physical_click
+from core.window import (
+    activate_window,
+    ensure_game_window_foreground,
+    find_game_window,
+    get_client_rect,
+    physical_click,
+    window_message_click,
+)
 from port_navigator import (
     confirm_no_commander,
     enter_battle,
@@ -27,11 +34,44 @@ from port_navigator import (
     handle_post_battle,
     queue_next_battle,
     select_requested_ship,
+    ShipSelectionError,
 )
+from strategy.route_planner import far_side_waypoint
 from runtime_control import RunLimits, RuntimeReporter
 
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("runner")
+
+
+class GameWindowUnavailableWhilePaused(RuntimeError):
+    """Raised after the paused workflow loses its game window for a grace period."""
+
+
+def is_game_window_alive(hwnd) -> bool:
+    """Inspect a window handle without restoring it or changing foreground focus."""
+    try:
+        return bool(hwnd and ctypes.windll.user32.IsWindow(int(hwnd)))
+    except (AttributeError, OSError, TypeError, ValueError):
+        # A platform/API inspection failure is not proof that the game closed.
+        # Keep waiting rather than turning a diagnostic failure into a shutdown.
+        return True
+
+
+def shutdown_bot(bot) -> None:
+    """Release controls only when their target window still exists.
+
+    Closing OCR/event resources is safe for a stale handle.  Sending key-up or
+    focus-management input is not: it can land in whichever application the
+    user is currently using while the Web panel is paused.
+    """
+    if is_game_window_alive(getattr(bot, "hwnd", 0)):
+        if ensure_game_window_foreground(bot.hwnd):
+            bot.stop()
+        else:
+            logger.warning("无法确认游戏前台；跳过输入释放")
+        return
+    logger.info("游戏窗口已失效；跳过前台切换和输入释放，仅关闭内部资源")
+    bot.stop(release_input=False)
 
 
 def configure_dpi_awareness():
@@ -98,10 +138,18 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
     store = store or CalibrationStore()
     if screen_state not in {ScreenState.PORT, ScreenState.BATTLE, ScreenState.RESULTS}:
         raise SafetyFault(f"自动自检无法确认当前游戏界面: {screen_state.value}")
-    if not activate_window(bot.hwnd):
+    if not ensure_game_window_foreground(bot.hwnd):
         raise SafetyFault("无法激活游戏窗口，输入自检未通过")
     time.sleep(0.4)
-    bot.gamepad.stop()
+    # Entering the controller while a battle is already under way must not
+    # change throttle or cancel an in-game autopilot.  The old universal
+    # "stop" probe was a safe port check, but it was a real brake command in
+    # battle and is the direct cause of resumed battles starting at STOP.
+    if screen_state == ScreenState.BATTLE:
+        input_check = "battle_controls_preserved"
+    else:
+        bot.gamepad.stop()
+        input_check = "safe_release_dispatched"
     verification_frame = bot.vision.grab(bot.hwnd)
     verified_state = bot.vision.classify_screen(verification_frame)
     if verified_state == ScreenState.UNKNOWN:
@@ -118,7 +166,7 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
                 "passed": True,
                 "screen": verified_state.value,
                 "capture_backend": capture_backend,
-                "input_check": "safe_release_dispatched",
+                "input_check": input_check,
                 "battle_feedback": "required",
                 "source": "automatic_runtime_preflight",
             }
@@ -167,12 +215,29 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         state = bot.vision.classify_screen(image)
 
     if state != ScreenState.PORT:
-        logger.warning("当前界面为 %s，等待下一轮识别", state.value)
+        logger.warning("当前界面为 %s，优先尝试恢复到港口", state.value)
+        return_to_port(bot, attempts=2)
         return False
 
-    logger.info("已确认港口，准备点击“加入战斗”")
-    activate_window(bot.hwnd)
-    time.sleep(1)
+    # Port actions are destructive to an active match (carousel scrolling and
+    # clicks). Require a second fresh port frame and give a battle HUD absolute
+    # priority. This catches transitions and any one-frame classifier error
+    # before the ship-selection workflow is allowed to run.
+    time.sleep(0.25)
+    confirmation = bot.vision.grab(bot.hwnd, allow_stale=True)
+    confirmed_state = bot.vision.classify_screen(confirmation)
+    if confirmed_state == ScreenState.BATTLE:
+        logger.info("港口复核帧检测到战斗 HUD，取消选船并直接接管当前战斗")
+        return True
+    if confirmed_state != ScreenState.PORT:
+        logger.warning(
+            "港口状态未连续确认: first=%s second=%s；本轮不执行选船",
+            state.value,
+            confirmed_state.value,
+        )
+        return False
+
+    logger.info("已连续确认港口，准备点击“加入战斗”")
     if configure_port:
         ship_key = os.environ.get("WOWS_SHIP", "pommern")
         mode = os.environ.get("WOWS_MODE", "asymmetric")
@@ -183,7 +248,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
             logger.warning("未能安全选择目标战斗模式")
             return False
     if not enter_battle(bot.hwnd, vision=bot.vision, configure_port=False):
-        logger.warning("未能安全定位“加入战斗”按钮")
+        logger.warning("“加入战斗”请求未能派发或未通过港口复核")
         return False
     time.sleep(5)
     return True
@@ -194,24 +259,10 @@ def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
     deadline = time.monotonic() + timeout
     commander_confirmed = False
     last_state = None
-    last_activation = 0.0
+    result_frames = 0
     while time.monotonic() < deadline:
         if should_stop and should_stop():
             return False
-        now = time.monotonic()
-        if (
-            now - last_activation >= 2.0
-            and int(ctypes.windll.user32.GetForegroundWindow() or 0) != bot.hwnd
-        ):
-            activate_window(bot.hwnd)
-            note_activity = getattr(
-                getattr(bot, "gamepad", None),
-                "note_automation_activity",
-                None,
-            )
-            if note_activity is not None:
-                note_activity()
-            last_activation = now
         time.sleep(0.20)
         image = bot.vision.grab(bot.hwnd, allow_stale=True)
         state = bot.vision.classify_screen(image)
@@ -229,6 +280,10 @@ def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
         if state == ScreenState.BATTLE:
             logger.info("战斗 HUD 首帧已确认，立即接管移动")
             return True
+        result_frames = result_frames + 1 if state == ScreenState.RESULTS else 0
+        if result_frames >= 3:
+            logger.warning("等待新战斗时持续停留结算页，交回港口恢复流程")
+            return False
         if (
             state == ScreenState.UNKNOWN
             and not commander_confirmed
@@ -241,11 +296,62 @@ def wait_for_battle(bot: BattleBot, timeout: float = 180.0, should_stop=None):
     return False
 
 
-def run_battle(bot: BattleBot, should_stop=None, progress=None):
-    bot.reset()
-    activate_window(bot.hwnd)
-    autopilot_set = configure_opening_autopilot(bot)
+def run_battle(
+    bot: BattleBot,
+    should_stop=None,
+    progress=None,
+    *,
+    resume_existing=False,
+    quick_battle=False,
+    quick_seconds=300.0,
+):
+    intervention = getattr(bot, "intervention", None)
+    while intervention is not None:
+        # Poll before the first focus/capture. A player who is already using
+        # the keyboard must not have the game raised behind their input.
+        if not intervention.poll(bot.gamepad, time.monotonic()):
+            break
+        mark_pause = getattr(bot, "mark_manual_pause", None)
+        if mark_pause is not None:
+            mark_pause()
+        if should_stop and should_stop():
+            return False
+        time.sleep(0.15)
+    # Focusing is coupled to an imminent game command. Merely observing a
+    # paused game must never steal focus from the Web panel or another app.
+    if not ensure_game_window_foreground(bot.hwnd):
+        logger.warning("无法切换《战舰世界》到前台，跳过本次战斗控制")
+        return False
+    try:
+        bot.reset(preserve_movement=resume_existing)
+    except TypeError:
+        # Compatibility for small test doubles and third-party adapters.
+        bot.reset()
+    autopilot_set = False
+    if resume_existing:
+        # Re-read the live HUD before issuing any command. A stale workflow flag
+        # must never send W/Q/E and cancel an already active game-native route.
+        try:
+            resume_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
+            autopilot_set = bool(
+                bot.vision.classify_screen(resume_frame) == ScreenState.BATTLE
+                and bot.vision.is_autopilot_enabled(resume_frame)
+            )
+        except (AttributeError, CaptureFault):
+            autopilot_set = False
+        if autopilot_set:
+            enable = getattr(bot, "enable_opening_autopilot", None)
+            if enable is not None:
+                enable("恢复的游戏自动航线")
+    else:
+        autopilot_set = configure_opening_autopilot(bot)
+
     if not autopilot_set:
+        enable_center_route = getattr(bot, "enable_generic_center_route", None)
+        if enable_center_route is not None:
+            enable_center_route(
+                "战术地图自动航行设置失败，通用驾驶向地图中央接管"
+            )
         reassert = getattr(bot.gamepad, "reassert_full_speed", None)
         if reassert is not None:
             reassert()
@@ -256,28 +362,92 @@ def run_battle(bot: BattleBot, should_stop=None, progress=None):
     intervention = getattr(bot, "intervention", None)
     if intervention is not None:
         intervention.reset()
-    if autopilot_set:
-        logger.info("进入战斗，已交由游戏自动航行驶向中央点位")
+    if resume_existing and autopilot_set:
+        bot.last_movement_reason = "已重新识别当前战斗，游戏自动航行仍开启，禁止Q/E"
+        logger.info("恢复当前战斗，确认原生自动航行仍开启，不发送W/Q/E")
+    elif resume_existing:
+        bot.last_movement_reason = "已重新识别当前战斗，按小地图恢复向点位/地图中心航行"
+        logger.info("恢复当前战斗，自动航行未开启，通用驾驶按小地图接管")
+    elif autopilot_set:
+        logger.info("进入战斗，已交由游戏自动航行驶向最近占领点远端")
     else:
-        bot.last_movement_reason = "自动航行设置失败，四档全速直行"
-        logger.warning("战术地图自动航行设置失败，临时使用四档全速直行")
+        bot.last_movement_reason = "自动航行设置失败，通用驾驶向地图中央接管"
+        logger.warning("战术地图自动航行设置失败，通用驾驶向地图中央接管")
     last_progress = 0.0
-    last_activation = time.monotonic()
-    while bot.combat_tick() != "ended":
+    quick_deadline = (
+        time.monotonic() + max(30.0, float(quick_seconds))
+        if quick_battle
+        else None
+    )
+    while True:
         if should_stop and should_stop():
             logger.info("收到停止请求，终止当前控制")
             return False
         now = time.monotonic()
+        if quick_deadline is not None and now >= quick_deadline:
+            logger.info("快速战斗已运行五分钟，退出本局回港；不统计收益")
+            return "quick_timeout"
+        intervention = getattr(bot, "intervention", None)
+        # Observe real keyboard input before any foreground switch. Otherwise
+        # the first user keystroke can race with SetForegroundWindow and the
+        # game appears to ignore the requested pause.
+        paused = bool(
+            intervention is not None
+            and intervention.poll(bot.gamepad, now)
+        )
+        if paused:
+            # A keyboard/Web pause is stronger than any observation or focus
+            # maintenance: do not grab a frame, raise the game, or generate a
+            # command.  The next resume iteration immediately re-reads the
+            # current scene before sending anything.
+            mark_pause = getattr(bot, "mark_manual_pause", None)
+            if mark_pause is not None:
+                mark_pause()
+            if progress and now - last_progress >= 1.0:
+                progress(bot)
+                last_progress = now
+            time.sleep(0.15)
+            continue
         if (
-            now - last_activation >= 5.0
-            and bot.current_movement_mode != "manual_pause"
+            not paused
             and int(ctypes.windll.user32.GetForegroundWindow() or 0) != bot.hwnd
         ):
-            activate_window(bot.hwnd)
+            # The next combat tick may issue a command, so focus immediately
+            # beforehand and mark the focus event as automation-generated.
+            if not ensure_game_window_foreground(bot.hwnd):
+                logger.warning("无法切换《战舰世界》到前台，本轮不发送控制指令")
+                time.sleep(0.5)
+                continue
             note_activity = getattr(bot.gamepad, "note_automation_activity", None)
             if note_activity is not None:
                 note_activity()
-            last_activation = now
+        try:
+            tick_result = bot.combat_tick()
+        except RuntimeError as error:
+            if "游戏窗口不在前台" not in str(error):
+                raise
+            # A transient focus denial (for example while Windows finishes
+            # switching a full-screen game) must not invalidate the whole
+            # battle.  No key was sent; retry the next control frame.
+            logger.warning("游戏前台切换尚未完成；跳过本帧控制并重试")
+            time.sleep(0.5)
+            continue
+        if tick_result == "ended":
+            if quick_battle:
+                # Quick battles never wait on or OCR the result page.  Whether
+                # the five-minute limit ended the battle or the ship was sunk,
+                # Esc immediately returns to port and the next loop queues a
+                # fresh battle without touching task totals.
+                logger.info("快速战斗已离开战斗 HUD，立即回港重开；不统计收益")
+                return "quick_ended"
+            break
+        if (
+            quick_battle
+            and getattr(getattr(bot, "last_analysis", None), "health", 1.0)
+            <= 0.01
+        ):
+            logger.info("快速战斗检测到舰船已沉没，退出本局回港；不统计收益")
+            return "quick_death"
         if progress and now - last_progress >= 1.0:
             progress(bot)
             last_progress = now
@@ -292,7 +462,10 @@ def tactical_map_local_point(
     normalized_target: tuple[float, float],
 ) -> tuple[int, int]:
     """Map minimap-normalized coordinates onto the centred tactical map."""
-    map_size = min(float(width), float(height)) * 0.94
+    # The tactical grid uses about 81% of the vertical viewport. The former
+    # 94% estimate clicked outside the actual 10x10 grid on 2560x1600 and the
+    # game silently ignored the autopilot destination.
+    map_size = min(float(width), float(height)) * 0.81
     left = (float(width) - map_size) / 2.0
     top = (float(height) - map_size) / 2.0
     target_x = max(0.05, min(float(normalized_target[0]), 0.95))
@@ -318,32 +491,71 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         target_label = "地图中心"
         minimap = bot.vision.find_minimap(image)
         if minimap is not None:
-            zone = bot.vision.find_central_capture_zone(minimap)
+            pose = bot.vision.find_player_pose_on_minimap(minimap)
+            player = None if pose is None else pose.position
+            find_nearest = getattr(bot.vision, "find_nearest_capture_zone", None)
+            zone = (
+                find_nearest(minimap, player)
+                if find_nearest is not None and player is not None
+                else bot.vision.find_central_capture_zone(minimap)
+            )
             if zone is not None:
+                destination = far_side_waypoint(player, zone) or zone.center
                 normalized_target = (
-                    zone.center[0] / max(minimap.shape[1], 1),
-                    zone.center[1] / max(minimap.shape[0], 1),
+                    destination[0] / max(minimap.shape[1], 1),
+                    destination[1] / max(minimap.shape[0], 1),
                 )
-                target_label = "中央占领点"
+                zone_label = getattr(zone, "label", "")
+                target_label = (
+                    f"{zone_label}点远端" if zone_label else "最近占领点远端"
+                )
         local_x, local_y = tactical_map_local_point(
             width,
             height,
             normalized_target,
         )
-        toggle_map()
-        time.sleep(0.65)
-        rect = get_window_rect(bot.hwnd)
-        if not physical_click(
-            rect["left"] + local_x,
-            rect["top"] + local_y,
-            extra_delay=0.1,
-        ):
+        rect = get_client_rect(bot.hwnd)
+        verify_autopilot = getattr(bot.vision, "is_autopilot_enabled", None)
+        accepted = False
+        for attempt in range(2):
             toggle_map()
+            time.sleep(0.65)
+            if not physical_click(
+                rect["left"] + local_x,
+                rect["top"] + local_y,
+                extra_delay=0.1,
+                hwnd=bot.hwnd,
+            ):
+                if not window_message_click(
+                    bot.hwnd,
+                    rect["left"] + local_x,
+                    rect["top"] + local_y,
+                    extra_delay=0.1,
+                ):
+                    toggle_map()
+                    continue
+            time.sleep(0.35)
+            toggle_map()
+            time.sleep(0.55)
+            if verify_autopilot is None:
+                accepted = True
+                break
+            verification = bot.vision.grab(bot.hwnd, allow_stale=True)
+            if verify_autopilot(verification):
+                accepted = True
+                break
+            logger.warning(
+                "战术地图落点未出现自动驾驶标识，重试 %s/2",
+                attempt + 1,
+            )
+        if not accepted:
+            logger.warning("战术地图两次落点均未生效，交由通用驾驶接管")
             return False
-        time.sleep(0.35)
-        toggle_map()
-        time.sleep(0.35)
-        enable(target_label)
+        try:
+            enable(target_label, target_normalized=normalized_target)
+        except TypeError:
+            # Compatibility for light-weight test/custom bot adapters.
+            enable(target_label)
         logger.info(
             "[SYSTEM] 战术地图自动航行: %s | local=(%s,%s)",
             target_label,
@@ -360,26 +572,66 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         return False
 
 
-def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 12):
-    """Read rewards before any result-page navigation occurs."""
+def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
+    """Confirm the result page, then read rewards before navigation.
+
+    Returns ``(page_confirmed, rewards, last_state)``.  A battle only counts
+    when the result page is positively observed on consecutive frames.
+    """
     if bot.distance_ocr_service is not None:
         bot.distance_ocr_service.close()
     fallback = BattleRewards(
         provider=str(getattr(reader.backend, "execution_provider", "custom"))
     )
+    result_frames = 0
+    page_confirmed = False
+    last_state = ScreenState.UNKNOWN
+    stable_rewards: dict[tuple[int, int, int], int] = {}
     for attempt in range(max(1, attempts)):
         if attempt == 0 and bot.last_analysis is not None:
             image = bot.last_analysis.image
         else:
             time.sleep(0.5)
             image = bot.vision.grab(bot.hwnd, allow_stale=True)
-        if bot.vision.classify_screen(image) != ScreenState.RESULTS:
+        last_state = bot.vision.classify_screen(image)
+        if last_state != ScreenState.RESULTS:
+            result_frames = 0
+            if attempt >= 1 and last_state in {ScreenState.BATTLE, ScreenState.PORT}:
+                break
             continue
+        result_frames += 1
+        page_confirmed = page_confirmed or result_frames >= 2
         rewards = reader.read(image)
-        fallback = rewards
-        if rewards.recognized:
-            return rewards
-    return fallback
+        if rewards.recognized or not fallback.recognized:
+            fallback = rewards
+        if page_confirmed and rewards.recognized:
+            signature = (
+                int(rewards.credits),
+                int(rewards.ship_xp),
+                int(rewards.free_xp),
+            )
+            stable_rewards[signature] = stable_rewards.get(signature, 0) + 1
+            # Result digits have a stable colour/position across frames. Two
+            # identical reads prove the complete same-colour number was
+            # captured, preventing a single clipped leading/trailing token
+            # from entering the per-task total.
+            if stable_rewards[signature] >= 2:
+                return True, rewards, last_state
+    if page_confirmed and not fallback.recognized:
+        logger.warning(
+            "结算页已确认但资源 OCR 未识别: raw=%s confidence=%s",
+            fallback.raw_text,
+            fallback.confidence,
+        )
+        debug_dir = getattr(bot, "_debug_dir", None)
+        save_debug = getattr(bot.vision, "save_debug_frame", None)
+        if debug_dir is not None and save_debug is not None:
+            save_debug(
+                Path(debug_dir)
+                / f"result_unrecognized_{time.strftime('%H%M%S')}.png",
+                image,
+            )
+    return page_confirmed, fallback, last_state
 
 
 def return_to_port(bot: BattleBot, attempts: int = 5):
@@ -396,16 +648,156 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
         elif state in {ScreenState.ESCAPE_MENU, ScreenState.EXIT_CONFIRMATION}:
             handle_post_battle(bot.hwnd, vision=bot.vision, max_steps=1)
             return False
+        else:
+            # Unknown dialogs must never receive a blind click.  Esc is the
+            # game's universal back action and keeps recovery scoped to the
+            # already-verified game client.
+            escape = getattr(bot.gamepad, "escape", None)
+            if escape is not None:
+                logger.info("未知页面，按 Esc 尝试返回港口")
+                escape()
         time.sleep(3)
     logger.warning("未能确认已返回港口；未执行盲点操作")
     return False
 
 
-def wait_for_web_resume(limits, reporter, *, resume_state="preparing"):
-    """Freeze workflow actions while preserving the exact lifecycle step."""
-    if not limits.pause_requested():
+def recover_current_scene(
+    bot: BattleBot,
+    *,
+    attempts: int = 6,
+    stable_frames: int = 2,
+    poll_interval: float = 0.25,
+) -> ScreenState:
+    """Observe the current page until one scene is stable on multiple frames.
+
+    Recovery classification must be side-effect free.  In particular, a
+    transient result/menu classification is not permission to click anything:
+    the lifecycle caller decides what to do only after this observer returns a
+    stable scene.
+    """
+    previous_state = ScreenState.UNKNOWN
+    consecutive = 0
+    sample_count = max(1, int(attempts))
+    required = max(1, int(stable_frames))
+
+    for attempt in range(sample_count):
+        try:
+            image = bot.vision.grab(bot.hwnd, allow_stale=True)
+            state = bot.vision.classify_screen(image)
+        except CaptureFault as error:
+            logger.info(
+                "恢复检查暂时无法取得画面 (%s/%s): %s",
+                attempt + 1,
+                sample_count,
+                error,
+            )
+            state = ScreenState.UNKNOWN
+
+        if state == ScreenState.UNKNOWN:
+            previous_state = ScreenState.UNKNOWN
+            consecutive = 0
+        elif state == previous_state:
+            consecutive += 1
+        else:
+            previous_state = state
+            consecutive = 1
+
+        if state != ScreenState.UNKNOWN and consecutive >= required:
+            logger.info(
+                "恢复检查连续 %s 帧确认当前场景: %s",
+                consecutive,
+                state.value,
+            )
+            return state
+
+        if attempt + 1 < sample_count:
+            time.sleep(max(0.0, float(poll_interval)))
+
+    logger.warning("恢复检查未取得稳定场景；保持原状态且不发送任何操作")
+    return ScreenState.UNKNOWN
+
+
+def recover_after_battle_fault(
+    bot: BattleBot,
+    *,
+    should_stop=None,
+    attempts: int = 3,
+    loading_timeout: float = 45.0,
+) -> ScreenState:
+    """Retry scene recognition after a battle-loop safety/capture fault.
+
+    Loading is handled by waiting for the battle HUD.  Port, battle and result
+    pages are returned to the lifecycle for phase-specific handling.  Unknown
+    and interruption pages are observed again and never clicked blindly.
+    """
+    retry_count = max(1, int(attempts))
+    last_state = ScreenState.UNKNOWN
+    for attempt in range(1, retry_count + 1):
+        if should_stop and should_stop():
+            return ScreenState.UNKNOWN
+        last_state = recover_current_scene(bot)
+        logger.info(
+            "战斗故障后场景恢复 (%s/%s): %s",
+            attempt,
+            retry_count,
+            last_state.value,
+        )
+        if last_state in {
+            ScreenState.BATTLE,
+            ScreenState.RESULTS,
+            ScreenState.PORT,
+        }:
+            return last_state
+        if last_state == ScreenState.LOADING:
+            try:
+                if wait_for_battle(
+                    bot,
+                    timeout=max(1.0, float(loading_timeout)),
+                    should_stop=should_stop,
+                ):
+                    return ScreenState.BATTLE
+            except (SafetyFault, CaptureFault) as error:
+                logger.info("等待加载恢复时仍无法取得稳定画面: %s", error)
+        if attempt < retry_count:
+            time.sleep(min(2.0 * attempt, 5.0))
+
+    # An unresolved loading screen is useful to the outer preparation loop.
+    # Every other unfamiliar page follows the global recovery rule: Esc is
+    # sent only to the verified game client, then the ordinary port detector
+    # decides whether recovery succeeded.  This is deliberately bounded so a
+    # login/disconnect prompt cannot spin forever or receive blind clicks.
+    if last_state == ScreenState.LOADING:
+        return last_state
+    logger.warning("场景连续未知，执行全局 Esc 回港恢复")
+    if return_to_port(bot, attempts=3):
+        return ScreenState.PORT
+    return ScreenState.UNKNOWN
+
+
+def wait_for_web_resume(
+    limits,
+    reporter,
+    bot=None,
+    *,
+    resume_state="preparing",
+    window_missing_timeout=5.0,
+    poll_interval=0.15,
+):
+    """Freeze lifecycle actions for Web pause or real keyboard intervention."""
+    intervention = getattr(bot, "intervention", None)
+
+    def keyboard_paused():
+        return bool(
+            intervention is not None
+            and intervention.poll(getattr(bot, "gamepad", None))
+        )
+
+    web_paused = limits.pause_requested()
+    key_paused = keyboard_paused()
+    if not web_paused and not key_paused:
         return True
-    logger.info("[USER] 网页手动暂停；保留当前流程位置和舰船操纵状态")
+    source = "网页手动暂停" if web_paused else "用户键盘介入"
+    logger.info("[USER] %s；保留当前流程位置和舰船操纵状态", source)
     reporter.update(
         "paused",
         "网页已暂停，不再下发新系统指令",
@@ -414,10 +806,41 @@ def wait_for_web_resume(limits, reporter, *, resume_state="preparing"):
         movement_mode="manual_pause",
         movement_reason="保持现有船速与舵位，等待网页继续",
     )
-    while limits.pause_requested():
+    window_missing_since = None
+    while True:
         if limits.stop_requested():
             return False
-        time.sleep(0.15)
+        web_paused = limits.pause_requested()
+        key_paused = keyboard_paused()
+        if not web_paused and not key_paused:
+            break
+        now = time.monotonic()
+        if bot is not None and not is_game_window_alive(getattr(bot, "hwnd", 0)):
+            if window_missing_since is None:
+                window_missing_since = now
+                logger.warning("暂停期间游戏窗口句柄失效，开始无操作确认")
+            elif now - window_missing_since >= max(
+                0.0, float(window_missing_timeout)
+            ):
+                reporter.update(
+                    "failed",
+                    "暂停期间游戏窗口已关闭，任务已安全退出",
+                    paused_by_user=False,
+                    manual_intervention_latched=False,
+                    movement_mode="idle",
+                    movement_reason="未切换前台、未向失效窗口发送控制指令",
+                    error="game_window_unavailable_while_paused",
+                    safety_state="blocked",
+                )
+                raise GameWindowUnavailableWhilePaused(
+                    "暂停期间连续无法找到原游戏窗口"
+                )
+        else:
+            # Minimize, foreground changes and one-off handle inspection
+            # failures do not trip the worker; only one stale HWND sustained
+            # for the full grace period does.
+            window_missing_since = None
+        time.sleep(max(0.01, float(poll_interval)))
     logger.info("[SYSTEM] 网页继续，立即重新识别当前画面并接续原流程")
     reporter.update(
         resume_state,
@@ -439,12 +862,19 @@ def run():
         logger.error("不支持的战斗模式: %s", mode)
         return 1
     limits = RunLimits.from_env()
-    reporter = RuntimeReporter(limits, ship=ship_key, mode=mode)
+    reporter = RuntimeReporter(
+        limits,
+        ship=ship_key,
+        mode=mode,
+        ship_display_name=ship_config.get("display_name", ship_config["name"]),
+    )
     logger.info(
         "舰船: %s | 副炮射程: %skm",
         ship_config["name"],
         ship_config["secondary"]["range"],
     )
+    if limits.quick_battle:
+        logger.info("快速战斗已开启：单局最多五分钟或沉没即 Esc 回港，不统计收益")
     logger.info("搜索战舰世界窗口")
     reporter.update("starting", "正在搜索游戏窗口")
     window = wait_for_game_window(timeout=2)
@@ -470,7 +900,6 @@ def run():
     hwnd, title, rect = window
     logger.info("找到游戏窗口: %s", title)
     logger.info("窗口坐标: %s", rect)
-    activate_window(hwnd)
     bot = BattleBot(hwnd, ship_config)
     reward_reader = ResultRewardReader(bot.distance_reader.backend)
     # Steam may expose the game window before login and port loading finish.
@@ -482,13 +911,26 @@ def run():
     )
     if initial_state == ScreenState.UNKNOWN:
         reporter.update(
+            "recovering",
+            "启动时页面未知，正在按 Esc 返回港口并重新识别",
+            safety_state="armed",
+            calibration_valid=True,
+        )
+        if return_to_port(bot, attempts=3):
+            initial_frame, initial_state = wait_for_recognized_screen(
+                bot,
+                timeout=min(screen_timeout, 30.0),
+            )
+    if initial_state == ScreenState.UNKNOWN:
+        reporter.update(
             "failed",
             "启动前无法可靠识别游戏画面",
             error="preflight_screen_unknown",
             safety_state="blocked",
             calibration_valid=True,
         )
-        bot.stop()
+        if ensure_game_window_foreground(bot.hwnd):
+            bot.stop()
         return 2
 
     reporter.update("preparing", "正在执行港口画面与输入自动自检")
@@ -508,7 +950,8 @@ def run():
             safety_state="blocked",
             calibration_valid=False,
         )
-        bot.stop()
+        if ensure_game_window_foreground(bot.hwnd):
+            bot.stop()
         return 2
     capture_backend = getattr(bot.vision.screen_capture, "last_backend", "unknown")
     reporter.update(
@@ -526,7 +969,9 @@ def run():
     current_round = 0
     port_configured = False
     battle_already_ready = initial_state == ScreenState.BATTLE
+    resume_current_battle = initial_state == ScreenState.BATTLE
     preparation_failures = 0
+    battle_recovery_failures = 0
 
     def should_stop():
         return limits.reached(completed_rounds, started_at)
@@ -535,8 +980,8 @@ def run():
         return limits.stop_requested()
 
     try:
-        while not should_stop():
-            if not wait_for_web_resume(limits, reporter):
+        while resume_current_battle or not should_stop():
+            if not wait_for_web_resume(limits, reporter, bot):
                 break
             current_round = completed_rounds + 1
             logger.info("=== 第 %s 局 ===", current_round)
@@ -548,16 +993,59 @@ def run():
             )
             prepared = battle_already_ready
             battle_already_ready = False
+            resuming_this_battle = bool(prepared and resume_current_battle)
+            resume_current_battle = False
             if not prepared:
-                prepared = prepare_battle(
+                configured_this_attempt = not port_configured
+                battle_queued = prepare_battle(
                     bot,
                     should_stop=should_stop,
-                    configure_port=not port_configured,
-                ) and wait_for_battle(bot, should_stop=should_stop)
+                    configure_port=configured_this_attempt,
+                )
+                # Selection and mode verification have already succeeded once
+                # prepare_battle clicks Join Battle. Preserve that fact even
+                # if loading/HUD recognition times out, so recovery never
+                # scrolls through and reselects the ship a second time.
+                if battle_queued and configured_this_attempt:
+                    port_configured = True
+                prepared = battle_queued and wait_for_battle(
+                    bot,
+                    should_stop=should_stop,
+                )
             if not prepared:
                 if should_stop():
                     break
                 preparation_failures += 1
+                recovered_state = recover_current_scene(bot)
+                reporter.update(
+                    "recovering",
+                    "正在按当前场景恢复流程，"
+                    f"重试 {preparation_failures}/5（{recovered_state.value}）",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                )
+                if recovered_state == ScreenState.BATTLE:
+                    battle_already_ready = True
+                    resume_current_battle = True
+                    continue
+                if recovered_state == ScreenState.LOADING:
+                    logger.info("准备恢复确认正在加载，继续等待战斗 HUD")
+                    try:
+                        if wait_for_battle(
+                            bot,
+                            timeout=45.0,
+                            should_stop=should_stop,
+                        ):
+                            battle_already_ready = True
+                            resume_current_battle = True
+                            continue
+                    except (SafetyFault, CaptureFault) as error:
+                        logger.info("准备恢复等待 HUD 时画面仍不稳定: %s", error)
+                elif recovered_state == ScreenState.RESULTS:
+                    # The observer has already confirmed the result page on
+                    # consecutive frames.  Navigation is now phase-authorized.
+                    return_to_port(bot, attempts=2)
+                    port_configured = False
                 if preparation_failures >= 5:
                     logger.error("连续 %s 次准备失败，停止运行", preparation_failures)
                     reporter.update(
@@ -641,6 +1129,69 @@ def run():
                     route_arrived=False
                     if analysis is None
                     else analysis.route_arrived,
+                    minimap_player=None
+                    if analysis is None
+                    else analysis.minimap_player_normalized,
+                    minimap_heading=None
+                    if analysis is None
+                    else analysis.minimap_heading,
+                    navigation_target=None
+                    if analysis is None
+                    else analysis.navigation_target_normalized,
+                    capture_zone_center=None
+                    if analysis is None
+                    else analysis.capture_zone_center_normalized,
+                    capture_zone_radius=None
+                    if analysis is None
+                    else analysis.capture_zone_radius_normalized,
+                    capture_zone_label=""
+                    if analysis is None
+                    else analysis.capture_zone_label,
+                    nearest_enemy=None
+                    if analysis is None
+                    else analysis.nearest_enemy_normalized,
+                    minimap_enemy_count=0
+                    if analysis is None
+                    else analysis.minimap_enemy_count,
+                    minimap_contacts=[]
+                    if analysis is None
+                    else analysis.minimap_contacts,
+                    capture_zones=[]
+                    if analysis is None
+                    else analysis.capture_zones,
+                    minimap_islands=[]
+                    if analysis is None
+                    else analysis.minimap_islands,
+                    navigation_source="unknown"
+                    if analysis is None
+                    else analysis.navigation_source,
+                    autopilot_enabled=False
+                    if analysis is None
+                    else analysis.autopilot_enabled,
+                    rudder_indicator="neutral"
+                    if analysis is None
+                    else analysis.rudder_indicator,
+                    commanded_rudder=None
+                    if active_bot.last_movement_command is None
+                    else active_bot.last_movement_command.rudder,
+                    island_distance=None
+                    if analysis is None
+                    else analysis.island_distance,
+                    health_percent=None
+                    if analysis is None
+                    else round(analysis.health * 100.0, 1),
+                    speed_knots=None
+                    if analysis is None
+                    else analysis.speed_knots,
+                    on_fire=False if analysis is None else analysis.on_fire,
+                    flooding=False if analysis is None else analysis.flooding,
+                    damage_control_ready=bool(
+                        getattr(active_bot, "damage_control_ready", False)
+                    ),
+                    heal_ready=bool(getattr(active_bot, "heal_ready", False)),
+                    manual_intervention_active=bool(
+                        getattr(active_bot, "manual_intervention_active", False)
+                    ),
                     manual_intervention_latched=(
                         active_bot.manual_intervention_latched
                     ),
@@ -654,13 +1205,99 @@ def run():
                     ),
                 )
 
-            if not run_battle(
-                bot,
-                # A time limit is a soft boundary: finish the active battle.
-                # Only an explicit user stop interrupts combat immediately.
-                should_stop=user_stop_requested,
-                progress=report_battle_progress,
-            ):
+            battle_finished = False
+            try:
+                battle_finished = run_battle(
+                    bot,
+                    # A time limit is a soft boundary: finish the active battle.
+                    # Only an explicit user stop interrupts combat immediately.
+                    should_stop=user_stop_requested,
+                    progress=report_battle_progress,
+                    resume_existing=resuming_this_battle,
+                    quick_battle=limits.quick_battle,
+                )
+            except (SafetyFault, CaptureFault) as error:
+                battle_recovery_failures += 1
+                logger.warning(
+                    "战斗控制异常，先重新判断当前场景再续接 (%s/3): %s",
+                    battle_recovery_failures,
+                    error,
+                )
+                recovered_state = recover_after_battle_fault(
+                    bot,
+                    should_stop=user_stop_requested,
+                )
+                reporter.update(
+                    "recovering",
+                    "战斗控制异常，已重新识别当前场景并准备续接",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    error=str(error),
+                    recovery_attempt=battle_recovery_failures,
+                    recovered_scene=recovered_state.value,
+                    safety_state="armed",
+                )
+                if recovered_state == ScreenState.BATTLE:
+                    if battle_recovery_failures >= 3:
+                        logger.error("战斗控制连续恢复失败，需要人工检查")
+                        reporter.update(
+                            "failed",
+                            "战斗控制连续失败，请人工检查后从网页继续",
+                            current_round=current_round,
+                            completed_rounds=completed_rounds,
+                            error="battle_recovery_retry_limit_reached",
+                            safety_state="blocked",
+                        )
+                        return 2
+                    battle_already_ready = True
+                    resume_current_battle = True
+                    logger.info("恢复场景仍为战斗，下一循环继续当前驾驶")
+                    continue
+                if recovered_state == ScreenState.RESULTS:
+                    # The controller can fault during the transition out of a
+                    # battle.  Preserve the result page for OCR; never click it
+                    # away during recovery.
+                    battle_finished = True
+                    battle_recovery_failures = 0
+                    logger.info("恢复场景已是结算页，直接进入收益统计")
+                elif recovered_state == ScreenState.PORT:
+                    battle_recovery_failures = 0
+                    port_configured = False
+                    logger.info("恢复场景已回港，本局不计数并重走港口准备")
+                    continue
+                elif recovered_state == ScreenState.LOADING:
+                    logger.info("恢复场景仍在加载，交由下一轮加载/HUD检查续接")
+                    continue
+                else:
+                    logger.error("反复识别后仍无法确认当前场景，需要人工介入")
+                    reporter.update(
+                        "failed",
+                        "反复重试后仍无法识别当前页面，请人工检查后重试",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        error="battle_scene_unknown_after_retries",
+                        safety_state="blocked",
+                    )
+                    return 2
+            else:
+                if battle_finished:
+                    battle_recovery_failures = 0
+
+            if battle_finished in {"quick_timeout", "quick_death", "quick_ended"}:
+                reporter.update(
+                    "returning",
+                    "快速战斗结束，正在 Esc 返回港口并重新开局；本局不统计收益",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                )
+                escape = getattr(bot.gamepad, "escape", None)
+                if escape is not None:
+                    escape()
+                    time.sleep(0.8)
+                return_to_port(bot, attempts=5)
+                port_configured = False
+                continue
+            if not battle_finished:
                 if user_stop_requested():
                     reporter.update(
                         "stopped",
@@ -673,6 +1310,7 @@ def run():
             if not wait_for_web_resume(
                 limits,
                 reporter,
+                bot,
                 resume_state="collecting_rewards",
             ):
                 break
@@ -683,7 +1321,32 @@ def run():
                 completed_rounds=completed_rounds,
                 rewards_status="reading",
             )
-            rewards = collect_battle_rewards(bot, reward_reader)
+            result_confirmed, rewards, post_battle_state = collect_battle_rewards(
+                bot,
+                reward_reader,
+            )
+            if not result_confirmed:
+                logger.warning(
+                    "未连续确认结算页，本次不增加局数；当前界面=%s",
+                    post_battle_state.value,
+                )
+                reporter.update(
+                    "recovering",
+                    "未确认结算页，本局不计数，正在恢复当前流程",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status="pending",
+                    last_rewards={},
+                )
+                if post_battle_state == ScreenState.BATTLE:
+                    battle_already_ready = True
+                    resume_current_battle = True
+                    logger.info("战斗仍在进行，下一循环继续当前战斗")
+                else:
+                    logger.warning("异常/未知页面优先尝试返回港口")
+                    return_to_port(bot)
+                    port_configured = False
+                continue
             if rewards.recognized:
                 logger.info(
                     "本局收益: 银币=%s 舰船经验=%s 全局经验=%s (%s)",
@@ -700,6 +1363,7 @@ def run():
                     rewards_status="recognized",
                     rewards_round=current_round,
                     last_rewards=rewards.resource_values(),
+                    last_outcome=rewards.outcome,
                 )
             else:
                 logger.warning("结算页收益 OCR 未通过，本局不写入错误数据")
@@ -711,6 +1375,7 @@ def run():
                     rewards_status="unrecognized",
                     rewards_round=current_round,
                     last_rewards={},
+                    last_outcome=rewards.outcome,
                 )
             completed_rounds += 1
             if should_stop():
@@ -745,6 +1410,7 @@ def run():
             if not wait_for_web_resume(
                 limits,
                 reporter,
+                bot,
                 resume_state="requeueing",
             ):
                 break
@@ -754,16 +1420,29 @@ def run():
                     continue
                 if should_stop():
                     break
-                logger.error("已点击继续战斗，但未能确认下一局 HUD，安全停止")
+                logger.warning("已点击继续战斗，但未确认下一局 HUD；重新识别场景后重试")
                 reporter.update(
-                    "failed",
-                    "下一局已排队，但未能确认战斗 HUD",
+                    "recovering",
+                    "下一局状态未确认，正在重新识别场景并恢复",
                     current_round=current_round + 1,
                     completed_rounds=completed_rounds,
                     error="requeue_battle_not_confirmed",
-                    safety_state="tripped",
+                    safety_state="armed",
                 )
-                return 2
+                recovered_state = recover_current_scene(bot)
+                if recovered_state == ScreenState.BATTLE:
+                    battle_already_ready = True
+                    resume_current_battle = True
+                elif recovered_state == ScreenState.RESULTS:
+                    return_to_port(bot, attempts=2)
+                    port_configured = False
+                elif recovered_state == ScreenState.PORT:
+                    port_configured = False
+                elif recovered_state == ScreenState.UNKNOWN:
+                    logger.warning("下一局场景仍未知，按全局规则 Esc 返回港口")
+                    return_to_port(bot, attempts=3)
+                    port_configured = False
+                continue
             logger.warning("无法直接继续战斗，回港后使用常规入口重试")
             return_to_port(bot)
             time.sleep(2)
@@ -782,6 +1461,11 @@ def run():
             inside_capture_point=False,
         )
         return 0
+    except GameWindowUnavailableWhilePaused as error:
+        logger.error("暂停任务安全退出: %s", error)
+        # wait_for_web_resume has already written the precise failure state.
+        # Returning lets the control server reconcile and release the stale run.
+        return 2
     except KeyboardInterrupt:
         logger.info("用户中断")
         reporter.update(
@@ -791,6 +1475,17 @@ def run():
             completed_rounds=completed_rounds,
         )
         return 0
+    except ShipSelectionError as error:
+        logger.error("自定义舰船选择失败: %s", error)
+        reporter.update(
+            "failed",
+            "未找到指定舰船，请返回网页重新选择",
+            current_round=current_round,
+            completed_rounds=completed_rounds,
+            error=str(error),
+            safety_state="blocked",
+        )
+        return 2
     except (SafetyFault, CaptureFault) as error:
         logger.error("安全熔断: %s", error)
         reporter.update(
@@ -814,7 +1509,9 @@ def run():
         )
         return 1
     finally:
-        bot.stop()
+        # A stale HWND must never receive focus-management/key-up input. The
+        # shutdown helper still closes internal OCR and event resources.
+        shutdown_bot(bot)
         logger.info("Bot 已停止")
 
 

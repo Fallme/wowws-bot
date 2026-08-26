@@ -31,11 +31,14 @@ STOP_PATH = DATA_DIR / "stop.request"
 PAUSE_PATH = DATA_DIR / "pause.request"
 RESUME_PATH = DATA_DIR / "resume.request"
 LOG_PATH = DATA_DIR / "runtime.log"
+CUSTOM_SHIP_PATH = DATA_DIR / "custom_ship.json"
+CUSTOM_SHIP_LOCK = threading.Lock()
 MODES = {
     "cooperative": "联合作战",
     "asymmetric": "非对称作战",
 }
 SUPPORTED_SHIPS = ("pommern", "napoli")
+CUSTOM_SHIP_KEY = "custom"
 RESOURCES = (
     "credits",
     "ship_xp",
@@ -46,6 +49,53 @@ RESOURCES = (
     "free_xp",
     "elite_xp",
 )
+
+
+def validate_custom_ship(payload, *, allow_empty_name=False):
+    name = str(payload.get("custom_ship_name", "")).strip()
+    if (
+        (not name and not allow_empty_name)
+        or len(name) > 64
+        or any(character in name for character in "\r\n\t")
+    ):
+        raise ValueError("请输入完整的舰船名称（最多 64 个字符）")
+    try:
+        secondary_range = float(payload.get("custom_secondary_range", 0))
+    except (TypeError, ValueError) as error:
+        raise ValueError("副炮射程必须是数字") from error
+    if not 1.0 <= secondary_range <= 30.0:
+        raise ValueError("副炮射程必须在 1.0 到 30.0 km 之间")
+    return name, secondary_range
+
+
+def load_custom_ship():
+    try:
+        payload = json.loads(CUSTOM_SHIP_PATH.read_text(encoding="utf-8"))
+        name, secondary_range = validate_custom_ship(
+            payload,
+            allow_empty_name=True,
+        )
+        return {"name": name, "secondary_range": secondary_range}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"name": "", "secondary_range": 10.0}
+
+
+def save_custom_ship(name, secondary_range):
+    with CUSTOM_SHIP_LOCK:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "custom_ship_name": name,
+                    "custom_secondary_range": secondary_range,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PATH)
 
 
 class ControlStore:
@@ -85,6 +135,19 @@ class ControlStore:
                     note TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL DEFAULT 'manual',
                     created_at REAL NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+                CREATE TABLE IF NOT EXISTS battle_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    round_no INTEGER NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT 'unknown',
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    ship_xp INTEGER NOT NULL DEFAULT 0,
+                    free_xp INTEGER NOT NULL DEFAULT 0,
+                    rewards_recognized INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    UNIQUE(run_id, round_no),
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
                 """
@@ -226,6 +289,57 @@ class ControlStore:
             )
             return cursor.lastrowid
 
+    def upsert_battle_result(
+        self,
+        run_id,
+        round_no,
+        outcome,
+        values=None,
+        *,
+        rewards_recognized=False,
+    ):
+        """Keep one auditable result row for every confirmed concluded battle."""
+        round_no = int(round_no or 0)
+        if not run_id or round_no <= 0:
+            return None
+        outcome = str(outcome or "unknown").strip().lower()
+        if outcome not in {"victory", "defeat", "unknown"}:
+            outcome = "unknown"
+        values = values if isinstance(values, dict) else {}
+        amounts = (
+            max(0, int(values.get("credits", 0) or 0)),
+            max(0, int(values.get("ship_xp", 0) or 0)),
+            max(0, int(values.get("free_xp", 0) or 0)),
+        )
+        with self.lock, self.connection:
+            self.connection.execute(
+                """INSERT INTO battle_history
+                   (run_id, round_no, outcome, credits, ship_xp, free_xp,
+                    rewards_recognized, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id, round_no) DO UPDATE SET
+                     outcome=excluded.outcome,
+                     credits=excluded.credits,
+                     ship_xp=excluded.ship_xp,
+                     free_xp=excluded.free_xp,
+                     rewards_recognized=excluded.rewards_recognized,
+                     created_at=excluded.created_at""",
+                (
+                    run_id,
+                    round_no,
+                    outcome,
+                    *amounts,
+                    1 if rewards_recognized else 0,
+                    time.time(),
+                ),
+            )
+            row = self.connection.execute(
+                """SELECT id FROM battle_history
+                   WHERE run_id = ? AND round_no = ?""",
+                (run_id, round_no),
+            ).fetchone()
+            return row["id"] if row else None
+
     def dashboard(self):
         with self.lock:
             totals = dict(
@@ -267,7 +381,14 @@ class ControlStore:
                     GROUP BY r.id ORDER BY r.started_at DESC LIMIT 20"""
                 )
             ]
-        return {"totals": totals, "runs": runs}
+            history = [
+                dict(row)
+                for row in self.connection.execute(
+                    """SELECT * FROM battle_history
+                       ORDER BY created_at DESC LIMIT 100"""
+                )
+            ]
+        return {"totals": totals, "runs": runs, "history": history}
 
 
 class RunnerManager:
@@ -331,12 +452,20 @@ class RunnerManager:
             self._reconcile()
             if self.process is not None:
                 raise RuntimeError("已有任务正在运行")
-            ship = str(payload.get("ship", "pommern"))
+            ship = str(payload.get("ship", "pommern")).strip().lower()
             mode = str(payload.get("mode", "asymmetric"))
             limit_type = str(payload.get("limit_type", "continuous"))
             limit_value = float(payload.get("limit_value", 0))
+            quick_battle = bool(payload.get("quick_battle", False))
             ships = load_ships()
-            if ship not in ships:
+            custom_ship_name = ""
+            custom_secondary_range = 0.0
+            if ship == CUSTOM_SHIP_KEY:
+                custom_ship_name, custom_secondary_range = validate_custom_ship(
+                    payload
+                )
+                save_custom_ship(custom_ship_name, custom_secondary_range)
+            elif ship not in ships:
                 raise ValueError("未知舰船配置")
             if mode not in MODES:
                 raise ValueError("未知战斗模式")
@@ -364,10 +493,17 @@ class RunnerManager:
                     "WOWS_RESUME_FILE": str(RESUME_PATH),
                     "WOWS_MAX_ROUNDS": str(int(limit_value)) if limit_type == "rounds" else "0",
                     "WOWS_DURATION_MINUTES": str(limit_value) if limit_type == "duration" else "0",
+                    "WOWS_QUICK_BATTLE": "1" if quick_battle else "0",
                     "PYTHONUNBUFFERED": "1",
                     "PYTHONUTF8": "1",
                 }
             )
+            if ship == CUSTOM_SHIP_KEY:
+                env["WOWS_CUSTOM_SHIP_NAME"] = custom_ship_name
+                env["WOWS_CUSTOM_SECONDARY_RANGE"] = str(custom_secondary_range)
+            else:
+                env.pop("WOWS_CUSTOM_SHIP_NAME", None)
+                env.pop("WOWS_CUSTOM_SECONDARY_RANGE", None)
             self.log_stream = LOG_PATH.open("w", encoding="utf-8")
             self.process = subprocess.Popen(
                 [sys.executable, str(BASE_DIR / "main.py")],
@@ -378,7 +514,13 @@ class RunnerManager:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self.run_id = run_id
-            self.store.create_run(run_id, ship, mode, limit_type, limit_value)
+            self.store.create_run(
+                run_id,
+                custom_ship_name if ship == CUSTOM_SHIP_KEY else ship,
+                mode,
+                limit_type,
+                limit_value,
+            )
             return {"run_id": run_id}
 
     def stop(self):
@@ -431,9 +573,22 @@ class RunnerManager:
             "route_progress": 0.0,
             "route_waypoint": 0,
             "route_arrived": False,
+            "minimap_player": None,
+            "navigation_target": None,
+            "capture_zone_center": None,
+            "capture_zone_radius": None,
+            "capture_zone_label": "",
+            "nearest_enemy": None,
+            "minimap_enemy_count": 0,
+            "minimap_contacts": [],
+            "capture_zones": [],
+            "minimap_islands": [],
+            "navigation_source": "unknown",
             "stop_after_current": False,
             "manual_intervention_latched": False,
             "manual_intervention_seconds": 0.0,
+            "minimap_snapshot": "",
+            "last_outcome": "unknown",
         }
         for key, value in defaults.items():
             state.setdefault(key, value)
@@ -443,15 +598,24 @@ class RunnerManager:
             state["manual_intervention_latched"] = True
             state["movement_mode"] = "manual_pause"
             state["movement_reason"] = "网页手动暂停；保持当前船速和舵位，不再下发新指令"
-        if state.get("rewards_status") == "recognized":
+        if state.get("rewards_status") in {"recognized", "unrecognized"}:
             rewards = state.get("last_rewards") or {}
             reward_round = int(state.get("rewards_round") or 0)
             reward_run_id = str(state.get("run_id") or run_id or "")
             if isinstance(rewards, dict) and reward_run_id and reward_round > 0:
-                self.store.upsert_auto_rewards(
+                recognized = state.get("rewards_status") == "recognized"
+                if recognized:
+                    self.store.upsert_auto_rewards(
+                        reward_run_id,
+                        reward_round,
+                        rewards,
+                    )
+                self.store.upsert_battle_result(
                     reward_run_id,
                     reward_round,
+                    state.get("last_outcome", "unknown"),
                     rewards,
+                    rewards_recognized=recognized,
                 )
         elapsed_seconds = float(state.get("elapsed_seconds") or 0.0)
         if running and state.get("started_at"):
@@ -460,7 +624,7 @@ class RunnerManager:
                 time.time() - float(state["started_at"]),
             )
             state["elapsed_seconds"] = elapsed_seconds
-        if run_id:
+        if run_id and running:
             self.store.update_run_progress(
                 run_id,
                 state.get("completed_rounds", 0),
@@ -472,6 +636,7 @@ class RunnerManager:
             "entering_game",
             "preparing",
             "battle",
+            "recovering",
             "requeueing",
             "returning",
             "collecting_rewards",
@@ -497,6 +662,14 @@ class RunnerManager:
                     "route_progress": 0.0,
                     "route_waypoint": 0,
                     "route_arrived": False,
+                    "minimap_player": None,
+                    "navigation_target": None,
+                    "capture_zone_center": None,
+                    "capture_zone_radius": None,
+                    "capture_zone_label": "",
+                    "nearest_enemy": None,
+                    "minimap_enemy_count": 0,
+                    "navigation_source": "unknown",
                     "stop_after_current": False,
                 }
             )
@@ -585,6 +758,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 {
                     "ships": load_ships(),
                     "modes": MODES,
+                    "custom_ship": load_custom_ship(),
                     "calibration": CalibrationStore().status().to_dict(),
                     "game": game_status(),
                 }
@@ -613,6 +787,14 @@ class ControlHandler(SimpleHTTPRequestHandler):
             payload = self._payload()
             if path == "/api/run/start":
                 self._json({"ok": True, **RUNNER.start(payload)}, HTTPStatus.CREATED)
+                return
+            if path == "/api/custom-ship":
+                name, secondary_range = validate_custom_ship(
+                    payload,
+                    allow_empty_name=True,
+                )
+                save_custom_ship(name, secondary_range)
+                self._json({"ok": True})
                 return
             if path == "/api/run/stop":
                 self._json({"ok": RUNNER.stop()})

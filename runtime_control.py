@@ -23,6 +23,7 @@ class RunLimits:
     state_file: Path | None = None
     stop_file: Path | None = None
     pause_file: Path | None = None
+    quick_battle: bool = False
 
     @classmethod
     def from_env(cls) -> "RunLimits":
@@ -31,6 +32,7 @@ class RunLimits:
         state = os.environ.get("WOWS_STATE_FILE", "").strip()
         stop = os.environ.get("WOWS_STOP_FILE", "").strip()
         pause = os.environ.get("WOWS_PAUSE_FILE", "").strip()
+        quick = os.environ.get("WOWS_QUICK_BATTLE", "").strip().lower()
         return cls(
             max_rounds=max_rounds,
             duration_minutes=duration,
@@ -39,6 +41,7 @@ class RunLimits:
             state_file=Path(state) if state else None,
             stop_file=Path(stop) if stop else None,
             pause_file=Path(pause) if pause else None,
+            quick_battle=quick in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -73,11 +76,13 @@ class RuntimeStatus:
     state: str = "idle"
     message: str = "等待启动"
     ship: str = ""
+    ship_display_name: str = ""
     mode: str = "asymmetric"
     completed_rounds: int = 0
     current_round: int = 0
     max_rounds: int = 0
     duration_minutes: float = 0
+    quick_battle: bool = False
     started_at: float = 0
     updated_at: float = field(default_factory=time.time)
     error: str = ""
@@ -101,26 +106,60 @@ class RuntimeStatus:
     route_progress: float = 0.0
     route_waypoint: int = 0
     route_arrived: bool = False
+    minimap_player: tuple[float, float] | None = None
+    minimap_heading: tuple[float, float] | None = None
+    navigation_target: tuple[float, float] | None = None
+    capture_zone_center: tuple[float, float] | None = None
+    capture_zone_radius: float | None = None
+    capture_zone_label: str = ""
+    nearest_enemy: tuple[float, float] | None = None
+    minimap_enemy_count: int = 0
+    minimap_contacts: list[dict[str, Any]] = field(default_factory=list)
+    capture_zones: list[dict[str, Any]] = field(default_factory=list)
+    minimap_islands: list[dict[str, Any]] = field(default_factory=list)
+    minimap_snapshot: str = ""
+    navigation_source: str = "unknown"
+    autopilot_enabled: bool = False
+    rudder_indicator: str = "neutral"
+    commanded_rudder: float | None = None
+    island_distance: float | None = None
+    health_percent: float | None = None
+    speed_knots: float | None = None
+    on_fire: bool = False
+    flooding: bool = False
+    damage_control_ready: bool = False
+    heal_ready: bool = False
     elapsed_seconds: float = 0.0
     stop_after_current: bool = False
     rewards_status: str = "pending"
     rewards_round: int = 0
     last_rewards: dict[str, Any] = field(default_factory=dict)
+    last_outcome: str = "unknown"
     manual_intervention_latched: bool = False
+    manual_intervention_active: bool = False
     manual_intervention_seconds: float = 0.0
     paused_by_user: bool = False
 
 
 class RuntimeReporter:
-    def __init__(self, limits: RunLimits, *, ship: str, mode: str):
+    def __init__(
+        self,
+        limits: RunLimits,
+        *,
+        ship: str,
+        mode: str,
+        ship_display_name: str = "",
+    ):
         self.limits = limits
         self.started_monotonic = time.monotonic()
         self.status = RuntimeStatus(
             run_id=limits.run_id,
             ship=ship,
+            ship_display_name=ship_display_name,
             mode=mode,
             max_rounds=limits.max_rounds,
             duration_minutes=limits.duration_minutes,
+            quick_battle=limits.quick_battle,
             started_at=time.time(),
         )
 

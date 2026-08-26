@@ -1,6 +1,8 @@
 import numpy as np
+from unittest.mock import patch
 
 from core.frame_guard import FrameGuard
+from core.vision import Vision
 
 
 def textured_frame(offset=0):
@@ -30,3 +32,22 @@ def test_identical_frames_trip_stale_guard():
     quality = guard.inspect(frame.copy(), now=2.1)
     assert not quality.valid
     assert quality.reason == "capture_stale"
+
+
+def test_vision_retries_transient_capture_failures_before_escalating():
+    class TransientCapture:
+        def __init__(self):
+            self.frames = [None, None, textured_frame()]
+            self.calls = 0
+
+        def capture_window(self, _hwnd):
+            self.calls += 1
+            return self.frames.pop(0)
+
+    capture = TransientCapture()
+    vision = Vision(screen_capture=capture)
+    with patch("core.vision.time.sleep", return_value=None):
+        image = vision.grab(1)
+
+    assert image is not None
+    assert capture.calls == 3

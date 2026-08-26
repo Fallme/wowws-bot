@@ -1,7 +1,10 @@
 """Screen capture and visual state recognition."""
 
+import base64
 import logging
 import math
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +45,11 @@ class IslandRisk:
 class CaptureZone:
     center: tuple[int, int]
     radius: float
+    label: str = ""
+    # Capture ring ownership read from the live minimap.  Friendly green
+    # points are intentionally not selected as an opening destination when a
+    # neutral white or hostile red lettered point is available.
+    state: str = "unknown"
 
 
 class Vision:
@@ -61,20 +69,84 @@ class Vision:
         self.green_hi = np.array([85, 255, 255])
 
     def grab(self, hwnd, *, allow_stale=False):
-        image = self.screen_capture.capture_window(hwnd)
-        if image is None:
-            raise CaptureFault("游戏画面截取失败")
-        quality = self.frame_guard.inspect(image)
-        self.last_frame_quality = quality
-        if not quality.valid and not (
-            allow_stale and quality.reason == "capture_stale"
-        ):
-            raise CaptureFault(f"游戏画面不可用: {quality.reason}")
-        return image
+        last_reason = "capture_failed"
+        for attempt in range(3):
+            image = self.screen_capture.capture_window(hwnd)
+            if image is None:
+                last_reason = "capture_failed"
+            else:
+                quality = self.frame_guard.inspect(image)
+                self.last_frame_quality = quality
+                if quality.valid or (
+                    allow_stale and quality.reason == "capture_stale"
+                ):
+                    return image
+                last_reason = quality.reason
+            if attempt < 2:
+                time.sleep(0.06 * (attempt + 1))
+        if last_reason == "capture_failed":
+            raise CaptureFault("游戏画面连续3次截取失败")
+        raise CaptureFault(f"游戏画面连续3次不可用: {last_reason}")
 
     def analyze_minimap(self, minimap):
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         return self.find_enemies_from_hsv(hsv), self.has_torpedoes_from_hsv(hsv)
+
+    @staticmethod
+    def is_autopilot_enabled(image) -> bool:
+        """Confirm the green ``M 自动驾驶开启`` HUD indicator."""
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        roi = image[
+            int(height * 0.79) : int(height * 0.88),
+            int(width * 0.10) : int(width * 0.22),
+        ]
+        if roi.size == 0:
+            return False
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        green = (
+            (hsv[:, :, 0] >= 35)
+            & (hsv[:, :, 0] <= 90)
+            & (hsv[:, :, 1] > 80)
+            & (hsv[:, :, 2] > 90)
+        )
+        return float(np.mean(green)) >= 0.008
+
+    @staticmethod
+    def detect_rudder_indicator(image) -> str:
+        """Read the green Q/E steering cue shown near the lower HUD centre."""
+        if image is None or image.size == 0:
+            return "neutral"
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        top, bottom = int(height * 0.70), int(height * 0.84)
+
+        def score(left_ratio, right_ratio):
+            roi = hsv[
+                top:bottom,
+                int(width * left_ratio) : int(width * right_ratio),
+            ]
+            if roi.size == 0:
+                return 0.0
+            green = (
+                (roi[:, :, 0] >= 35)
+                & (roi[:, :, 0] <= 90)
+                & (roi[:, :, 1] > 100)
+                & (roi[:, :, 2] > 120)
+            )
+            return float(np.mean(green))
+
+        q_score = score(0.42, 0.49)
+        e_score = score(0.51, 0.58)
+        threshold = 0.002
+        if q_score >= threshold and q_score > e_score * 1.35:
+            return "Q"
+        if e_score >= threshold and e_score > q_score * 1.35:
+            return "E"
+        if max(q_score, e_score) >= threshold:
+            return "ambiguous"
+        return "neutral"
 
     def find_player_on_minimap(self, minimap):
         pose = self.find_player_pose_on_minimap(minimap)
@@ -97,15 +169,16 @@ class Vision:
         dot = heading_x * target_x + heading_y * target_y
         return max(-1.0, min(math.atan2(cross, dot) / math.pi, 1.0))
 
-    def find_central_capture_zone(self, minimap):
-        """Find the capture circle nearest the geometric map centre.
+    def find_capture_zones(self, minimap, player=None):
+        """Return plausible capture circles visible on the minimap.
 
-        Station maps place the strategically important central cap closest to
-        the minimap centre.  Hough circle evidence works for neutral white
-        zones as well as red/green contested zones and ignores letter colour.
+        ``player`` is optional, but when supplied it lets us reject the large
+        gun/secondary range rings centred on the white player arrow.  Those
+        rings are the main reason a tactical-map click can silently target the
+        ship's current position instead of a capture area.
         """
         if minimap is None or minimap.size == 0:
-            return None
+            return []
         height, width = minimap.shape[:2]
         scale = min(width, height)
         gray = cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY)
@@ -114,35 +187,272 @@ class Vision:
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=scale * 0.08,
+            minDist=scale * 0.055,
             param1=100,
-            param2=max(24, scale * 0.055),
-            minRadius=max(12, int(scale * 0.045)),
-            maxRadius=max(20, int(scale * 0.15)),
+            param2=max(24, scale * 0.045),
+            minRadius=max(12, int(scale * 0.040)),
+            maxRadius=max(20, int(scale * 0.115)),
         )
         if circles is None:
-            return None
-        map_center = (width / 2.0, height / 2.0)
-        candidates = []
-        for raw_x, raw_y, raw_radius in circles[0]:
-            distance_to_center = math.hypot(
-                float(raw_x) - map_center[0],
-                float(raw_y) - map_center[1],
-            )
-            if distance_to_center > scale * 0.30:
+            return []
+        raw_candidates = []
+        for rank, (raw_x, raw_y, raw_radius) in enumerate(circles[0]):
+            center = (int(round(raw_x)), int(round(raw_y)))
+            if (
+                center[0] < scale * 0.035
+                or center[1] < scale * 0.035
+                or center[0] > width - scale * 0.035
+                or center[1] > height - scale * 0.035
+            ):
                 continue
-            candidates.append(
+            raw_candidates.append(
                 (
-                    distance_to_center,
+                    rank,
                     CaptureZone(
-                        center=(int(round(raw_x)), int(round(raw_y))),
+                        center=center,
                         radius=float(raw_radius),
+                        state=self._capture_zone_state(
+                            minimap,
+                            center,
+                            float(raw_radius),
+                        ),
                     ),
                 )
             )
+
+        # In many station battles the capture circles form an evenly spaced
+        # row at an arbitrary angle. That relationship is much more reliable
+        # than circle colour:
+        # the player's concentric range rings and circular island bays are
+        # otherwise easy Hough false positives.  The middle cap can be heavily
+        # obscured by the white player arrow, so infer its exact centre from
+        # the two endpoints after requiring actual circular evidence nearby.
+        endpoints = [
+            item
+            for item in raw_candidates
+            if scale * 0.055 <= item[1].radius <= scale * 0.112
+            and (
+                player is None
+                or math.dist(item[1].center, player) > scale * 0.050
+            )
+        ]
+        best_formation = None
+        for left_index, (left_rank, left) in enumerate(endpoints):
+            for right_rank, right in endpoints[left_index + 1 :]:
+                first, third = left, right
+                separation = math.dist(first.center, third.center)
+                if not scale * 0.28 <= separation <= scale * 0.70:
+                    continue
+                if abs(first.radius - third.radius) > scale * 0.025:
+                    continue
+                midpoint = (
+                    (first.center[0] + third.center[0]) / 2.0,
+                    (first.center[1] + third.center[1]) / 2.0,
+                )
+                middle_evidence = [
+                    (rank, zone)
+                    for rank, zone in raw_candidates
+                    if zone not in (first, third)
+                    and scale * 0.045 <= zone.radius <= scale * 0.110
+                    and math.dist(zone.center, midpoint) <= scale * 0.070
+                ]
+                if not middle_evidence:
+                    continue
+                middle_rank, _middle = min(
+                    middle_evidence,
+                    key=lambda item: (math.dist(item[1].center, midpoint), item[0]),
+                )
+                score = (
+                    left_rank
+                    + right_rank
+                    + middle_rank * 0.35
+                    + abs(separation / scale - 0.42) * 30.0
+                    + abs(first.radius - third.radius) / scale * 35.0
+                )
+                if best_formation is None or score < best_formation[0]:
+                    radius = (first.radius + third.radius) / 2.0
+                    ordered = sorted(
+                        (first, third),
+                        key=(
+                            (lambda zone: zone.center[0])
+                            if abs(first.center[0] - third.center[0])
+                            >= abs(first.center[1] - third.center[1])
+                            else (lambda zone: zone.center[1])
+                        ),
+                    )
+                    best_formation = (
+                        score,
+                        [
+                            CaptureZone(
+                                ordered[0].center,
+                                radius,
+                                "A",
+                                ordered[0].state,
+                            ),
+                            CaptureZone(
+                                (int(round(midpoint[0])), int(round(midpoint[1]))),
+                                radius,
+                                "B",
+                                _middle.state,
+                            ),
+                            CaptureZone(
+                                ordered[1].center,
+                                radius,
+                                "C",
+                                ordered[1].state,
+                            ),
+                        ],
+                    )
+        if best_formation is not None:
+            return best_formation[1]
+
+        # Some maps use a triangular or otherwise staggered point layout.
+        # Dynamically cluster the equally sized high-confidence circles rather
+        # than applying coordinates from a known map. Nearby duplicate Hough
+        # fits are collapsed; spatially separated peers are retained.
+        uniform_groups = []
+        for anchor_rank, anchor in endpoints:
+            peers = [
+                (rank, zone)
+                for rank, zone in endpoints
+                if abs(zone.radius - anchor.radius) <= scale * 0.014
+            ]
+            distinct = []
+            for rank, zone in sorted(peers, key=lambda item: item[0]):
+                if all(
+                    math.dist(zone.center, kept.center) > scale * 0.12
+                    for _kept_rank, kept in distinct
+                ):
+                    distinct.append((rank, zone))
+            if len(distinct) >= 2:
+                uniform_groups.append(
+                    (
+                        sum(rank for rank, _zone in distinct[:4])
+                        + abs(anchor.radius / scale - 0.075) * 20.0,
+                        distinct[:4],
+                    )
+                )
+        if uniform_groups:
+            _score, group = min(uniform_groups, key=lambda item: item[0])
+            zones = [zone for _rank, zone in group]
+            zones.sort(key=lambda zone: (zone.center[0], zone.center[1]))
+            return [
+                CaptureZone(
+                    zone.center,
+                    zone.radius,
+                    chr(ord("A") + index),
+                    zone.state,
+                )
+                for index, zone in enumerate(zones)
+            ]
+
+        # Non-three-point maps retain a conservative fallback.  Exclude any
+        # circle centred on or enclosing the player so a range ring can never
+        # become an autopilot destination.
+        candidates = []
+        for _rank, zone in raw_candidates:
+            if not scale * 0.055 <= zone.radius <= scale * 0.112:
+                continue
+            if player is not None:
+                player_offset = math.dist(zone.center, player)
+                if player_offset <= scale * 0.055:
+                    continue
+                if player_offset <= zone.radius * 0.72:
+                    continue
+            candidates.append(zone)
+        return candidates
+
+    def find_nearest_capture_zone(self, minimap, player):
+        """Find the nearest neutral/hostile lettered capture point.
+
+        The player's white arrow and the ship's range/stealth circles are
+        excluded by ``find_capture_zones``.  Of the remaining A/B/C/D points,
+        prefer white/neutral or red/enemy ownership: sailing back to a green
+        friendly cap is not an opening objective unless it is the only point
+        currently visible.
+        """
+        if player is None:
+            return None
+        candidates = self.find_capture_zones(minimap, player=player)
+        return self.select_navigation_capture_zone(candidates, player)
+
+    @staticmethod
+    def select_navigation_capture_zone(candidates, player):
+        """Select an eligible A/B/C/D zone from already-detected candidates."""
+        if player is None or not candidates:
+            return None
         if not candidates:
             return None
-        return min(candidates, key=lambda candidate: candidate[0])[1]
+        preferred = [
+            zone
+            for zone in candidates
+            if getattr(zone, "state", "unknown") in {"neutral", "hostile", "unknown"}
+        ]
+        return min(
+            preferred or candidates,
+            key=lambda zone: math.dist(zone.center, player),
+        )
+
+    @staticmethod
+    def _capture_zone_state(minimap, center, radius: float) -> str:
+        """Classify the coloured A/B/C/D ring without using ship range rings."""
+        if minimap is None or minimap.size == 0 or radius <= 1:
+            return "unknown"
+        height, width = minimap.shape[:2]
+        yy, xx = np.ogrid[:height, :width]
+        distance = np.hypot(xx - float(center[0]), yy - float(center[1]))
+        # The ownership colour sits on the capture outline. Sampling an
+        # annulus prevents the island texture inside a point from dominating.
+        annulus = (distance >= radius * 0.76) & (distance <= radius * 1.10)
+        sample_count = int(np.count_nonzero(annulus))
+        if sample_count < 20:
+            return "unknown"
+        hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+        red = (
+            ((hsv[:, :, 0] <= 15) | (hsv[:, :, 0] >= 165))
+            & (hsv[:, :, 1] >= 75)
+            & (hsv[:, :, 2] >= 75)
+            & annulus
+        )
+        green = (
+            (hsv[:, :, 0] >= 35)
+            & (hsv[:, :, 0] <= 95)
+            & (hsv[:, :, 1] >= 55)
+            & (hsv[:, :, 2] >= 65)
+            & annulus
+        )
+        neutral = (
+            (hsv[:, :, 1] <= 75)
+            & (hsv[:, :, 2] >= 125)
+            & annulus
+        )
+        red_ratio = float(np.count_nonzero(red)) / sample_count
+        green_ratio = float(np.count_nonzero(green)) / sample_count
+        neutral_ratio = float(np.count_nonzero(neutral)) / sample_count
+        if red_ratio >= 0.012:
+            return "hostile"
+        if green_ratio >= 0.012:
+            return "friendly"
+        if neutral_ratio >= 0.045:
+            return "neutral"
+        return "unknown"
+
+    def find_central_capture_zone(self, minimap):
+        """Find the plausible capture circle nearest the geometric map centre."""
+        candidates = self.find_capture_zones(minimap)
+        if not candidates:
+            return None
+        height, width = minimap.shape[:2]
+        scale = min(width, height)
+        map_center = (width / 2.0, height / 2.0)
+        central = [
+            zone
+            for zone in candidates
+            if math.dist(zone.center, map_center) <= scale * 0.30
+        ]
+        if not central:
+            return None
+        return min(central, key=lambda zone: math.dist(zone.center, map_center))
 
     def find_player_pose_on_minimap(self, minimap):
         """Find the bright player arrow using its concentric yellow range ring.
@@ -152,10 +462,15 @@ class Vision:
         yellow gun-range circle, which gives a much stronger live signal.
         """
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+        # The player marker has a dark outline and can be semi-transparent
+        # while the native autopilot is active.  The older near-white-only
+        # threshold lost that arrow on bright/snow maps, which in turn made
+        # the route layer guess a bearing.  Keep the range-circle evidence
+        # below as the false-positive guard, but accept the full bright arrow.
         mask = cv2.inRange(
             hsv,
-            np.array([0, 0, 185]),
-            np.array([180, 75, 255]),
+            np.array([0, 0, 155]),
+            np.array([180, 135, 255]),
         )
         mask = cv2.morphologyEx(
             mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)
@@ -237,11 +552,15 @@ class Vision:
         if not candidates:
             return None
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
-        minimum_coverage = 18
-        minimum_score = max(40, int(scale * scale * 0.00035))
+        # Only portions of the range circle can be visible behind islands or
+        # capture overlays.  Twelve occupied sectors still describe a ring;
+        # requiring eighteen made the live white arrow disappear precisely
+        # when the ship approached an island.
+        minimum_coverage = 12
+        minimum_score = max(32, int(scale * scale * 0.00024))
         if candidates[0][0] < minimum_coverage or candidates[0][1] < minimum_score:
             return None
-        if len(candidates) > 1 and candidates[0][0] < candidates[1][0] * 1.25:
+        if len(candidates) > 1 and candidates[0][0] < candidates[1][0] * 1.08:
             return None
         best = candidates[0]
         return PlayerPose(
@@ -309,7 +628,7 @@ class Vision:
             & (saturation > 70)
         )
         colored_land[ui_overlay] = 0
-        capture_zone = self.find_central_capture_zone(minimap)
+        capture_zone = self.find_nearest_capture_zone(minimap, pose.position)
         if capture_zone is not None:
             yy, xx = np.indices(colored_land.shape)
             capture_disk = (
@@ -406,8 +725,15 @@ class Vision:
         forward = delta_x * heading_x + delta_y * heading_y
         lateral = delta_x * (-heading_y) + delta_y * heading_x
         minimum_forward = scale * 0.018
+        # Islands only justify evasive steering when they are directly in the
+        # current bow corridor.  The old 0.34 widening factor included large
+        # off-bow islands and made a full-speed ship start a needless arc.
+        # Keep a longer look-ahead for the navigation display and route
+        # planner, but the narrow corridor below ensures only geometry on the
+        # actual heading is reported.  Movement only reacts at its much
+        # shorter warning/emergency distances.
         maximum_forward = diagonal * 0.18
-        corridor_half_width = scale * 0.022 + forward * 0.34
+        corridor_half_width = scale * 0.018 + forward * 0.18
         in_corridor = (
             (forward >= minimum_forward)
             & (forward <= maximum_forward)
@@ -440,6 +766,98 @@ class Vision:
             avoidance_rudder = 1.0 if right_clearance > left_clearance else -1.0
         return IslandRisk(distance, avoidance_rudder)
 
+    def find_minimap_island_outlines(self, minimap, *, maximum_shapes: int = 24):
+        """Return simplified island polygons for the browser radar.
+
+        This intentionally derives coastline candidates from the same live
+        minimap pixels used by navigation.  It is not a copied image: rings,
+        labels, contacts and player glyphs are filtered first, then the
+        remaining terrain components are reduced to small normalized polygons.
+        """
+        if minimap is None or minimap.size == 0:
+            return []
+        height, width = minimap.shape[:2]
+        scale = min(width, height)
+        hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0].astype(np.float64)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        ocean_samples = hue[(saturation > 25) & (value > 25)]
+        ocean_hue = float(np.median(ocean_samples)) if ocean_samples.size else 100.0
+        hue_delta = np.minimum(
+            np.abs(hue - ocean_hue),
+            180.0 - np.abs(hue - ocean_hue),
+        )
+        terrain = (
+            (hue_delta > 16)
+            & (saturation > 22)
+            & (value > 28)
+        ).astype(np.uint8) * 255
+        # Red/green team marks, capture circles and smoke overlays are not
+        # coastlines.  Remove them before connected-component extraction.
+        ui_overlay = (
+            (((hue >= 35) & (hue <= 95)) | (hue <= 8) | (hue >= 168))
+            & (saturation > 70)
+        )
+        terrain[ui_overlay] = 0
+        for zone in self.find_capture_zones(minimap):
+            yy, xx = np.indices(terrain.shape)
+            terrain[
+                (xx - zone.center[0]) ** 2 + (yy - zone.center[1]) ** 2
+                <= (zone.radius * 1.12) ** 2
+            ] = 0
+        terrain = cv2.morphologyEx(
+            terrain, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+        )
+        terrain = cv2.morphologyEx(
+            terrain, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+        )
+        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            terrain, connectivity=8
+        )
+        minimum_pixels = max(70, int(scale * scale * 0.00018))
+        candidates = []
+        for label in range(1, labels_count):
+            x, y, component_width, component_height, pixels = stats[label]
+            bounding_area = max(component_width * component_height, 1)
+            density = pixels / bounding_area
+            if pixels < minimum_pixels or density < 0.15:
+                continue
+            if max(component_width, component_height) < max(8, int(scale * 0.014)):
+                continue
+            if (
+                component_width > scale * 0.52
+                or component_height > scale * 0.52
+                or bounding_area > scale * scale * 0.22
+            ):
+                continue
+            component = (labels == label).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+            simplified = cv2.approxPolyDP(contour, perimeter * 0.035, True)
+            if len(simplified) < 3:
+                continue
+            points = [
+                [
+                    round(float(point[0][0]) / max(width, 1), 4),
+                    round(float(point[0][1]) / max(height, 1), 4),
+                ]
+                for point in simplified[:12]
+            ]
+            candidates.append((int(pixels), points))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [
+            {"points": points}
+            for _, points in candidates[: max(0, int(maximum_shapes))]
+        ]
+
     @staticmethod
     def _ray_clearance(delta_x, delta_y, heading, *, angle, scale, maximum):
         cosine = math.cos(angle)
@@ -459,10 +877,21 @@ class Vision:
         return float(np.min(forward[corridor]))
 
     def find_enemies_from_hsv(self, hsv):
+        # Live enemy minimap glyphs are saturated red (hue about 3-6). Brown
+        # islands sit around hue 14-23 with low saturation; the former broad
+        # red/orange mask therefore produced several persistent "enemy" tracks
+        # at spawn and cancelled native autopilot after only a few seconds.
         mask = (
-            cv2.inRange(hsv, self.red_lo1, self.red_hi1)
-            | cv2.inRange(hsv, self.red_lo2, self.red_hi2)
-            | cv2.inRange(hsv, self.orange_lo, self.orange_hi)
+            cv2.inRange(
+                hsv,
+                np.array([0, 100, 90]),
+                np.array([10, 255, 255]),
+            )
+            | cv2.inRange(
+                hsv,
+                np.array([165, 100, 90]),
+                np.array([180, 255, 255]),
+            )
         )
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -593,6 +1022,36 @@ class Vision:
         )
         return None
 
+    @staticmethod
+    def minimap_snapshot_data_url(minimap, *, maximum_side: int = 520) -> str:
+        """Encode the visible game minimap for the local control panel.
+
+        The browser receives the actual minimap crop, not a reconstructed
+        schematic.  This keeps islands, grid, ship arrow, contacts and capture
+        circles in exactly the same relative positions as the game HUD.
+        """
+        if minimap is None or minimap.size == 0:
+            return ""
+        image = minimap
+        height, width = image.shape[:2]
+        maximum_side = max(120, int(maximum_side))
+        if max(width, height) > maximum_side:
+            scale = maximum_side / max(width, height)
+            image = cv2.resize(
+                image,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+        )
+        if not ok:
+            return ""
+        payload = base64.b64encode(encoded.tobytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{payload}"
+
     def find_health_bar(self, image):
         area = self._crop_region(image, HEALTH_BAR_REGION)
         return area if area.size else None
@@ -628,15 +1087,23 @@ class Vision:
         if area is None or area.size == 0:
             return None
         hsv = cv2.cvtColor(area, cv2.COLOR_BGR2HSV)
-        # The live UI uses a yellow/orange/red ship silhouette once health has
-        # fallen below the safe green range.  Measure the longest continuous
-        # filled scanline; scanning the whole lower screen previously measured
-        # sea and aiming-sector colours instead.
-        mask = cv2.inRange(
+        # The ship bar remains green for a large part of the HP range, then
+        # turns yellow/orange/red.  Reading only warm colours made a healthy
+        # or moderately damaged ship look like an OCR failure and left a
+        # stale cached percentage on the panel.  The longest horizontal run
+        # in this tight lower-left ROI is the filled HP segment; consumable
+        # icons are too short to pass that test.
+        warm = cv2.inRange(
             hsv,
-            np.array([0, 70, 80]),
+            np.array([0, 65, 75]),
             np.array([42, 255, 255]),
         )
+        green = cv2.inRange(
+            hsv,
+            np.array([35, 55, 70]),
+            np.array([95, 255, 255]),
+        )
+        mask = cv2.bitwise_or(warm, green)
         best_run = 0
         for row in mask:
             indices = np.flatnonzero(row)
@@ -681,11 +1148,23 @@ class Vision:
         colorful = cv2.inRange(
             hsv, np.array([0, 60, 80]), np.array([180, 255, 255])
         )
-        ratio = np.count_nonzero(colorful) / max(colorful.size, 1)
-        logger.debug("Ship bar colorful ratio: %.1f%%", ratio * 100)
+        colorful_ratio = np.count_nonzero(colorful) / max(colorful.size, 1)
+        # A port carousel contains many card edges, ship thumbnails and text
+        # across the full width. During battle, the compass/consumables/minimap
+        # can be equally colourful but leave most of this band visually sparse.
+        # Colour alone therefore misclassified active battles as the port.
+        gray = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 180)
+        edge_ratio = np.count_nonzero(edges) / max(edges.size, 1)
+        logger.debug(
+            "Ship bar evidence: colorful=%.1f%% edges=%.1f%%",
+            colorful_ratio * 100,
+            edge_ratio * 100,
+        )
         # Commander-less ships make much of the grid gray; live 2560x1600
-        # ports can fall near 0.20 even though the carousel is fully visible.
-        return ratio > 0.16
+        # ports can fall near 0.20 colour coverage even though the carousel is
+        # fully visible. The dense edge structure remains stable.
+        return colorful_ratio > 0.16 and edge_ratio > 0.125
 
     def in_port(self, image):
         battle_button = self._crop_region(image, PORT_BATTLE_BUTTON)
@@ -783,6 +1262,69 @@ class Vision:
         # treating a single shell tracer or aiming marker as a fire condition.
         return len(areas) >= 2 and areas[0] >= 35 and sum(areas[:4]) >= 75
 
+    def is_flooding(self, image):
+        """Conservatively detect the blue flooding status icon near the reticle."""
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        status = image[
+            int(height * 0.47) : int(height * 0.55),
+            int(width * 0.485) : int(width * 0.555),
+        ]
+        if status.size == 0:
+            return False
+        hsv = cv2.cvtColor(status, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(
+            hsv,
+            np.array([88, 110, 120]),
+            np.array([125, 255, 255]),
+        )
+        labels, _, stats, _ = cv2.connectedComponentsWithStats(
+            blue, connectivity=8
+        )
+        if labels <= 1:
+            return False
+        areas = [int(value) for value in stats[1:, cv2.CC_STAT_AREA]]
+        # A blue ship/team marker is not sufficient: require a compact status
+        # glyph of meaningful size inside the dedicated HUD area.
+        return sum(area for area in areas if 18 <= area <= 520) >= 55
+
+    @staticmethod
+    def read_speed_knots(image, backend) -> float | None:
+        """Read the player's lower-left speed readout without using viewport targets."""
+        if image is None or image.size == 0 or backend is None:
+            return None
+        height, width = image.shape[:2]
+        # This is the speed/engine sector left of the ship, deliberately
+        # outside the central target labels and lower-right minimap.
+        crop = image[
+            int(height * 0.83) : int(height * 0.96),
+            int(width * 0.105) : int(width * 0.205),
+        ]
+        if crop.size == 0:
+            return None
+        tokens = backend.recognize(crop)
+        candidates = []
+        for token in tokens:
+            text = str(token.text or "")
+            match = re.search(
+                r"(?<!\d)(\d{1,2}(?:[\.,]\d)?)\s*(?:kts?|节)",
+                text,
+                flags=re.IGNORECASE,
+            )
+            # OCR occasionally drops the ``kts`` suffix but preserves the
+            # decimal; do not accept gear labels such as ``3/4``.
+            if match is None:
+                match = re.search(r"(?<!\d)(\d{1,2}[\.,]\d)(?!\d)", text)
+            if match is None:
+                continue
+            value = float(match.group(1).replace(",", "."))
+            if 0.0 <= value <= 75.0:
+                candidates.append((float(getattr(token, "confidence", 0.0)), value))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
     def in_exit_confirmation(self, image):
         button = self._crop_region(image, EXIT_CONTINUE_BUTTON)
         blue_ratio = self._color_ratio(button, (90, 70, 70), (135, 255, 255))
@@ -807,9 +1349,49 @@ class Vision:
         bright_ratio = np.count_nonzero(gray > 165) / max(gray.size, 1)
         return bright_ratio > 0.004
 
+    @staticmethod
+    def _is_port_reward_overlay(image) -> bool:
+        """Reject the dimmed ``已获得 / 补给箱`` port modal as battle HUD.
+
+        The overlay hides the port carousel while leaving textured artwork in
+        the minimap region, so the normal port and battle guards can both lose
+        their strongest evidence.  Its combination of a low-contrast full
+        screen scrim and a bright, edge-rich heading at the top centre is
+        stable and absent from the live battle fixtures.
+        """
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        heading = image[
+            int(height * 0.03) : int(height * 0.12),
+            int(width * 0.42) : int(width * 0.58),
+        ]
+        if heading.size == 0:
+            return False
+        heading_hsv = cv2.cvtColor(heading, cv2.COLOR_BGR2HSV)
+        heading_gray = cv2.cvtColor(heading, cv2.COLOR_BGR2GRAY)
+        pale_heading = (
+            (heading_gray > 150) & (heading_hsv[:, :, 1] < 60)
+        )
+        edge_ratio = np.count_nonzero(
+            cv2.Canny(heading_gray, 60, 150)
+        ) / max(heading_gray.size, 1)
+        return (
+            float(gray.mean()) < 70
+            and float(gray.std()) < 35
+            and float(np.mean(pale_heading)) > 0.03
+            and edge_ratio > 0.02
+        )
+
     def classify_screen(self, image):
         """Classify only states with positive UI evidence; never infer by exclusion."""
         if image is None or image.size == 0:
+            return ScreenState.UNKNOWN
+        # This port modal has neither trustworthy port nor battle controls.
+        # Keep it UNKNOWN so recovery can dismiss/retry it explicitly instead
+        # of ever entering the combat loop.
+        if self._is_port_reward_overlay(image):
             return ScreenState.UNKNOWN
         loading_seen = self.in_loading(image)
         # Battle HUD evidence wins over overlapping result/port colour bands.

@@ -1,3 +1,5 @@
+import pytest
+
 from core.keyboard import KeyboardController
 
 
@@ -127,3 +129,27 @@ def test_reassert_full_speed_resends_w_when_cached_notch_is_already_full():
     assert backend.events.count(("tap", "w")) == 8
     assert controller.last_dispatch.action == "full_speed_reassert"
     assert controller.last_dispatch.throttle_notch == 4
+
+
+def test_focus_guard_runs_before_native_key_input():
+    backend = RecordingBackend()
+    focus_checks = []
+    controller = KeyboardController(
+        backend,
+        focus_guard=lambda: focus_checks.append("checked") or True,
+    )
+
+    controller.full_speed()
+
+    assert focus_checks == ["checked"]
+    assert backend.events == [("tap", "w")] * 4
+
+
+def test_focus_guard_blocks_native_key_input_when_game_cannot_activate():
+    backend = RecordingBackend()
+    controller = KeyboardController(backend, focus_guard=lambda: False)
+
+    with pytest.raises(RuntimeError, match="游戏窗口不在前台"):
+        controller.full_speed()
+
+    assert backend.events == []

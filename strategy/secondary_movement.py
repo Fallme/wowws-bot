@@ -93,7 +93,7 @@ class SecondaryMovementController:
         self.opening_seconds = max(0.0, float(opening_seconds))
         self.secondary_range_km = self._bounded(secondary_range_km, 2.0, 30.0)
         self.island_warning_distance = self._bounded(
-            island_warning_distance, 0.025, 0.12
+            island_warning_distance, 0.025, 0.18
         )
         self.island_emergency_distance = self._bounded(
             island_emergency_distance, 0.012, self.island_warning_distance
@@ -129,7 +129,7 @@ class SecondaryMovementController:
     def _island_rudder(self, state: SecondaryMovementInput) -> float:
         rudder = state.island_avoidance_rudder
         if rudder is None or abs(rudder) < 0.2:
-            return 0.0
+            return 0.76 * self.preferred_side
         return 0.76 if rudder > 0 else -0.76
 
     def _evasion_rudder(self, state: SecondaryMovementInput) -> float:
@@ -140,11 +140,9 @@ class SecondaryMovementController:
 
     @staticmethod
     def _enemy_bearing(state: SecondaryMovementInput) -> float | None:
-        if state.minimap_target_bearing is not None:
-            return state.minimap_target_bearing
-        if state.target_offset_x is not None:
-            return state.target_offset_x * 0.55
-        return None
+        # Steering has exactly one source of truth: player/enemy markers on
+        # the minimap. Viewport labels can belong to aircraft or allies.
+        return state.minimap_target_bearing
 
     @staticmethod
     def _objective_bearing(state: SecondaryMovementInput) -> float | None:
@@ -237,7 +235,11 @@ class SecondaryMovementController:
             )
 
         distance, distance_source = self._effective_distance(state)
-        arrived = state.route_arrived or state.inside_capture_point
+        # Route-planner arrival is historical and can remain true after the
+        # ship drifts out of a point.  Current minimap position is authoritative:
+        # after the contacted enemy dies, resume full-speed travel until the
+        # white player marker is actually back inside the objective.
+        arrived = state.inside_capture_point
 
         # Until the central objective is reached, the route owns steering.
         # Enemies are observed for later contact but cannot pull the ship away

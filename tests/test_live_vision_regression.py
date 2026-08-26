@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 
+from core.ocr import OcrToken
 from core.ui import NO_COMMANDER_CONFIRM_BUTTON
 from core.vision import PlayerPose, Vision
 
@@ -67,6 +68,18 @@ def test_minimap_grid_converts_one_cell_to_five_kilometres():
     assert Vision().minimap_pixels_to_km(minimap, 69) == pytest.approx(5.0)
 
 
+def test_speed_ocr_uses_kts_value_not_engine_notch_label(live_frame):
+    class SpeedBackend:
+        @staticmethod
+        def recognize(_image):
+            return [
+                OcrToken("3/4", 0.99, ((10, 0),)),
+                OcrToken("23.6kts", 0.92, ((90, 0),)),
+            ]
+
+    assert Vision.read_speed_knots(live_frame, SpeedBackend()) == pytest.approx(23.6)
+
+
 def test_central_capture_circle_is_selected():
     minimap = np.full((420, 420, 3), (80, 105, 120), dtype=np.uint8)
     cv2.circle(minimap, (210, 210), 45, (220, 220, 220), 2)
@@ -79,6 +92,89 @@ def test_central_capture_circle_is_selected():
     assert zone.center[0] == pytest.approx(210, abs=4)
     assert zone.center[1] == pytest.approx(210, abs=4)
     assert zone.radius == pytest.approx(45, abs=5)
+
+
+def test_nearest_capture_circle_is_selected_from_player_position():
+    minimap = np.full((420, 420, 3), (80, 105, 120), dtype=np.uint8)
+    cv2.circle(minimap, (95, 100), 40, (220, 220, 220), 2)
+    cv2.circle(minimap, (315, 300), 40, (220, 220, 220), 2)
+
+    zone = Vision().find_nearest_capture_zone(minimap, (70, 210))
+
+    assert zone is not None
+    assert zone.center[0] == pytest.approx(95, abs=4)
+    assert zone.center[1] == pytest.approx(100, abs=4)
+
+
+def test_three_capture_points_are_recovered_from_alignment_amid_range_rings():
+    minimap = np.full((690, 690, 3), (45, 58, 64), dtype=np.uint8)
+    player = (355, 165)
+    # Player range rings and an offset circular decoy must not become points.
+    cv2.circle(minimap, player, 70, (210, 210, 210), 2)
+    cv2.circle(minimap, (430, 235), 62, (205, 205, 205), 2)
+    for center in ((180, 350), (325, 350), (470, 350)):
+        cv2.circle(minimap, center, 48, (230, 230, 230), 2)
+
+    zones = Vision().find_capture_zones(minimap, player)
+
+    assert [zone.label for zone in zones] == ["A", "B", "C"]
+    assert [zone.center[0] for zone in zones] == pytest.approx(
+        [180, 325, 470], abs=5
+    )
+    assert Vision().find_nearest_capture_zone(minimap, player).label == "B"
+
+
+def test_obscured_middle_capture_point_is_inferred_and_player_is_inside():
+    minimap = np.full((684, 684, 3), (45, 58, 64), dtype=np.uint8)
+    player = (335, 327)
+    cv2.circle(minimap, (177, 347), 48, (230, 230, 230), 2)
+    cv2.circle(minimap, (320, 346), 64, (210, 210, 210), 2)
+    cv2.circle(minimap, (463, 346), 48, (230, 230, 230), 2)
+
+    zone = Vision().find_nearest_capture_zone(minimap, player)
+
+    assert zone.label == "B"
+    assert zone.center == pytest.approx((320, 346), abs=5)
+    assert np.hypot(player[0] - zone.center[0], player[1] - zone.center[1]) < zone.radius
+
+
+def test_capture_formation_is_detected_at_map_specific_diagonal_angle():
+    minimap = np.full((600, 600, 3), (45, 58, 64), dtype=np.uint8)
+    centers = ((150, 180), (300, 300), (450, 420))
+    for center in centers:
+        cv2.circle(minimap, center, 44, (230, 230, 230), 2)
+
+    zones = Vision().find_capture_zones(minimap, (520, 100))
+
+    assert len(zones) == 3
+    for zone, expected in zip(zones, centers):
+        assert zone.center == pytest.approx(expected, abs=5)
+
+
+def test_live_nearest_capture_circle_rejects_player_range_ring(live_frame):
+    vision = Vision()
+    minimap = vision.find_minimap(live_frame)
+    player = vision.find_player_on_minimap(minimap)
+
+    zone = vision.find_nearest_capture_zone(minimap, player)
+
+    assert zone is not None
+    assert zone.center[0] == pytest.approx(133, abs=6)
+    assert zone.center[1] == pytest.approx(353, abs=6)
+
+
+def test_live_capture_letters_keep_their_visible_ownership_state(live_frame):
+    vision = Vision()
+    minimap = vision.find_minimap(live_frame)
+    player = vision.find_player_on_minimap(minimap)
+
+    zones = vision.find_capture_zones(minimap, player)
+
+    assert [(zone.label, zone.state) for zone in zones] == [
+        ("A", "hostile"),
+        ("B", "friendly"),
+        ("C", "neutral"),
+    ]
 
 
 def test_player_range_ring_beats_dense_yellow_clutter():
@@ -146,6 +242,62 @@ def test_connected_grid_and_range_rings_are_not_islands():
     pose = PlayerPose(position=(160, 190), heading=(0.0, -1.0))
 
     assert Vision().find_island_risk(minimap, pose) is None
+
+
+def test_autopilot_hud_indicator_requires_green_enabled_text():
+    enabled = np.zeros((1600, 2560, 3), dtype=np.uint8)
+    disabled = enabled.copy()
+    enabled[1280:1380, 300:520] = (40, 190, 40)
+    disabled[1280:1380, 300:520] = (150, 150, 150)
+
+    assert Vision().is_autopilot_enabled(enabled)
+    assert not Vision().is_autopilot_enabled(disabled)
+
+
+def test_minimap_enemy_mask_rejects_brown_islands_and_clusters_red_glyphs():
+    hsv = np.zeros((320, 320, 3), dtype=np.uint8)
+    hsv[:] = (100, 55, 75)
+    # Saturated brown/orange terrain used to be counted as nearby enemies.
+    cv2.circle(hsv, (85, 85), 35, (20, 80, 170), -1)
+    cv2.rectangle(hsv, (180, 55), (250, 105), (16, 70, 155), -1)
+    # Two red ship markers, each with a nearby label stroke.
+    for center_x, center_y in ((120, 210), (245, 180)):
+        cv2.fillConvexPoly(
+            hsv,
+            np.array(
+                [
+                    [center_x, center_y - 8],
+                    [center_x - 7, center_y + 7],
+                    [center_x + 7, center_y + 7],
+                ],
+                dtype=np.int32,
+            ),
+            (4, 230, 245),
+        )
+        cv2.rectangle(
+            hsv,
+            (center_x + 14, center_y - 3),
+            (center_x + 22, center_y + 3),
+            (4, 220, 235),
+            -1,
+        )
+
+    enemies = Vision().find_enemies_from_hsv(hsv)
+
+    assert len(enemies) == 2
+    assert all(point[1] > 150 for point in enemies)
+
+
+def test_rudder_indicator_reads_q_and_e_without_viewport_navigation():
+    neutral = np.zeros((1600, 2560, 3), dtype=np.uint8)
+    q_frame = neutral.copy()
+    e_frame = neutral.copy()
+    q_frame[1210:1260, 1100:1140] = (40, 210, 40)
+    e_frame[1210:1260, 1390:1430] = (40, 210, 40)
+
+    assert Vision().detect_rudder_indicator(neutral) == "neutral"
+    assert Vision().detect_rudder_indicator(q_frame) == "Q"
+    assert Vision().detect_rudder_indicator(e_frame) == "E"
 
 
 def test_no_commander_detector_requires_confirm_button():

@@ -12,6 +12,8 @@ import numpy as np
 import win32gui
 import win32ui
 
+from core.window import ensure_game_window_foreground, get_client_rect
+
 
 logger = logging.getLogger("capture")
 PW_RENDERFULLCONTENT = 0x00000002
@@ -34,14 +36,12 @@ class ScreenCapture:
 
     @staticmethod
     def _window_size(hwnd):
-        rect = ctypes.wintypes.RECT()
-        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        """Return the client-area bounds; never capture desktop around it."""
+        try:
+            rect = get_client_rect(hwnd)
+        except Exception:
             return None
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-        if width <= 0 or height <= 0:
-            return None
-        return rect.left, rect.top, width, height
+        return rect["left"], rect["top"], rect["width"], rect["height"]
 
     @staticmethod
     def _usable(image):
@@ -103,6 +103,14 @@ class ScreenCapture:
         unobstructed and live, so prefer it. When another window is foreground,
         retain the occlusion-safe PrintWindow path.
         """
+        # OCR and vision are allowed to see only a focused, verified game
+        # client area.  Cropping a background desktop rectangle could include
+        # the web control panel or another monitor and corrupt both scene
+        # recognition and reward OCR.
+        if not ensure_game_window_foreground(hwnd):
+            self.last_backend = "failed"
+            self.last_error = "game_window_not_foreground"
+            return None
         geometry = self._window_size(hwnd)
         if geometry is None:
             self.last_error = "window_rect_invalid"
@@ -111,19 +119,9 @@ class ScreenCapture:
 
         with self._lock:
             errors = []
-            game_is_foreground = int(
-                ctypes.windll.user32.GetForegroundWindow() or 0
-            ) == int(hwnd)
             backends = (
-                (
-                    ("mss_desktop_live", lambda: self._capture_desktop(left, top, width, height)),
-                    ("print_window", lambda: self._capture_print_window(hwnd, width, height)),
-                )
-                if game_is_foreground
-                else (
-                    ("print_window", lambda: self._capture_print_window(hwnd, width, height)),
-                    ("mss_desktop_fallback", lambda: self._capture_desktop(left, top, width, height)),
-                )
+                ("mss_game_client", lambda: self._capture_desktop(left, top, width, height)),
+                ("print_window", lambda: self._capture_print_window(hwnd, width, height)),
             )
             for backend_name, capture in backends:
                 try:

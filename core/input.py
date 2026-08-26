@@ -31,10 +31,15 @@ def configured_input_backend() -> str:
     return value
 
 
-def create_input_controller(backend: str | None = None):
+def create_input_controller(backend: str | None = None, *, hwnd=None):
     selected = backend or configured_input_backend()
     if selected == DEFAULT_INPUT_BACKEND:
-        return KeyboardController()
+        focus_guard = None
+        if hwnd:
+            from core.window import ensure_game_window_foreground
+
+            focus_guard = lambda: ensure_game_window_foreground(hwnd)
+        return KeyboardController(focus_guard=focus_guard)
     if selected == "vgamepad_xbox360":
         from core.gamepad import GamepadController
 

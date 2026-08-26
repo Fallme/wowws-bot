@@ -13,7 +13,7 @@ import time
 # On some Windows/game combinations GetLastInputInfo publishes that event a
 # little before the controller can record its own marker.  The old 120 ms
 # tolerance therefore classified our focus maintenance as player input.
-AUTOMATION_TICK_TOLERANCE_MS = 750
+AUTOMATION_TICK_TOLERANCE_MS = 400
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -57,9 +57,10 @@ def _tick_distance(left: int, right: int) -> int:
 class UserInterventionMonitor:
     """Observe real keyboard input without mistaking our own injections.
 
-    ``GetLastInputInfo`` is system-wide, so activity only counts while the game
-    owns the foreground.  Native input injection records its Windows tick on
-    the controller backend; matching ticks are ignored.
+    ``GetLastInputInfo`` is system-wide. Keyboard activity therefore pauses
+    automation even after the user has switched to another window; otherwise
+    the five-second timer expires while the user is still typing and the game
+    immediately steals focus back. Native injected ticks are still ignored.
     """
 
     def __init__(
@@ -145,9 +146,6 @@ class UserInterventionMonitor:
                 self.intervention_started_at = None
                 self.last_user_input_at = None
             return now < self.pause_until
-        if self.hwnd and self._foreground_reader() != self.hwnd:
-            return self.latched or now < self.pause_until
-
         # A changed LASTINPUTINFO tick with no keyboard transition is mouse
         # activity.  It must never pause automation, including Web-panel clicks.
         if not self._keyboard_activity_reader():
@@ -183,3 +181,12 @@ class UserInterventionMonitor:
             return 0.0
         current = time.monotonic() if now is None else float(now)
         return max(0.0, current - self.intervention_started_at)
+
+    def command_generation_paused(self, now: float | None = None) -> bool:
+        """Inspect pause state without consuming resume files or input events."""
+        if self.resume_path is not None and self.resume_path.exists():
+            return False
+        if self.pause_path is not None and self.pause_path.exists():
+            return True
+        current = time.monotonic() if now is None else float(now)
+        return bool(self.latched or current < self.pause_until)

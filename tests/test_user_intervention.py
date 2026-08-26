@@ -18,7 +18,7 @@ def test_foreground_user_input_pauses_for_configured_window():
     assert monitor.poll(controller, now=13)
 
 
-def test_automation_tick_and_background_input_do_not_pause():
+def test_automation_tick_is_ignored_but_background_keyboard_still_pauses():
     current = [100]
     foreground = [7]
     monitor = UserInterventionMonitor(
@@ -33,9 +33,10 @@ def test_automation_tick_and_background_input_do_not_pause():
     current[0] = 200
     assert not monitor.poll(controller, now=10)
 
-    current[0] = 300
+    controller.last_injected_tick_ms = 9000
+    current[0] = 800
     foreground[0] = 9
-    assert not monitor.poll(controller, now=11)
+    assert monitor.poll(controller, now=11)
 
 
 def test_delayed_focus_injection_is_not_user_intervention():
@@ -46,7 +47,7 @@ def test_delayed_focus_injection_is_not_user_intervention():
         input_tick_reader=lambda: current[0],
         foreground_reader=lambda: 7,
     )
-    controller = SimpleNamespace(last_injected_tick_ms=1600)
+    controller = SimpleNamespace(last_injected_tick_ms=1300)
     monitor.reset()
 
     # Alt focus events can be reported a few hundred milliseconds before the
@@ -112,6 +113,26 @@ def test_web_pause_latches_immediately_until_resume(tmp_path):
     resume_path.write_text("resume", encoding="utf-8")
     assert not monitor.poll(controller, now=11)
     assert monitor.resumed_from_web
+
+
+def test_pause_state_can_be_checked_without_consuming_resume(tmp_path):
+    pause_path = tmp_path / "pause.request"
+    resume_path = tmp_path / "resume.request"
+    monitor = UserInterventionMonitor(
+        7,
+        pause_path=pause_path,
+        resume_path=resume_path,
+        input_tick_reader=lambda: 100,
+        foreground_reader=lambda: 7,
+    )
+    monitor.reset()
+
+    pause_path.write_text("pause", encoding="utf-8")
+    assert monitor.command_generation_paused(now=10)
+    pause_path.unlink()
+    resume_path.write_text("resume", encoding="utf-8")
+    assert not monitor.command_generation_paused(now=10)
+    assert resume_path.exists()
 
 
 def test_continuous_user_input_latches_until_web_resume(tmp_path):

@@ -51,6 +51,7 @@ class SecondaryMovementTests(unittest.TestCase):
             capture_point_bearing=-0.3,
             health=0.12,
             route_arrived=True,
+            inside_capture_point=True,
         )
 
         self.assertEqual(command.mode, MovementMode.BRAWL)
@@ -75,10 +76,11 @@ class SecondaryMovementTests(unittest.TestCase):
             capture_point_bearing=-0.4,
             enemy_count=1,
             route_arrived=True,
+            inside_capture_point=True,
         )
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
-        self.assertEqual(command.throttle, 1.0)
+        self.assertEqual(command.throttle, 0.72)
         # Central-cap bearing remains dominant, preventing an early about-turn.
         self.assertLess(command.rudder, 0)
 
@@ -89,10 +91,11 @@ class SecondaryMovementTests(unittest.TestCase):
             minimap_target_bearing=0.2,
             capture_point_bearing=0.0,
             route_arrived=True,
+            inside_capture_point=True,
         )
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
-        self.assertEqual(command.throttle, 1.0)
+        self.assertEqual(command.throttle, 0.72)
         self.assertIn("小地图5km网格15.0km", command.reason)
 
     def test_minimap_grid_overrides_untrusted_viewport_ocr(self):
@@ -102,6 +105,7 @@ class SecondaryMovementTests(unittest.TestCase):
             minimap_target_bearing=0.8,
             capture_point_bearing=-0.2,
             route_arrived=True,
+            inside_capture_point=True,
         )
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
@@ -116,10 +120,38 @@ class SecondaryMovementTests(unittest.TestCase):
             minimap_distance_km=None,
             capture_point_bearing=0.0,
             route_arrived=True,
+            inside_capture_point=True,
         )
 
         self.assertEqual(command.mode, MovementMode.CAPTURE)
         self.assertNotIn("4.0km", command.reason)
+
+    def test_viewport_bearing_cannot_change_rudder_without_minimap_enemy(self):
+        command = self.plan(
+            target_offset_x=1.0,
+            minimap_target_bearing=None,
+            minimap_distance_km=16.0,
+            capture_point_bearing=-0.25,
+            route_arrived=True,
+            inside_capture_point=True,
+        )
+
+        self.assertEqual(command.mode, MovementMode.APPROACH)
+        self.assertLess(command.rudder, 0)
+
+    def test_enemy_death_resumes_objective_when_ship_is_outside_point(self):
+        command = self.plan(
+            minimap_distance_km=None,
+            capture_point_bearing=0.25,
+            capture_point_distance_km=6.0,
+            route_arrived=True,
+            inside_capture_point=False,
+            enemy_count=0,
+        )
+
+        self.assertEqual(command.mode, MovementMode.ROUTE_TRANSIT)
+        self.assertEqual(command.throttle, 1.0)
+        self.assertGreater(command.rudder, 0)
 
     def test_low_health_no_longer_triggers_disengage(self):
         command = self.plan(

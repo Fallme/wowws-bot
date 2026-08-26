@@ -37,3 +37,29 @@ def test_course_heading_rejects_one_frame_reversal():
     reversed_sample = tracker.update((100, 102))
 
     assert reversed_sample == forward
+
+
+def test_course_heading_accepts_a_persistent_completed_turn():
+    tracker = CourseHeadingFilter(minimum_travel=3)
+    tracker.update((100, 120))
+    forward = tracker.update((100, 114))
+
+    # Three consistent observations in the opposite direction represent a
+    # genuine turn, not a one-frame player-marker glitch.
+    tracker.update((100, 121))
+    tracker.update((100, 128))
+    turned = tracker.update((100, 135))
+
+    assert forward[1] < 0
+    assert turned[1] > 0.9
+
+
+def test_course_heading_uses_recent_motion_instead_of_old_loop_origin():
+    tracker = CourseHeadingFilter(minimum_travel=4)
+    for point in ((100, 100), (108, 96), (116, 98), (119, 106), (115, 114)):
+        heading = tracker.update(point)
+
+    # The latest leg is down-left.  An oldest-origin estimator would still
+    # report right/down and keep a slow ship circling.
+    assert heading[0] < 0
+    assert heading[1] > 0

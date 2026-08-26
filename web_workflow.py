@@ -12,7 +12,7 @@ from core.input import configured_input_backend, create_input_controller
 from core.launcher import launch_game
 from core.ui import ScreenState
 from core.vision import Vision
-from core.window import activate_window, find_game_window
+from core.window import ensure_game_window_foreground, find_game_window
 from port_navigator import (
     enter_battle,
     ensure_requested_mode,
@@ -63,7 +63,7 @@ class WebCalibrationWorkflow:
         controller_factory=create_input_controller,
         launcher=launch_game,
         window_finder=find_game_window,
-        activator=activate_window,
+        activator=ensure_game_window_foreground,
         sleep=time.sleep,
     ):
         self.store = store or CalibrationStore()
@@ -209,7 +209,12 @@ class WebCalibrationWorkflow:
                     with self.lock:
                         if cancel_event.is_set():
                             return
-                        self.controller = self.controller_factory()
+                        try:
+                            self.controller = self.controller_factory(hwnd=hwnd)
+                        except TypeError:
+                            # Compatibility with injected test/third-party
+                            # controller factories that do not expose hwnd.
+                            self.controller = self.controller_factory()
                         self.state = "ready"
                         self.message = "战斗已就绪，可以发送第一个校准动作"
                     return

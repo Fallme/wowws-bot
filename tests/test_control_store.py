@@ -39,6 +39,27 @@ class ControlStoreTests(unittest.TestCase):
                 self.assertEqual(dashboard["totals"]["ship_xp"], 897)
                 self.assertEqual(dashboard["totals"]["free_xp"], 590)
                 self.assertEqual(dashboard["totals"]["credits"], 383088)
+
+                store.upsert_battle_result(
+                    "run-1",
+                    1,
+                    "victory",
+                    {"credits": 258088, "ship_xp": 897, "free_xp": 540},
+                    rewards_recognized=True,
+                )
+                # A later poll for the same result updates it rather than
+                # creating a duplicate battle in the group's history.
+                store.upsert_battle_result(
+                    "run-1",
+                    1,
+                    "victory",
+                    {"credits": 258088, "ship_xp": 897, "free_xp": 540},
+                    rewards_recognized=True,
+                )
+                dashboard = store.dashboard()
+                self.assertEqual(len(dashboard["history"]), 1)
+                self.assertEqual(dashboard["history"][0]["outcome"], "victory")
+                self.assertTrue(dashboard["history"][0]["rewards_recognized"])
             finally:
                 store.close()
 

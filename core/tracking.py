@@ -41,10 +41,14 @@ class CourseHeadingFilter:
         self.minimum_travel = max(2.0, float(minimum_travel))
         self.maximum_jump = max(self.minimum_travel * 2, float(maximum_jump))
         self.heading = None
+        self._pending_reversal = None
+        self._pending_reversal_samples = 0
 
     def reset(self):
         self.samples.clear()
         self.heading = None
+        self._pending_reversal = None
+        self._pending_reversal_samples = 0
 
     def update(self, point):
         if point is None:
@@ -55,7 +59,12 @@ class CourseHeadingFilter:
         self.samples.append(current)
 
         origin = None
-        for candidate in self.samples:
+        # Use the nearest *recent* sample with enough travel.  Using the oldest
+        # point inside the history window makes a turning ship keep the heading
+        # it had before the turn and is especially harmful after a broad
+        # battleship U-turn: the controller then keeps adding the same rudder
+        # and circles indefinitely.
+        for candidate in reversed(tuple(self.samples)[:-1]):
             travel = math.dist(candidate, current)
             if self.minimum_travel <= travel <= self.maximum_jump:
                 origin = candidate
@@ -72,13 +81,39 @@ class CourseHeadingFilter:
             return self.heading
 
         dot = self.heading[0] * raw[0] + self.heading[1] * raw[1]
-        # A large instantaneous reversal is position jitter or a temporary
-        # reverse manoeuvre, not a trustworthy new bow direction.
+        # One opposite displacement can be player-marker jitter.  A persistent
+        # opposite course, however, is a real completed turn and must become
+        # authoritative; otherwise every subsequent bearing is inverted.
         if dot < -0.20:
+            pending = self._pending_reversal
+            pending_dot = (
+                -1.0
+                if pending is None
+                else pending[0] * raw[0] + pending[1] * raw[1]
+            )
+            if pending is not None and pending_dot >= 0.72:
+                self._pending_reversal_samples += 1
+                combined = (pending[0] + raw[0], pending[1] + raw[1])
+                combined_length = math.hypot(*combined)
+                if combined_length > 0:
+                    self._pending_reversal = (
+                        combined[0] / combined_length,
+                        combined[1] / combined_length,
+                    )
+            else:
+                self._pending_reversal = raw
+                self._pending_reversal_samples = 1
+            if self._pending_reversal_samples < 3:
+                return self.heading
+            self.heading = self._pending_reversal
+            self._pending_reversal = None
+            self._pending_reversal_samples = 0
             return self.heading
+        self._pending_reversal = None
+        self._pending_reversal_samples = 0
         blended = (
-            self.heading[0] * 0.64 + raw[0] * 0.36,
-            self.heading[1] * 0.64 + raw[1] * 0.36,
+            self.heading[0] * 0.35 + raw[0] * 0.65,
+            self.heading[1] * 0.35 + raw[1] * 0.65,
         )
         magnitude = math.hypot(*blended)
         if magnitude > 0:

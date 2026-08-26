@@ -39,6 +39,16 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.BATTLE,
         )
 
+    def test_battle_bottom_hud_is_not_treated_as_port_carousel(self):
+        for filename in ("battle_reference.png", "live_battle.png"):
+            image = cv2.imread(str(self.FIXTURE_ROOT / filename))
+            self.assertTrue(self.vision._has_battle_hud(image), filename)
+            self.assertFalse(self.vision._is_port_ship_bar(image), filename)
+
+        for filename in ("port_ship_selected.png", "port_mode_selector.png"):
+            image = cv2.imread(str(self.FIXTURE_ROOT / filename))
+            self.assertTrue(self.vision._is_port_ship_bar(image), filename)
+
     def test_escape_menu_overrides_broad_loading_signal(self):
         self.assertEqual(
             self.classify(self.FIXTURE_ROOT / "escape_menu.png"),
@@ -56,6 +66,18 @@ class ScreenStateRegressionTests(unittest.TestCase):
             self.classify(self.FIXTURE_ROOT / "results.png"),
             ScreenState.RESULTS,
         )
+
+    def test_port_reward_overlay_can_never_enter_battle_state(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_reward_overlay.png"))
+        self.assertIsNotNone(image)
+        self.assertTrue(self.vision._is_port_reward_overlay(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.UNKNOWN)
+
+        # The negative guard must not mask either reference battle frame.
+        for filename in ("battle_reference.png", "live_battle.png"):
+            battle = cv2.imread(str(self.FIXTURE_ROOT / filename))
+            self.assertFalse(self.vision._is_port_reward_overlay(battle), filename)
+            self.assertEqual(self.vision.classify_screen(battle), ScreenState.BATTLE)
 
 if __name__ == "__main__":
     unittest.main()

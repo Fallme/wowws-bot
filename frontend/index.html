@@ -7,6 +7,7 @@
     <meta name="description" content="战舰世界本地自动作战控制台" />
     <title>战舰自动化控制台</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/custom_ship.css" />
   </head>
   <body>
     <main class="app-shell">
@@ -29,6 +30,13 @@
           <div class="control-group">
             <div class="label-row"><label>选择舰船</label><span id="shipCount">0 艘</span></div>
             <div class="ship-list" id="shipList"></div>
+            <div class="custom-ship-fields" id="customShipFields" hidden>
+              <label for="customShipName">完整舰船名称</label>
+              <input id="customShipName" type="text" maxlength="64" autocomplete="off" placeholder="例如：大选帝侯" />
+              <label for="customSecondaryRange">副炮射程</label>
+              <div class="range-input"><input id="customSecondaryRange" type="number" min="1" max="30" step="0.1" value="10.0" /><span>km</span></div>
+              <p>名称须与港口显示完全一致；输入会自动保存在本机。</p>
+            </div>
           </div>
           <div class="control-group stop-plan">
             <label>自动停止</label>
@@ -45,6 +53,7 @@
             </div>
             <p id="limitHint">完整结束 5 局后返回港口并停止</p>
           </div>
+          <label class="quick-battle-toggle"><input id="quickBattle" type="checkbox" /><span><b>快速战斗测试</b><small>单局最多 5 分钟；沉没即回港重开，不统计收益</small></span></label>
           <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
           <div class="human-alert" id="interventionCard" hidden><strong>需要人工检查</strong><p id="interventionMessage"></p><button id="retryBtn">问题处理后重试</button></div>
           <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong>手动操作保持中</strong><p>已保持原有油门与舵，系统不会继续下发新指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
@@ -57,8 +66,15 @@
           <div class="operation-hero">
             <div class="route-visual" id="routeVisual">
               <div class="route-ring ring-one"></div><div class="route-ring ring-two"></div>
-              <div class="route-line"><i id="routeLine"></i></div>
-              <span class="route-node start">出生</span><span class="ship-marker">▲</span><span class="route-node goal">点位</span>
+              <div class="radar-island-layer" id="mapIslands"></div>
+              <div class="radar-zone-layer" id="mapZones"></div>
+              <div class="radar-contact-layer" id="mapContacts"></div>
+              <div class="map-track" id="routeLine"></div>
+              <span class="map-center-marker">＋</span>
+              <span class="capture-zone-marker" id="mapObjective"><b id="mapObjectiveLabel">点</b></span>
+              <span class="enemy-marker" id="mapEnemy">◆</span>
+              <span class="ship-marker" id="mapPlayer">▲</span>
+              <span class="route-node goal" id="mapGoal">目标</span>
             </div>
             <div class="operation-copy"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
           </div>
@@ -71,6 +87,10 @@
             <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>最近敌舰</small><strong id="targetDistance">—</strong></div>
             <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
             <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
+            <div><small>自动航行</small><strong id="autopilotStatus">未开启</strong></div><div><small>当前舵位</small><strong id="rudderStatus">中舵</strong></div>
+            <div><small>小地图态势</small><strong id="mapSituation">等待识别</strong></div><div><small>导航依据</small><strong id="navigationStatus">—</strong></div>
+            <div><small>舰体状态</small><strong id="shipStatus">生命 —</strong></div><div><small>实时航速</small><strong id="speedStatus">—</strong></div>
+            <div><small>小地图航向</small><strong id="headingStatus">—</strong></div><div><small>消耗品状态</small><strong id="consumableStatus">等待识别</strong></div>
           </div>
           <details class="log-drawer"><summary>查看实时日志 <span id="runId">—</span></summary><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></details>
         </article>
@@ -83,6 +103,8 @@
             <div class="reward-total ship-xp"><small>经验</small><strong id="shipXpTotal">0</strong><span>本组累计</span></div>
             <div class="reward-total free-xp"><small>全局经验</small><strong id="freeXpTotal">0</strong><span>本组累计</span></div>
           </div>
+          <div class="task-history-heading"><strong>本组历史</strong><span id="historySummary">暂无结算记录</span></div>
+          <div class="task-history" id="taskHistory"><p class="history-empty">本组完成结算后，会在这里记录每局胜负与收益。</p></div>
         </article>
       </section>
     </main>

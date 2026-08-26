@@ -64,6 +64,18 @@ class BattleAnalysis:
     minimap_target_bearing: float | None = None
     minimap_enemy_count: int = 0
     player_position: tuple[int, int] | None = None
+    minimap_player_normalized: tuple[float, float] | None = None
+    minimap_heading: tuple[float, float] | None = None
+    nearest_enemy_normalized: tuple[float, float] | None = None
+    minimap_contacts: list[dict[str, Any]] = field(default_factory=list)
+    capture_zones: list[dict[str, Any]] = field(default_factory=list)
+    minimap_islands: list[dict[str, Any]] = field(default_factory=list)
+    minimap_snapshot: str = ""
+    capture_zone_center_normalized: tuple[float, float] | None = None
+    capture_zone_radius_normalized: float | None = None
+    capture_zone_label: str = ""
+    navigation_target_normalized: tuple[float, float] | None = None
+    navigation_source: str = "unknown"
     map_center_bearing: float | None = None
     map_center_distance_km: float | None = None
     capture_point_bearing: float | None = None
@@ -77,6 +89,10 @@ class BattleAnalysis:
     island_avoidance_rudder: float | None = None
     movement_verified: bool = False
     on_fire: bool = False
+    flooding: bool = False
+    speed_knots: float | None = None
+    autopilot_enabled: bool = False
+    rudder_indicator: str = "neutral"
 
 
 def torpedo_evasion_threat(
@@ -114,7 +130,7 @@ class BattleBot:
         self.vision = vision or Vision()
         # Keep the attribute name for compatibility with existing strategy and
         # tests; the default implementation is now native keyboard SendInput.
-        self.gamepad = gamepad or create_input_controller()
+        self.gamepad = gamepad or create_input_controller(hwnd=hwnd)
         self._distance_ocr_async = distance_reader is None
         self.distance_reader = distance_reader or TargetDistanceReader(
             minimum_confidence=float(
@@ -198,6 +214,12 @@ class BattleBot:
             missing_timeout_seconds=float(
                 self.strategy.get("position_missing_timeout_seconds", 10)
             ),
+            movement_pixels=float(
+                self.strategy.get("feedback_movement_pixels", 2.0)
+            ),
+        )
+        self.max_movement_feedback_retries = max(
+            1, int(self.strategy.get("movement_feedback_retries", 3))
         )
         self.minimap_target_filter = ConsecutivePointFilter(match_radius=18)
         self.course_heading_filter = CourseHeadingFilter(
@@ -231,14 +253,18 @@ class BattleBot:
         self.tick = 0
         self.battle_start_time = 0.0
         self._cached_health = 1.0
+        self._cached_speed_knots: float | None = None
         self._cached_reload = False
         self._health_samples = deque(maxlen=5)
         self._torpedo_samples = deque(maxlen=3)
         self._fire_samples = deque(maxlen=2)
-        self._secondary_contact_samples = deque(maxlen=5)
+        self._autopilot_hud_samples = deque(maxlen=3)
         self._island_samples = deque(maxlen=5)
+        self._island_avoidance_until = 0.0
+        self._island_avoidance_rudder = 0.0
         self._capture_zone = None
         self._unknown_since = None
+        self._ended_state_streak = 0
         self._post_battle_grace_seconds = float(
             self.strategy.get("post_battle_grace_seconds", 900.0)
         )
@@ -253,10 +279,16 @@ class BattleBot:
         )
         self.movement_verified = False
         self._last_full_speed_reassert = 0.0
+        self._last_applied_rudder = 0.0
+        self._rudder_commanded_at = 0.0
+        self._rudder_release_until = 0.0
         self._manual_intervention_active = False
         self._manual_intervention_latched = False
         self.opening_autopilot_active = False
         self.opening_autopilot_target = ""
+        self.opening_autopilot_target_normalized = None
+        self.generic_center_route_active = False
+        self.movement_feedback_failures = 0
         self._last_movement_mode = None
         self._last_ocr_at = 0.0
         self._ocr_failures = 0
@@ -267,7 +299,7 @@ class BattleBot:
         self.last_movement_command = None
         self.last_movement_reason = ""
 
-    def reset(self):
+    def reset(self, *, preserve_movement=False):
         now = time.monotonic()
         if self._event_recorder is not None:
             self._event_recorder.close()
@@ -287,20 +319,31 @@ class BattleBot:
         self.tick = 0
         self.battle_start_time = now
         self._cached_health = 1.0
+        self._cached_speed_knots = None
         self._cached_reload = False
         self._health_samples.clear()
         self._torpedo_samples.clear()
         self._fire_samples.clear()
-        self._secondary_contact_samples.clear()
+        self._autopilot_hud_samples.clear()
         self._island_samples.clear()
+        self._island_avoidance_until = 0.0
+        self._island_avoidance_rudder = 0.0
         self._capture_zone = None
         self._unknown_since = None
+        self._ended_state_streak = 0
         self.movement_verified = False
         self._last_full_speed_reassert = 0.0
+        self._last_applied_rudder = 0.0
+        self._rudder_commanded_at = 0.0
+        self._rudder_release_until = 0.0
         self._manual_intervention_active = False
         self._manual_intervention_latched = False
-        self.opening_autopilot_active = False
-        self.opening_autopilot_target = ""
+        if not preserve_movement:
+            self.opening_autopilot_active = False
+            self.opening_autopilot_target = ""
+            self.opening_autopilot_target_normalized = None
+            self.generic_center_route_active = False
+        self.movement_feedback_failures = 0
         self._last_movement_mode = None
         self._last_ocr_at = 0.0
         self._ocr_failures = 0
@@ -329,16 +372,170 @@ class BattleBot:
         if self._distance_ocr_async:
             self.distance_ocr_service.close()
             self.distance_ocr_service = DistanceOcrService(self.distance_reader)
-        self.gamepad.stop()
+        if not preserve_movement:
+            self.gamepad.stop()
 
-    def enable_opening_autopilot(self, target: str):
+    def enable_opening_autopilot(
+        self,
+        target: str,
+        *,
+        target_normalized: tuple[float, float] | None = None,
+    ):
         self.opening_autopilot_active = True
+        self.generic_center_route_active = False
         self.opening_autopilot_target = str(target or "地图中心")
+        self.opening_autopilot_target_normalized = target_normalized
         self.last_movement_command = None
         self.last_movement_reason = (
             f"游戏自动航行已设定至{self.opening_autopilot_target}"
         )
         self._last_movement_mode = "autopilot_route"
+
+    def enable_generic_center_route(self, reason: str = ""):
+        """Fall back from unreliable tactical-map navigation without stopping."""
+        self.opening_autopilot_active = False
+        self.opening_autopilot_target_normalized = None
+        self.generic_center_route_active = True
+        self._last_movement_mode = None
+        self.last_movement_reason = reason or "通用驾驶接管，驶向地图中央"
+
+    def _apply_map_center_objective(self, analysis: BattleAnalysis):
+        analysis.capture_point_bearing = analysis.map_center_bearing
+        analysis.capture_point_distance_km = analysis.map_center_distance_km
+        arrival_distance = float(
+            self.strategy.get("capture_arrival_distance_km", 4.5)
+        )
+        arrived = bool(
+            analysis.map_center_distance_km is not None
+            and analysis.map_center_distance_km <= arrival_distance
+        )
+        analysis.inside_capture_point = arrived
+        analysis.route_phase = "station" if arrived else "transit"
+        analysis.route_progress = 1.0 if arrived else analysis.route_progress
+        analysis.route_waypoint = 2 if arrived else 0
+        analysis.route_arrived = arrived
+        analysis.navigation_target_normalized = (0.5, 0.5)
+        analysis.navigation_source = "minimap_center"
+
+    def _apply_generic_objective(self, analysis: BattleAnalysis):
+        """Prefer the live capture route; use geometric centre only as fallback."""
+        if (
+            analysis.capture_zone_center_normalized is not None
+            and analysis.capture_point_bearing is not None
+        ):
+            analysis.navigation_source = "minimap_capture_zone_fallback"
+            return
+        self._apply_map_center_objective(analysis)
+
+    def _reassert_full_speed(self):
+        reassert = getattr(self.gamepad, "reassert_full_speed", None)
+        if reassert is not None:
+            reassert()
+            return
+        full_speed = getattr(self.gamepad, "full_speed", None)
+        if full_speed is not None:
+            full_speed()
+
+    def _movement_feedback_update(self, now, position, throttle):
+        """Retry feedback faults locally before escalating to human takeover."""
+        try:
+            feedback = self.feedback.update(now, position, throttle)
+        except SafetyFault as error:
+            # The white player arrow can disappear for a few captures while
+            # the tactical overlay fades, an island label overlaps it, or a
+            # frame arrives mid-transition.  That is a vision gap, not proof
+            # that the ship stopped.  Keep the last safe straight/full-speed
+            # command and wait for the next minimap frame; crucially, do not
+            # turn without a current minimap pose and never end a whole round
+            # just because one detector is temporarily unavailable.
+            if "无法识别玩家小地图位置" in str(error):
+                self.feedback.reset()
+                self.movement_verified = False
+                self.enable_generic_center_route(
+                    "小地图暂未定位舰船，保持当前安全航向与全速，等待实时小地图恢复"
+                )
+                self._reassert_full_speed()
+                logger.warning(
+                    "[SYSTEM] 小地图暂未定位白箭头；保持当前航向，不打舵，等待下一帧识别"
+                )
+                return None
+            self.movement_feedback_failures += 1
+            if self.movement_feedback_failures > self.max_movement_feedback_retries:
+                raise SafetyFault(
+                    "通用航行连续反馈失败，重试后仍无法确认舰船移动: "
+                    f"{error}"
+                ) from error
+            self.feedback.reset()
+            self.movement_verified = False
+            self.enable_generic_center_route(
+                "航行反馈失败，通用驾驶向地图中央接管；"
+                f"正在重试 {self.movement_feedback_failures}/"
+                f"{self.max_movement_feedback_retries}"
+            )
+            self._reassert_full_speed()
+            logger.warning(
+                "[SYSTEM] 航行反馈失败 (%s/%s): %s；重新识别并向地图中央接管",
+                self.movement_feedback_failures,
+                self.max_movement_feedback_retries,
+                error,
+            )
+            return None
+        self.movement_verified = feedback.verified
+        if feedback.verified:
+            self.movement_feedback_failures = 0
+        return feedback
+
+    def _latency_compensated_rudder(
+        self,
+        desired: float,
+        now: float,
+        *,
+        safety_override: bool = False,
+    ) -> float:
+        """Keep Q/E decisions long enough for a battleship's rudder to react."""
+        desired = max(-1.0, min(float(desired), 1.0))
+
+        def direction(value):
+            return 0 if abs(value) < 0.10 else (1 if value > 0 else -1)
+
+        current_direction = direction(self._last_applied_rudder)
+        desired_direction = direction(desired)
+        hold_seconds = float(
+            self.strategy.get("rudder_minimum_hold_seconds", 1.1)
+        )
+        maximum_hold_seconds = max(
+            hold_seconds,
+            min(
+                float(self.strategy.get("rudder_maximum_hold_seconds", 4.5)),
+                4.8,
+            ),
+        )
+        # A single Q/E order may not stay active long enough to make the
+        # ship circle.  Always release to neutral before another correction;
+        # the next minimap frame then has to justify a new steering order.
+        if (
+            current_direction
+            and self._rudder_commanded_at > 0
+            and now - self._rudder_commanded_at >= maximum_hold_seconds
+        ):
+            self._last_applied_rudder = 0.0
+            self._rudder_commanded_at = 0.0
+            self._rudder_release_until = now + 0.65
+            return 0.0
+        if now < self._rudder_release_until:
+            return 0.0
+        changing_direction = desired_direction != current_direction
+        if (
+            changing_direction
+            and not safety_override
+            and self._rudder_commanded_at > 0
+            and now - self._rudder_commanded_at < hold_seconds
+        ):
+            return self._last_applied_rudder
+        if changing_direction:
+            self._rudder_commanded_at = now
+        self._last_applied_rudder = desired
+        return desired
 
     def analyze(self) -> BattleAnalysis:
         observed_at = time.monotonic()
@@ -354,7 +551,16 @@ class BattleBot:
         height, width = image.shape[:2]
         analysis = BattleAnalysis(image=image, width=width, height=height)
         state = self.vision.classify_screen(image)
-        analysis.ended = state in {ScreenState.RESULTS, ScreenState.PORT}
+        raw_ended = state in {ScreenState.RESULTS, ScreenState.PORT}
+        if raw_ended:
+            self._ended_state_streak += 1
+        else:
+            self._ended_state_streak = 0
+        # A single result/port-shaped frame can be a transition animation or
+        # a broad colour match.  End combat only after the lifecycle evidence
+        # is stable on two consecutive captures; until then the existing
+        # throttle/rudder telegraph is left untouched.
+        analysis.ended = self._ended_state_streak >= 2
         analysis.in_battle = state == ScreenState.BATTLE
 
         if not analysis.in_battle:
@@ -365,13 +571,28 @@ class BattleBot:
             return analysis
 
         if analysis.in_battle:
+            autopilot_detector = getattr(self.vision, "is_autopilot_enabled", None)
+            analysis.autopilot_enabled = bool(
+                autopilot_detector is not None and autopilot_detector(image)
+            )
+            rudder_detector = getattr(self.vision, "detect_rudder_indicator", None)
+            if rudder_detector is not None:
+                analysis.rudder_indicator = str(
+                    rudder_detector(image) or "neutral"
+                )
             minimap = self.vision.find_minimap(image)
             minimap_enemies = []
+            minimap_zones = []
             island_sample = None
             if minimap is not None:
                 minimap_enemies, torpedoes_seen = (
                     self.vision.analyze_minimap(minimap)
                 )
+                island_outline_finder = getattr(
+                    self.vision, "find_minimap_island_outlines", None
+                )
+                if island_outline_finder is not None:
+                    analysis.minimap_islands = island_outline_finder(minimap)
                 if len(minimap_enemies) > 16:
                     logger.warning(
                         "拒绝异常小地图检测: %s 个敌舰候选", len(minimap_enemies)
@@ -389,12 +610,17 @@ class BattleBot:
                 player = None if pose is None else pose.position
                 analysis.player_position = player
                 if pose is not None:
+                    analysis.minimap_player_normalized = (
+                        player[0] / max(minimap.shape[1], 1),
+                        player[1] / max(minimap.shape[0], 1),
+                    )
                     course_heading = self.course_heading_filter.update(player)
                     navigation_pose = (
                         pose
                         if course_heading is None
                         else replace(pose, heading=course_heading)
                     )
+                    analysis.minimap_heading = tuple(navigation_pose.heading)
                     map_center = (
                         minimap.shape[1] / 2.0,
                         minimap.shape[0] / 2.0,
@@ -408,17 +634,73 @@ class BattleBot:
                     analysis.map_center_bearing = self.vision.relative_bearing(
                         navigation_pose, map_center
                     )
-                    if self.route_planner.zone is None or self.tick % 15 == 0:
-                        detected_zone = self.vision.find_central_capture_zone(
-                            minimap
+                    # Every control frame derives the objective from the
+                    # visible A/B/C/D circles, not from the ship's concentric
+                    # gun/concealment rings or the main camera.  A neutral
+                    # white or hostile red point wins over a friendly green
+                    # point, then the nearest eligible point is selected.
+                    zone_finder = getattr(self.vision, "find_capture_zones", None)
+                    if zone_finder is not None:
+                        minimap_zones = zone_finder(minimap, player=player)
+                    analysis.capture_zones = [
+                        {
+                            "label": zone.label,
+                            "state": getattr(zone, "state", "unknown"),
+                            "position": [
+                                zone.center[0] / max(minimap.shape[1], 1),
+                                zone.center[1] / max(minimap.shape[0], 1),
+                            ],
+                            "radius": zone.radius
+                            / max(min(minimap.shape[:2]), 1),
+                        }
+                        for zone in minimap_zones
+                    ]
+                    select_zone = getattr(
+                        self.vision,
+                        "select_navigation_capture_zone",
+                        None,
+                    )
+                    if select_zone is not None:
+                        detected_zone = select_zone(minimap_zones, player)
+                    else:
+                        find_nearest = getattr(
+                            self.vision, "find_nearest_capture_zone", None
                         )
-                        if detected_zone is not None:
-                            self.route_planner.observe_zone(
-                                detected_zone,
-                                minimap.shape,
-                            )
+                        detected_zone = (
+                            find_nearest(minimap, player)
+                            if find_nearest is not None
+                            else self.vision.find_central_capture_zone(minimap)
+                        )
+                    if detected_zone is not None:
+                        active_state = getattr(
+                            self.route_planner.zone,
+                            "state",
+                            "unknown",
+                        )
+                        self.route_planner.observe_zone(
+                            detected_zone,
+                            minimap.shape,
+                            allow_retarget=(
+                                active_state == "friendly"
+                                and getattr(detected_zone, "state", "unknown")
+                                in {"neutral", "hostile", "unknown"}
+                            ),
+                        )
                     self._capture_zone = self.route_planner.zone
                     if self._capture_zone is not None:
+                        analysis.capture_zone_center_normalized = (
+                            self._capture_zone.center[0]
+                            / max(minimap.shape[1], 1),
+                            self._capture_zone.center[1]
+                            / max(minimap.shape[0], 1),
+                        )
+                        analysis.capture_zone_radius_normalized = (
+                            self._capture_zone.radius
+                            / max(min(minimap.shape[:2]), 1)
+                        )
+                        analysis.capture_zone_label = getattr(
+                            self._capture_zone, "label", ""
+                        )
                         capture_pixels = math.dist(
                             player, self._capture_zone.center
                         )
@@ -427,21 +709,19 @@ class BattleBot:
                                 minimap, capture_pixels
                             )
                         )
-                        arrival_distance_km = float(
-                            self.strategy.get(
-                                "capture_arrival_distance_km", 4.5
-                            )
-                        )
                         analysis.inside_capture_point = (
-                            capture_pixels <= self._capture_zone.radius * 0.95
-                            or analysis.capture_point_distance_km
-                            <= arrival_distance_km
+                            capture_pixels <= self._capture_zone.radius * 0.96
                         )
                         route = self.route_planner.update(
                             player,
                             inside_zone=analysis.inside_capture_point,
                         )
                         route_target = route.target or self._capture_zone.center
+                        analysis.navigation_target_normalized = (
+                            route_target[0] / max(minimap.shape[1], 1),
+                            route_target[1] / max(minimap.shape[0], 1),
+                        )
+                        analysis.navigation_source = "minimap_capture_zone"
                         analysis.capture_point_bearing = (
                             self.vision.relative_bearing(
                                 navigation_pose, route_target
@@ -457,6 +737,16 @@ class BattleBot:
                         analysis.route_progress = route.progress
                         analysis.route_waypoint = route.waypoint_index
                         analysis.route_arrived = route.arrived
+                    if self.generic_center_route_active:
+                        self._apply_generic_objective(analysis)
+                    elif (
+                        self.opening_autopilot_active
+                        and self.opening_autopilot_target_normalized is not None
+                    ):
+                        analysis.navigation_target_normalized = (
+                            self.opening_autopilot_target_normalized
+                        )
+                        analysis.navigation_source = "native_autopilot"
                 island_risk = (
                     None
                     if pose is None or course_heading is None
@@ -491,6 +781,20 @@ class BattleBot:
                             navigation_pose, nearest_map_enemy
                         )
                     )
+                    analysis.nearest_enemy_normalized = (
+                        nearest_map_enemy[0] / max(minimap.shape[1], 1),
+                        nearest_map_enemy[1] / max(minimap.shape[0], 1),
+                    )
+                analysis.minimap_contacts = [
+                    {
+                        "position": [
+                            enemy[0] / max(minimap.shape[1], 1),
+                            enemy[1] / max(minimap.shape[0], 1),
+                        ],
+                        "kind": "enemy",
+                    }
+                    for enemy in minimap_enemies
+                ]
 
                 type_detector = getattr(
                     self.vision,
@@ -513,11 +817,34 @@ class BattleBot:
 
             self._island_samples.append(island_sample)
             stable_island = self._stable_island_risk()
+            if (
+                island_sample is not None
+                and island_sample[0] <= self.movement.island_emergency_distance
+                and abs(island_sample[1]) >= 0.2
+            ):
+                stable_island = island_sample
             if stable_island is not None:
                 (
                     analysis.island_distance,
                     analysis.island_avoidance_rudder,
                 ) = stable_island
+                self._island_avoidance_rudder = stable_island[1]
+                self._island_avoidance_until = observed_at + float(
+                    # Never carry a one-time island observation into a long
+                    # turn.  Every Q/E correction is capped below five
+                    # seconds and must be renewed from fresh minimap terrain.
+                    self.strategy.get("island_turn_commit_seconds", 3.8)
+                )
+            elif observed_at < self._island_avoidance_until:
+                # A battleship reacts several seconds after Q/E input. Keep
+                # the chosen escape turn through intermittent vision gaps so
+                # route steering cannot immediately cancel it.
+                analysis.island_distance = (
+                    self.movement.island_warning_distance * 0.92
+                )
+                analysis.island_avoidance_rudder = (
+                    self._island_avoidance_rudder
+                )
 
             viewport_enemies = self.vision.find_enemies_in_viewport(image)
             if len(viewport_enemies) > 8:
@@ -591,6 +918,22 @@ class BattleBot:
                 self.vision.find_reload_bar(image)
             )
         analysis.health = self._cached_health
+        flooding_detector = getattr(self.vision, "is_flooding", None)
+        analysis.flooding = bool(
+            flooding_detector is not None and flooding_detector(image)
+        )
+        speed_reader = getattr(self.vision, "read_speed_knots", None)
+        if speed_reader is not None and self.tick % 3 == 0:
+            try:
+                speed_knots = speed_reader(
+                    image,
+                    getattr(self.distance_reader, "backend", None),
+                )
+                if speed_knots is not None:
+                    self._cached_speed_knots = float(speed_knots)
+            except Exception:
+                logger.debug("航速 OCR 本帧不可用", exc_info=True)
+        analysis.speed_knots = self._cached_speed_knots
         analysis.reload_ready = self._cached_reload
         analysis.movement_verified = self.movement_verified
 
@@ -621,20 +964,21 @@ class BattleBot:
         return analysis
 
     def _stable_island_risk(self):
-        """Require four consistent terrain observations before manoeuvring."""
-        required = 4
+        """Accept three matching terrain observations from the latest five."""
+        required = 3
         if len(self._island_samples) < required:
             return None
-        samples = list(self._island_samples)[-required:]
-        if any(sample is None for sample in samples):
+        samples = [sample for sample in self._island_samples if sample is not None]
+        if len(samples) < required:
             return None
+        samples = samples[-required:]
         distances = [sample[0] for sample in samples]
-        if max(distances) - min(distances) > 0.035:
+        if max(distances) - min(distances) > 0.060:
             return None
         sides = [sample[1] for sample in samples if abs(sample[1]) >= 0.5]
         positive = sum(side > 0 for side in sides)
         negative = sum(side < 0 for side in sides)
-        if max(positive, negative) < 3:
+        if max(positive, negative) < 2:
             return None
         side = 1.0 if positive > negative else -1.0
         distance = sum(distances) / len(distances)
@@ -800,7 +1144,13 @@ class BattleBot:
         analysis = self.analyze()
         self.last_analysis = analysis
         if analysis.ended:
-            self.gamepad.stop()
+            # Screen classification is intentionally tentative here.  Keep
+            # the existing telegraph/rudder until the lifecycle confirms the
+            # result page on consecutive frames; a single false result frame
+            # must not stop an otherwise active battle.
+            pause = getattr(self.gamepad, "pause_automation", None)
+            if pause is not None:
+                pause()
             self.events.publish("battle.ended", tick=self.tick)
             return "ended"
 
@@ -829,6 +1179,18 @@ class BattleBot:
         self._finish_tick(analysis)
         return "combat"
 
+    def mark_manual_pause(self):
+        """Expose an already-observed keyboard/Web pause without input."""
+        pause_source = (
+            "网页手动暂停" if self.intervention.web_paused else "用户键盘介入"
+        )
+        self.last_movement_reason = (
+            f"{pause_source}：保持既有油门与舵，暂停下发新指令"
+        )
+        self._manual_intervention_active = True
+        self._manual_intervention_latched = self.intervention.latched
+        self._last_movement_mode = "manual_pause"
+
     def _execute_rules(self, analysis: BattleAnalysis, now: float):
         if self.intervention.poll(self.gamepad, now):
             # Freeze command generation only. Do not release rudder or change
@@ -839,10 +1201,10 @@ class BattleBot:
                 if self.intervention.web_paused
                 else "用户键盘介入"
             )
-            self.last_movement_reason = (
-                f"{pause_source}：保持既有油门与舵，暂停下发新指令"
-            )
-            if not self._manual_intervention_active:
+            was_active = self._manual_intervention_active
+            was_latched = self._manual_intervention_latched
+            self.mark_manual_pause()
+            if not was_active:
                 logger.info(
                     "[USER] %s，冻结新系统指令%s；保持既有航行状态",
                     pause_source,
@@ -850,14 +1212,11 @@ class BattleBot:
                     if self.intervention.web_paused
                     else f" {self.intervention.pause_seconds:.1f} 秒",
                 )
-            if self.intervention.latched and not self._manual_intervention_latched:
+            if self.intervention.latched and not was_latched:
                 logger.warning(
                     "[USER] 持续介入达到 %.1f 秒，进入手动保持；等待网页继续",
                     self.intervention.latch_seconds,
                 )
-            self._manual_intervention_active = True
-            self._manual_intervention_latched = self.intervention.latched
-            self._last_movement_mode = "manual_pause"
             return
 
         if self._manual_intervention_active:
@@ -869,60 +1228,76 @@ class BattleBot:
             self._manual_intervention_latched = False
             self._last_movement_mode = None
 
+        if analysis.autopilot_enabled and not self.opening_autopilot_active:
+            # Recover from a stale internal flag without touching the keyboard.
+            # The live green HUD is authoritative over any cached workflow state.
+            self.opening_autopilot_active = True
+            self.generic_center_route_active = False
+            self.opening_autopilot_target = (
+                self.opening_autopilot_target or "当前游戏航点"
+            )
+            self._autopilot_hud_samples.clear()
+            logger.info("[SYSTEM] 检测到游戏自动航行仍开启，恢复原生航线互锁")
+
         if self.opening_autopilot_active:
-            map_distance = analysis.minimap_distance_km
-            # Autopilot takeover is based only on the white player marker and
-            # red enemy markers on the minimap. Viewport OCR can lock aircraft
-            # or friendly labels and must never cancel game-native navigation.
-            distance_in_range = bool(
-                map_distance is not None
-                and map_distance <= self.movement.secondary_range_km
-            )
-            self._secondary_contact_samples.append(
-                distance_in_range
-            )
-            confirmed_contact = bool(
-                len(self._secondary_contact_samples) >= 3
-                and all(list(self._secondary_contact_samples)[-3:])
-            )
-            if not confirmed_contact:
-                self.last_movement_command = None
-                self.last_movement_reason = (
-                    f"游戏自动航行至{self.opening_autopilot_target}；"
-                    f"按小地图5km网格等待敌舰进入{self.movement.secondary_range_km:.1f}km副炮射程"
+            self._autopilot_hud_samples.append(bool(analysis.autopilot_enabled))
+            if (
+                not analysis.autopilot_enabled
+                and len(self._autopilot_hud_samples) >= 3
+                and not any(self._autopilot_hud_samples)
+            ):
+                self.feedback.reset()
+                self.movement_verified = False
+                self.enable_generic_center_route(
+                    "游戏自动航行已自然结束，通用驾驶按小地图向点位/中央接管"
                 )
-                if self._last_movement_mode != "autopilot_route":
-                    logger.info("[SYSTEM] %s", self.last_movement_reason)
-                self._last_movement_mode = "autopilot_route"
+                self._apply_generic_objective(analysis)
+                logger.warning(
+                    "[SYSTEM] 自动航行已自然结束；本帧不发送任何驾驶指令，下一帧按小地图接管"
+                )
+                return
+            # Native autopilot is exclusive.  Enemy distance, island risk and
+            # all other combat rules are observation-only until the game HUD
+            # itself confirms that native navigation has finished.
+            self.last_movement_command = None
+            self.last_movement_reason = (
+                f"游戏自动航行至{self.opening_autopilot_target}；"
+                "绿色自动航行互锁中，禁止Q/E，等待自动航行自然结束"
+            )
+            if self._last_movement_mode != "autopilot_route":
+                logger.info("[SYSTEM] %s", self.last_movement_reason)
+            self._last_movement_mode = "autopilot_route"
+            if not analysis.autopilot_enabled:
+                return
+            try:
                 feedback = self.feedback.update(
                     now,
                     analysis.player_position,
                     1.0,
                 )
-                self.movement_verified = feedback.verified
+            except SafetyFault as error:
+                # Lack of a pose is not authority to cancel native navigation.
+                # Keep the game route and wait for the next reliable minimap
+                # frame; no Q/E or throttle key is sent here.
+                self.feedback.reset()
+                self.movement_verified = False
+                logger.warning(
+                    "[SYSTEM] 自动航行反馈暂不可用: %s；保持自动航行互锁，不打舵",
+                    error,
+                )
                 return
+            self.movement_verified = feedback.verified
+            return
+            return
 
-            takeover = getattr(self.gamepad, "takeover_from_autopilot", None)
-            if takeover is not None:
-                takeover()
-            else:
-                self.gamepad.full_speed()
-            self.opening_autopilot_active = False
-            self._secondary_contact_samples.clear()
-            self._last_movement_mode = None
-            logger.info(
-                "[SYSTEM] 敌舰距离%.1fkm进入副炮射程，取消游戏自动航行并切回系统驾驶",
-                map_distance,
-            )
-
-        enemy_count = max(len(analysis.enemies), analysis.minimap_enemy_count)
+        enemy_count = analysis.minimap_enemy_count
         command = self.movement.plan(
             SecondaryMovementInput(
                 elapsed=max(0.0, now - self.battle_start_time),
                 health=analysis.health,
-                visible_target=analysis.visible_target,
-                target_offset_x=analysis.target_offset_x,
-                target_distance_km=analysis.target_distance_km,
+                visible_target=bool(analysis.minimap_enemy_count),
+                target_offset_x=None,
+                target_distance_km=None,
                 minimap_distance=analysis.minimap_distance,
                 minimap_distance_km=analysis.minimap_distance_km,
                 minimap_target_bearing=analysis.minimap_target_bearing,
@@ -939,13 +1314,20 @@ class BattleBot:
                 island_avoidance_rudder=analysis.island_avoidance_rudder,
             )
         )
-        self.last_movement_command = command
-        self.last_movement_reason = command.reason
         safety_override = command.mode in {
             MovementMode.AVOID_ISLAND,
             MovementMode.EVADE,
             MovementMode.SEPARATE,
         }
+        compensated_rudder = self._latency_compensated_rudder(
+            command.rudder,
+            now,
+            safety_override=safety_override,
+        )
+        if compensated_rudder != command.rudder:
+            command = replace(command, rudder=compensated_rudder)
+        self.last_movement_command = command
+        self.last_movement_reason = command.reason
         if safety_override:
             self.stuck_recovery.cancel()
             recovery = None
@@ -957,10 +1339,9 @@ class BattleBot:
             )
         if recovery is not None:
             self.gamepad.set_movement(recovery.throttle, recovery.rudder)
-            feedback = self.feedback.update(
+            self._movement_feedback_update(
                 now, analysis.player_position, recovery.throttle
             )
-            self.movement_verified = feedback.verified
             recovery_mode = f"recovery:{recovery.phase}"
             self.last_movement_command = None
             self.last_movement_reason = "舰船位置长时间未变化，执行自动脱困"
@@ -984,8 +1365,9 @@ class BattleBot:
             if reassert is not None:
                 reassert()
                 self._last_full_speed_reassert = now
-        feedback = self.feedback.update(now, analysis.player_position, command.throttle)
-        self.movement_verified = feedback.verified
+        self._movement_feedback_update(
+            now, analysis.player_position, command.throttle
+        )
         if command.mode != self._last_movement_mode:
             logger.info(
                 "[SYSTEM] 移动状态: %s | 推力=%.2f 舵角=%.2f | %s",
@@ -996,6 +1378,13 @@ class BattleBot:
             )
             self._last_movement_mode = command.mode
 
+        # Check again after the movement dispatch. A keyboard press that
+        # happened during this frame must block lock/fire/R/T/smoke commands;
+        # it must not wait for the next 300 ms control frame.
+        if self.intervention.poll(self.gamepad, time.monotonic()):
+            self.mark_manual_pause()
+            return
+
         # Target-lock input is intentionally deferred until movement is proven;
         # the opening priority is to get underway and reach the capture point.
         if analysis.visible_target and self.movement_verified:
@@ -1005,14 +1394,17 @@ class BattleBot:
             self.strategy.get("damage_control_cooldown_seconds", 80.0)
         )
         if (
-            analysis.on_fire
+            (analysis.on_fire or analysis.flooding)
             and analysis.health < 0.99
             and now - self.last_damage_control >= damage_control_cooldown
             and hasattr(self.gamepad, "damage_control")
         ):
             self.gamepad.damage_control()
             self.last_damage_control = now
-            logger.info("检测到持续着火，使用 R 损害管制")
+            logger.info(
+                "检测到%s，使用 R 损害管制",
+                "着火/漏水" if analysis.on_fire and analysis.flooding else "着火" if analysis.on_fire else "漏水",
+            )
 
         heal_threshold = float(self.strategy.get("heal_threshold", 0.55))
         heal_cooldown = float(
@@ -1095,6 +1487,9 @@ class BattleBot:
             route_waypoint=analysis.route_waypoint,
             route_arrived=analysis.route_arrived,
             island_distance=analysis.island_distance,
+            minimap_heading=analysis.minimap_heading,
+            autopilot_enabled=analysis.autopilot_enabled,
+            rudder_indicator=analysis.rudder_indicator,
             movement_mode=self.current_movement_mode,
             throttle=None if command is None else command.throttle,
             rudder=None if command is None else command.rudder,
@@ -1146,11 +1541,41 @@ class BattleBot:
         return bool(self.intervention.latched)
 
     @property
+    def manual_intervention_active(self) -> bool:
+        return bool(
+            self._manual_intervention_active
+            or self.intervention.command_generation_paused()
+        )
+
+    @property
     def manual_intervention_seconds(self) -> float:
         return self.intervention.continuous_seconds()
 
-    def stop(self):
-        self.gamepad.stop()
+    @property
+    def damage_control_ready(self) -> bool:
+        cooldown = float(
+            self.strategy.get("damage_control_cooldown_seconds", 80.0)
+        )
+        return time.monotonic() - self.last_damage_control >= cooldown
+
+    @property
+    def heal_ready(self) -> bool:
+        cooldown = float(self.strategy.get("heal_cooldown_seconds", 80.0))
+        max_uses = int(self.strategy.get("heal_max_uses", 3))
+        return (
+            self.heal_used < max_uses
+            and time.monotonic() - self.last_heal >= cooldown
+        )
+
+    def stop(self, *, release_input: bool = True):
+        """Close runtime resources, optionally releasing game controls.
+
+        ``release_input=False`` is reserved for a destroyed game HWND.  It
+        avoids sending key-up events into whichever application owns focus
+        after the game has closed while still flushing OCR/event resources.
+        """
+        if release_input:
+            self.gamepad.stop()
         self.events.publish("runtime.stopped", tick=self.tick)
         if self.distance_ocr_service is not None:
             self.distance_ocr_service.close()

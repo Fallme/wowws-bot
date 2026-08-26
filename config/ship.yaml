@@ -45,12 +45,15 @@ pommern:
     ideal_outer_distance: 0.15       # 兼容旧事件回放
     ideal_inner_distance: 0.10       # 兼容旧事件回放
     too_close_distance: 0.07         # 兼容旧事件回放
-    island_warning_distance: 0.040   # 约 2.8 km，只在前向航路冲突时绕行
-    island_emergency_distance: 0.020 # 约 1.4 km，允许短暂倒车脱困
+    island_warning_distance: 0.120   # 战列舰舵效慢，约提前 8km 建立绕岛转向
+    island_emergency_distance: 0.060 # 近岛立即硬舵，但仍保持向前脱离
+    island_turn_commit_seconds: 8.0  # Q/E 下发后保留转向，等待实际舵效出现
+    rudder_minimum_hold_seconds: 4.0 # 普通航向修正避免左右指令反复抵消
     capture_throttle: 0.36           # 进入中央占领点后约 1/2 航速留点
     enemy_steering_weight: 0.28      # 圈外敌人仅占航向修正的 28%
     center_steering_gain: 1.35       # 中央点航向控制增益
     straight_opening_seconds: 4.0    # 先建立短航迹，随后立即转向中央点
+    opening_autopilot_minimum_seconds: 35.0 # 开局至少保留游戏自动航行，避免出生点红色误报取消
     enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
     manual_intervention_pause_seconds: 5.0
     manual_intervention_latch_seconds: 15.0
@@ -106,12 +109,15 @@ napoli:
     ideal_outer_distance: 0.15
     ideal_inner_distance: 0.10
     too_close_distance: 0.07
-    island_warning_distance: 0.040
-    island_emergency_distance: 0.020
+    island_warning_distance: 0.120
+    island_emergency_distance: 0.060
+    island_turn_commit_seconds: 8.0
+    rudder_minimum_hold_seconds: 4.0
     capture_throttle: 0.36
     enemy_steering_weight: 0.28
     center_steering_gain: 1.35
     straight_opening_seconds: 4.0
+    opening_autopilot_minimum_seconds: 35.0
     enable_minimap_torpedo_evasion: true
     manual_intervention_pause_seconds: 5.0
     manual_intervention_latch_seconds: 15.0

@@ -1,0 +1,71 @@
+.ship-choice.custom {
+  border-style: dashed;
+}
+
+.custom-ship-fields {
+  margin-top: 8px;
+  padding: 11px;
+  border: 1px solid #4c3c28;
+  border-radius: 10px;
+  background: #17130daa;
+}
+
+.custom-ship-fields[hidden] {
+  display: none;
+}
+
+.custom-ship-fields label {
+  display: block;
+  margin: 0 0 5px;
+  color: #9aabad;
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+
+.custom-ship-fields label:not(:first-child) {
+  margin-top: 9px;
+}
+
+.custom-ship-fields input {
+  width: 100%;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid #31464e;
+  border-radius: 7px;
+  background: #081217;
+  color: #eef3f2;
+  outline: none;
+}
+
+.custom-ship-fields input:focus {
+  border-color: #b98538;
+  box-shadow: 0 0 0 2px #eeb54b1a;
+}
+
+.custom-ship-fields .range-input {
+  display: grid;
+  grid-template-columns: 1fr 34px;
+  align-items: center;
+}
+
+.custom-ship-fields .range-input input {
+  border-radius: 7px 0 0 7px;
+}
+
+.custom-ship-fields .range-input span {
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #31464e;
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+  color: #9aabad;
+  font: 9px Consolas;
+}
+
+.custom-ship-fields p {
+  margin: 8px 0 0;
+  color: #7c8e92;
+  font-size: 8px;
+  line-height: 1.5;
+}
