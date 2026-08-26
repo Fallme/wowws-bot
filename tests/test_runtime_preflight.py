@@ -204,7 +204,7 @@ def test_prepare_battle_cancels_port_actions_when_second_frame_is_battle():
     enter.assert_not_called()
 
 
-def test_opening_autopilot_clicks_far_side_of_nearest_capture_point():
+def test_opening_autopilot_uses_map_center_not_unstable_capture_circle():
     minimap = np.zeros((200, 200, 3), dtype=np.uint8)
     events = []
 
@@ -254,8 +254,8 @@ def test_opening_autopilot_clicks_far_side_of_nearest_capture_point():
     ):
         assert configure_opening_autopilot(bot)
 
-    assert events == ["toggle", "toggle", "最近占领点远端"]
+    assert events == ["toggle", "toggle", "地图中心"]
     assert len(clicks) == 1
-    # Player is west of the cap, so its far-side destination must be east of
-    # the tactical map centre rather than the cap's exact centre.
-    assert clicks[0][0] > 810
+    # Capture-circle OCR is telemetry only; map centre remains the stable
+    # opening target on every map.
+    assert clicks[0][0] == 810

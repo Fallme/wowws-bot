@@ -50,9 +50,9 @@ def test_delayed_focus_injection_is_not_user_intervention():
     controller = SimpleNamespace(last_injected_tick_ms=1300)
     monitor.reset()
 
-    # Alt focus events can be reported a few hundred milliseconds before the
-    # backend records its automation marker.
-    current[0] = 1005
+    # A just-injected key can reach GetLastInputInfo shortly before the
+    # backend records its marker.
+    current[0] = 1185
     assert not monitor.poll(controller, now=10)
 
 

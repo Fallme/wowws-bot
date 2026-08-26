@@ -425,13 +425,12 @@ class BattleBot:
         analysis.navigation_source = "minimap_center"
 
     def _apply_generic_objective(self, analysis: BattleAnalysis):
-        """Prefer the live capture route; use geometric centre only as fallback."""
-        if (
-            analysis.capture_zone_center_normalized is not None
-            and analysis.capture_point_bearing is not None
-        ):
-            analysis.navigation_source = "minimap_capture_zone_fallback"
-            return
+        """Use map centre as the stable default after native navigation.
+
+        Capture circles are useful telemetry, but their OCR/Hough result is
+        not reliable enough to own the helm.  They remain visible in the Web
+        radar while the fallback controller always heads toward map centre.
+        """
         self._apply_map_center_objective(analysis)
 
     def _reassert_full_speed(self):

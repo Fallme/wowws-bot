@@ -9,10 +9,11 @@ from pathlib import Path
 import time
 
 
-# Foreground maintenance can update GetLastInputInfo shortly before the
-# controller records its own marker.  Keep a short tolerance so that system
-# focus activity is not mistaken for the player's keyboard intervention.
-AUTOMATION_TICK_TOLERANCE_MS = 400
+# Native SendInput events reach GetLastInputInfo almost immediately.  Keep a
+# very small grace window for our own key injection, but never mask a real
+# player keypress for nearly half a second: doing so made manual intervention
+# occasionally miss its first key and let the bot steal focus back.
+AUTOMATION_TICK_TOLERANCE_MS = 120
 
 
 class _LASTINPUTINFO(ctypes.Structure):

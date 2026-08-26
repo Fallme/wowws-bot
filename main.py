@@ -37,7 +37,6 @@ from port_navigator import (
     select_requested_ship,
     ShipSelectionError,
 )
-from strategy.route_planner import far_side_waypoint
 from runtime_control import RunLimits, RuntimeReporter
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -398,7 +397,7 @@ def run_battle(
         bot.last_movement_reason = "恢复战斗的自动航行设置失败，通用驾驶向点位/地图中心接管"
         logger.info("恢复当前战斗，自动航行未生效，通用驾驶按小地图接管")
     elif autopilot_set:
-        logger.info("进入战斗，已交由游戏自动航行驶向最近占领点远端")
+        logger.info("进入战斗，已交由游戏自动航行驶向地图中心")
     else:
         bot.last_movement_reason = "自动航行设置失败，通用驾驶向地图中央接管"
         logger.warning("战术地图自动航行设置失败，通用驾驶向地图中央接管")
@@ -447,9 +446,9 @@ def run_battle(
                 logger.warning("无法切换《战舰世界》到前台，本轮不发送控制指令")
                 time.sleep(0.5)
                 continue
-            note_activity = getattr(bot.gamepad, "note_automation_activity", None)
-            if note_activity is not None:
-                note_activity()
+            # Focus activation is not a game command.  Do not mark it as an
+            # injected key event, otherwise a player's first keyboard input
+            # immediately after switching windows can be mistaken for ours.
         try:
             tick_result = bot.combat_tick()
         except RuntimeError as error:
@@ -516,28 +515,11 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         if bot.vision.classify_screen(image) != ScreenState.BATTLE:
             return False
         height, width = image.shape[:2]
+        # A/B/C/D circle detection is retained for the radar only.  Maps have
+        # different layouts and a false circle must never redirect the opening
+        # route.  Map centre is the invariant, safe initial objective.
         normalized_target = (0.5, 0.5)
         target_label = "地图中心"
-        minimap = bot.vision.find_minimap(image)
-        if minimap is not None:
-            pose = bot.vision.find_player_pose_on_minimap(minimap)
-            player = None if pose is None else pose.position
-            find_nearest = getattr(bot.vision, "find_nearest_capture_zone", None)
-            zone = (
-                find_nearest(minimap, player)
-                if find_nearest is not None and player is not None
-                else bot.vision.find_central_capture_zone(minimap)
-            )
-            if zone is not None:
-                destination = far_side_waypoint(player, zone) or zone.center
-                normalized_target = (
-                    destination[0] / max(minimap.shape[1], 1),
-                    destination[1] / max(minimap.shape[0], 1),
-                )
-                zone_label = getattr(zone, "label", "")
-                target_label = (
-                    f"{zone_label}点远端" if zone_label else "最近占领点远端"
-                )
         local_x, local_y = tactical_map_local_point(
             width,
             height,
@@ -547,8 +529,22 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         verify_autopilot = getattr(bot.vision, "is_autopilot_enabled", None)
         accepted = False
         for attempt in range(2):
+            intervention = getattr(bot, "intervention", None)
+            if intervention is not None and intervention.poll(bot.gamepad):
+                mark_pause = getattr(bot, "mark_manual_pause", None)
+                if mark_pause is not None:
+                    mark_pause()
+                logger.info("用户键盘介入，取消本次自动航行设置")
+                return False
             toggle_map()
             time.sleep(0.65)
+            if intervention is not None and intervention.poll(bot.gamepad):
+                mark_pause = getattr(bot, "mark_manual_pause", None)
+                if mark_pause is not None:
+                    mark_pause()
+                logger.info("用户键盘介入，战术地图已停止继续操作")
+                toggle_map()
+                return False
             if not physical_click(
                 rect["left"] + local_x,
                 rect["top"] + local_y,
