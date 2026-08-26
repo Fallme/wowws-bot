@@ -1166,7 +1166,10 @@ class Vision:
         # The dense full-width card-edge pattern remains the distinguishing
         # signal.  The prior colour threshold was high enough that a normal
         # selected-ship port could fall through into the loose battle guard.
-        return colorful_ratio > 0.10 and edge_ratio > 0.13
+        # Real 2560px port captures can sit around 12.5% edge coverage when
+        # the carousel is dense but low-contrast.  Keep this below the battle
+        # fixture (about 11.1%) while accepting the verified live port frame.
+        return colorful_ratio > 0.10 and edge_ratio > 0.115
 
     def in_port(self, image):
         battle_button = self._crop_region(image, PORT_BATTLE_BUTTON)

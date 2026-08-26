@@ -65,7 +65,10 @@ def activate_window(hwnd):
         # activation only: it never posts a mouse event or changes geometry.
         user32 = ctypes.windll.user32
         foreground = int(user32.GetForegroundWindow() or 0)
-        current_thread = int(user32.GetCurrentThreadId() or 0)
+        # GetCurrentThreadId is exported by kernel32, not user32.  Calling it
+        # through user32 raised AttributeError and aborted every foreground
+        # activation before SetForegroundWindow could run.
+        current_thread = int(ctypes.windll.kernel32.GetCurrentThreadId() or 0)
         foreground_thread = 0
         game_thread = 0
         attached_foreground = False
