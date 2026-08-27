@@ -225,15 +225,11 @@ class ResultRewardReader:
         confidence = {}
         raw_text = {}
         height, width = image.shape[:2]
-        # 2560x1600 is only 16:10, but it still uses the expanded result
-        # layout: the three figures sit farther left/lower just like the
-        # ultrawide panel.  Aspect ratio alone therefore read the headline
-        # “在战斗中获得” as the credits field.  Treat high-resolution result
-        # pages as expanded as well; the later two-frame consensus remains
-        # responsible for accepting the actual values.
-        expanded_layout = (
-            width >= 2000 or width / max(height, 1) >= 1.70
-        )
+        # Layout follows aspect ratio, not absolute resolution.  A 2560x1600
+        # client is still 16:10 and uses the normal three-column placement;
+        # treating all high-resolution frames as ultrawide crops credit/XP
+        # groups into neighbouring columns (for example 258 / 088 / 897).
+        expanded_layout = width / max(height, 1) >= 1.82
         regions = (
             WIDE_RESULT_REWARD_REGIONS
             if expanded_layout

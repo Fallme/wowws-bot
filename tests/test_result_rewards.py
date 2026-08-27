@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 
 from core.ocr import OcrToken
 from core.results import (
@@ -37,6 +38,17 @@ def test_result_reward_reader_extracts_credits_and_experience():
     assert rewards.ship_xp == 897
     assert rewards.free_xp == 540
     assert rewards.provider == "CUDAExecutionProvider"
+
+
+def test_16_by_10_result_fixture_uses_normal_three_column_layout():
+    image = cv2.imread("tests/fixtures/results.png")
+
+    rewards = ResultRewardReader().read(image)
+
+    assert rewards.recognized
+    assert rewards.credits == 258_088
+    assert rewards.ship_xp == 897
+    assert rewards.free_xp == 540
 
 
 def test_result_reader_classifies_coloured_result_headline_without_reward_ocr():

@@ -256,6 +256,6 @@ def test_opening_autopilot_uses_map_center_not_unstable_capture_circle():
 
     assert events == ["toggle", "toggle", "地图中心"]
     assert len(clicks) == 1
-    # Capture-circle OCR is telemetry only; map centre remains the stable
-    # opening target on every map.
-    assert clicks[0][0] == 810
+    # Capture-circle OCR is telemetry only. The first target is on the
+    # player-to-centre approach ray; later retries advance farther to centre.
+    assert 710 <= clicks[0][0] < 810

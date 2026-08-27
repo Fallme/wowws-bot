@@ -64,3 +64,35 @@ def test_single_false_result_frame_does_not_commit_round():
 
     assert not confirmed
     assert state == ScreenState.BATTLE
+
+
+def test_reward_consensus_accepts_columns_confirmed_on_different_frames():
+    class StaggeredReader:
+        backend = SimpleNamespace(execution_provider="CUDAExecutionProvider")
+        MINIMUM_CREDITS = 1_000
+
+        def __init__(self):
+            self.values = iter(
+                [
+                    BattleRewards(credits=102_692, ship_xp=0, free_xp=0),
+                    BattleRewards(credits=102_692, ship_xp=1_143, free_xp=136),
+                    BattleRewards(credits=102_692, ship_xp=1_143, free_xp=136),
+                ]
+            )
+
+        def read(self, _image):
+            return next(self.values)
+
+    confirmed, rewards, state = collect_battle_rewards(
+        make_bot([ScreenState.RESULTS, ScreenState.RESULTS, ScreenState.RESULTS]),
+        StaggeredReader(),
+        attempts=3,
+    )
+
+    assert confirmed
+    assert state == ScreenState.RESULTS
+    assert rewards.resource_values() == {
+        "credits": 102_692,
+        "ship_xp": 1_143,
+        "free_xp": 136,
+    }

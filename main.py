@@ -3,6 +3,7 @@
 import ctypes
 import logging
 import os
+import random
 import time
 from pathlib import Path
 
@@ -519,16 +520,22 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         # different layouts and a false circle must never redirect the opening
         # route.  Map centre is the invariant, safe initial objective.
         normalized_target = (0.5, 0.5)
+        player_normalized = None
+        minimap = bot.vision.find_minimap(image)
+        if minimap is not None:
+            pose = bot.vision.find_player_pose_on_minimap(minimap)
+            if pose is not None:
+                player_normalized = (
+                    pose.position[0] / max(minimap.shape[1], 1),
+                    pose.position[1] / max(minimap.shape[0], 1),
+                )
         target_label = "地图中心"
-        local_x, local_y = tactical_map_local_point(
-            width,
-            height,
-            normalized_target,
-        )
         rect = get_client_rect(bot.hwnd)
         verify_autopilot = getattr(bot.vision, "is_autopilot_enabled", None)
         accepted = False
-        for attempt in range(2):
+        local_x, local_y = tactical_map_local_point(width, height, normalized_target)
+        selected_target = normalized_target
+        for attempt in range(3):
             intervention = getattr(bot, "intervention", None)
             if intervention is not None and intervention.poll(bot.gamepad):
                 mark_pause = getattr(bot, "mark_manual_pause", None)
@@ -536,6 +543,25 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
                     mark_pause()
                 logger.info("用户键盘介入，取消本次自动航行设置")
                 return False
+            # Retry farther along the player-to-centre ray.  The first point
+            # is a safe central approach, then every retry advances deeper
+            # toward the centre with a small lateral variation.  This avoids
+            # repeatedly clicking an ignored target while never following a
+            # false capture-circle detection.
+            attempt_target = normalized_target
+            if player_normalized is not None:
+                progress = (0.70, 0.86, 1.00)[attempt]
+                dx = 0.5 - player_normalized[0]
+                dy = 0.5 - player_normalized[1]
+                lateral = random.uniform(-0.018, 0.018) if attempt < 2 else 0.0
+                attempt_target = (
+                    max(0.08, min(0.92, player_normalized[0] + dx * progress - dy * lateral)),
+                    max(0.08, min(0.92, player_normalized[1] + dy * progress + dx * lateral)),
+                )
+            local_x, local_y = tactical_map_local_point(
+                width, height, attempt_target
+            )
+            selected_target = attempt_target
             toggle_map()
             time.sleep(0.65)
             if intervention is not None and intervention.poll(bot.gamepad):
@@ -570,14 +596,14 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
                 accepted = True
                 break
             logger.warning(
-                "战术地图落点未出现自动驾驶标识，重试 %s/2",
+                "战术地图落点未出现自动驾驶标识，向地图中心更远处重试 %s/3",
                 attempt + 1,
             )
         if not accepted:
-            logger.warning("战术地图两次落点均未生效，交由通用驾驶接管")
+            logger.warning("战术地图三次渐进落点均未生效，交由通用驾驶接管")
             return False
         try:
-            enable(target_label, target_normalized=normalized_target)
+            enable(target_label, target_normalized=selected_target)
         except TypeError:
             # Compatibility for light-weight test/custom bot adapters.
             enable(target_label)
@@ -611,7 +637,15 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
     result_frames = 0
     page_confirmed = False
     last_state = ScreenState.UNKNOWN
-    stable_rewards: dict[tuple[int, int, int], int] = {}
+    # OCR can finish one numeric column a frame later than the others while
+    # the result panel animates. Vote per resource instead of requiring one
+    # whole three-column tuple to match byte-for-byte; every value still needs
+    # agreement from two independent result frames.
+    field_votes: dict[str, dict[int, int]] = {
+        "credits": {},
+        "ship_xp": {},
+        "free_xp": {},
+    }
     for attempt in range(max(1, attempts)):
         if attempt == 0 and bot.last_analysis is not None:
             image = bot.last_analysis.image
@@ -629,19 +663,44 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
         rewards = reader.read(image)
         if rewards.recognized or not fallback.recognized:
             fallback = rewards
-        if page_confirmed and rewards.recognized:
-            signature = (
-                int(rewards.credits),
-                int(rewards.ship_xp),
-                int(rewards.free_xp),
+        if page_confirmed:
+            values = rewards.resource_values()
+            minimum_credits = int(
+                getattr(reader, "MINIMUM_CREDITS", ResultRewardReader.MINIMUM_CREDITS)
             )
-            stable_rewards[signature] = stable_rewards.get(signature, 0) + 1
-            # Result digits have a stable colour/position across frames. Two
-            # identical reads prove the complete same-colour number was
-            # captured, preventing a single clipped leading/trailing token
-            # from entering the per-task total.
-            if stable_rewards[signature] >= 2:
-                return True, rewards, last_state
+            if values["credits"] >= minimum_credits:
+                field_votes["credits"][values["credits"]] = (
+                    field_votes["credits"].get(values["credits"], 0) + 1
+                )
+            for field in ("ship_xp", "free_xp"):
+                if values[field] > 0:
+                    field_votes[field][values[field]] = (
+                        field_votes[field].get(values[field], 0) + 1
+                    )
+            consensus = {}
+            for field, votes in field_votes.items():
+                confirmed = [
+                    (count, value)
+                    for value, count in votes.items()
+                    if count >= 2
+                ]
+                if confirmed:
+                    consensus[field] = max(confirmed)[1]
+            if len(consensus) == 3:
+                return (
+                    True,
+                    BattleRewards(
+                        credits=consensus["credits"],
+                        ship_xp=consensus["ship_xp"],
+                        free_xp=consensus["free_xp"],
+                        recognized=True,
+                        provider=rewards.provider,
+                        confidence=rewards.confidence,
+                        raw_text=rewards.raw_text,
+                        outcome=rewards.outcome,
+                    ),
+                    last_state,
+                )
     if page_confirmed and not fallback.recognized:
         logger.warning(
             "结算页已确认但资源 OCR 未识别: raw=%s confidence=%s",
