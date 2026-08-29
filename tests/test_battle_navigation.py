@@ -78,6 +78,15 @@ class DamageControlGamepad(RecordingGamepad):
         self.damage_control_uses += 1
 
 
+class SurvivalGamepad(DamageControlGamepad):
+    def __init__(self):
+        super().__init__()
+        self.heal_uses = 0
+
+    def heal(self):
+        self.heal_uses += 1
+
+
 class FixtureDistanceReader:
     def read(self, image, anchor, target_track_id, *, captured_at):
         return DistanceObservation(
@@ -311,6 +320,82 @@ def test_confirmed_hazard_uses_damage_control_without_waiting_for_hp_drop():
     bot._execute_rules(analysis, now + 1)
 
     assert gamepad.damage_control_uses == 1
+
+
+def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
+    gamepad = SurvivalGamepad()
+    bot = BattleBot(
+        1,
+        {
+            "strategy": {
+                "damage_control_cooldown_seconds": 80,
+                "heal_cooldown_seconds": 80,
+                "heal_loss_step": 0.20,
+                "heal_max_uses": 3,
+            }
+        },
+        vision=object(),
+        gamepad=gamepad,
+    )
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    now = time.monotonic()
+    bot.battle_start_time = now - 100
+    bot.last_damage_control = now - 100
+    bot.last_heal = now - 100
+    bot.opening_autopilot_active = True
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1600,
+        health=0.79,
+        health_recognized=True,
+        on_fire=True,
+        autopilot_enabled=True,
+        player_position=(100, 100),
+    )
+
+    bot._execute_rules(analysis, now)
+
+    assert gamepad.damage_control_uses == 1
+    assert gamepad.heal_uses == 1
+    assert gamepad.movements == []
+
+
+def test_heal_uses_numeric_health_at_each_twenty_percent_loss_band():
+    gamepad = SurvivalGamepad()
+    bot = BattleBot(
+        1,
+        {
+            "strategy": {
+                "heal_cooldown_seconds": 80,
+                "heal_loss_step": 0.20,
+                "heal_max_uses": 3,
+            }
+        },
+        vision=object(),
+        gamepad=gamepad,
+    )
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    now = time.monotonic()
+    bot.last_heal = now - 100
+
+    def analysis_at(health):
+        return BattleAnalysis(
+            image=None,
+            width=2560,
+            height=1600,
+            health=health,
+            health_recognized=True,
+        )
+
+    assert bot._execute_survival_consumables(analysis_at(0.79), now)
+    assert gamepad.heal_uses == 1
+    assert bot._execute_survival_consumables(analysis_at(0.70), now + 100)
+    assert gamepad.heal_uses == 1
+    assert bot._execute_survival_consumables(analysis_at(0.59), now + 200)
+    assert gamepad.heal_uses == 2
+    assert bot._execute_survival_consumables(analysis_at(0.39), now + 300)
+    assert gamepad.heal_uses == 3
 
 
 def test_emergency_island_command_never_reverses_from_vision_alone():

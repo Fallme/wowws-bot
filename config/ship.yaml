@@ -64,7 +64,8 @@ pommern:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
-    heal_threshold: 0.50
+    heal_threshold: 0.50            # 兼容旧配置；实际按每损失20%血量分档触发
+    heal_loss_step: 0.20
     heal_cooldown_seconds: 80
     heal_max_uses: 3
     torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
@@ -128,7 +129,8 @@ napoli:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
-    heal_threshold: 0.55
+    heal_threshold: 0.55            # 兼容旧配置；实际按每损失20%血量分档触发
+    heal_loss_step: 0.20
     heal_cooldown_seconds: 80
     heal_max_uses: 3
     auto_smoke: true

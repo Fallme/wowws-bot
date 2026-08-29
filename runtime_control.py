@@ -138,6 +138,7 @@ class RuntimeStatus:
     manual_intervention_latched: bool = False
     manual_intervention_active: bool = False
     manual_intervention_seconds: float = 0.0
+    manual_intervention_remaining_seconds: float = 0.0
     paused_by_user: bool = False
 
 

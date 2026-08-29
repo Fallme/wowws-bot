@@ -2,6 +2,7 @@
 
 import ctypes
 import logging
+import math
 import os
 import random
 import time
@@ -1958,11 +1959,38 @@ def run():
             def report_battle_progress(active_bot):
                 quality = active_bot.vision.last_frame_quality
                 analysis = active_bot.last_analysis
+                intervention_active = bool(
+                    getattr(active_bot, "manual_intervention_active", False)
+                )
+                intervention_latched = bool(
+                    getattr(active_bot, "manual_intervention_latched", False)
+                )
+                intervention_remaining = float(
+                    getattr(
+                        active_bot,
+                        "manual_intervention_remaining_seconds",
+                        0.0,
+                    )
+                )
+                if intervention_latched:
+                    progress_state = "paused"
+                    progress_message = "用户持续操作已满20秒，永久暂停；等待网页点击继续"
+                elif intervention_active:
+                    progress_state = "paused"
+                    progress_message = (
+                        f"用户介入暂停；静默 {max(0, math.ceil(intervention_remaining))} 秒后自动恢复，"
+                        "持续操作满20秒将永久暂停"
+                    )
+                else:
+                    progress_state = "battle"
+                    progress_message = (
+                        "闭环控制已确认"
+                        if active_bot.movement_verified
+                        else "等待舰船位移反馈"
+                    )
                 reporter.update(
-                    "battle",
-                    "闭环控制已确认"
-                    if active_bot.movement_verified
-                    else "等待舰船位移反馈",
+                    progress_state,
+                    progress_message,
                     current_round=current_round,
                     completed_rounds=completed_rounds,
                     safety_state="verified"
@@ -2083,6 +2111,9 @@ def run():
                     ),
                     manual_intervention_seconds=(
                         active_bot.manual_intervention_seconds
+                    ),
+                    manual_intervention_remaining_seconds=(
+                        active_bot.manual_intervention_remaining_seconds
                     ),
                     stop_after_current=bool(
                         limits.duration_seconds

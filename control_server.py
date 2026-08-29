@@ -727,7 +727,9 @@ class RunnerManager:
             "navigation_source": "unknown",
             "stop_after_current": False,
             "manual_intervention_latched": False,
+            "manual_intervention_active": False,
             "manual_intervention_seconds": 0.0,
+            "manual_intervention_remaining_seconds": 0.0,
             "minimap_snapshot": "",
             "last_outcome": "unknown",
         }

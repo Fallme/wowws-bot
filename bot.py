@@ -1466,47 +1466,64 @@ class BattleBot:
 
     def mark_manual_pause(self):
         """Expose an already-observed keyboard/Web pause without input."""
+        was_active = self._manual_intervention_active
+        was_latched = self._manual_intervention_latched
+        web_paused = bool(getattr(self.intervention, "web_paused", False))
+        latched = bool(getattr(self.intervention, "latched", False))
         pause_source = (
-            "网页手动暂停" if self.intervention.web_paused else "用户键盘介入"
+            "网页手动暂停" if web_paused else "用户键盘介入"
         )
         self.last_movement_reason = (
-            f"{pause_source}：保持既有油门与舵，暂停下发新指令"
+            f"{pause_source}：停止截图、切窗和全部游戏指令；"
+            + (
+                "等待网页点击继续"
+                if latched
+                else (
+                    f"静默 {float(getattr(self.intervention, 'pause_seconds', 5.0)):.0f} "
+                    "秒后自动恢复"
+                )
+            )
         )
         self._manual_intervention_active = True
-        self._manual_intervention_latched = self.intervention.latched
+        self._manual_intervention_latched = latched
         self._last_movement_mode = "manual_pause"
+        if not was_active:
+            logger.info(
+                "[USER] %s，立即冻结截图、切窗及全部游戏指令；%s",
+                pause_source,
+                "等待网页继续"
+                if web_paused
+                else (
+                    f"连续 {float(getattr(self.intervention, 'pause_seconds', 5.0)):.0f} "
+                    "秒无新键盘操作后自动恢复，"
+                    f"持续操作满 {float(getattr(self.intervention, 'latch_seconds', 20.0)):.0f} "
+                    "秒将锁定暂停"
+                ),
+            )
+        if latched and not was_latched and not web_paused:
+            logger.warning(
+                "[USER] 持续键盘介入达到 %.0f 秒，已转为永久暂停；等待网页点击继续",
+                float(getattr(self.intervention, "latch_seconds", 20.0)),
+            )
 
     def _execute_rules(self, analysis: BattleAnalysis, now: float):
         if self.intervention.poll(self.gamepad, now):
             # Freeze command generation only. Do not release rudder or change
             # the latched engine telegraph: the ship keeps executing the last
             # accepted command while the player interacts.
-            pause_source = (
-                "网页手动暂停"
-                if self.intervention.web_paused
-                else "用户键盘介入"
-            )
-            was_active = self._manual_intervention_active
-            was_latched = self._manual_intervention_latched
             self.mark_manual_pause()
-            if not was_active:
-                logger.info(
-                    "[USER] %s，冻结新系统指令%s；保持既有航行状态",
-                    pause_source,
-                    "直到网页继续"
-                    if self.intervention.web_paused
-                    else f" {self.intervention.pause_seconds:.1f} 秒",
-                )
-            if self.intervention.latched and not was_latched:
-                logger.warning(
-                    "[USER] 持续介入达到 %.1f 秒，进入手动保持；等待网页继续",
-                    self.intervention.latch_seconds,
-                )
             return
 
         if self._manual_intervention_active:
-            source = "网页确认" if self.intervention.resumed_from_web else "5秒内无用户输入"
-            logger.info("[SYSTEM] %s，下一控制帧恢复进点主航线", source)
+            source = (
+                "网页点击继续"
+                if getattr(self.intervention, "resumed_from_web", False)
+                else (
+                    f"连续 {float(getattr(self.intervention, 'pause_seconds', 5.0)):.0f} "
+                    "秒无新的键盘操作"
+                )
+            )
+            logger.info("[SYSTEM] %s，重新识别当前战斗状态并恢复控制", source)
             if not self.movement_verified:
                 self.feedback.reset()
             self._manual_intervention_active = False
@@ -1523,6 +1540,12 @@ class BattleBot:
             )
             self._autopilot_hud_samples.clear()
             logger.info("[SYSTEM] 检测到游戏自动航行仍开启，恢复原生航线互锁")
+
+        # Survival consumables are independent from steering.  They must be
+        # evaluated before the native-autopilot branch returns; otherwise R/T
+        # could remain unused for the whole opening route.
+        if not self._execute_survival_consumables(analysis, now):
+            return
 
         if self.opening_autopilot_active:
             self._autopilot_hud_samples.append(bool(analysis.autopilot_enabled))
@@ -1701,55 +1724,6 @@ class BattleBot:
         if analysis.visible_target and self.movement_verified:
             self._engage_visible_enemy(analysis, now)
 
-        damage_control_cooldown = float(
-            self.strategy.get("damage_control_cooldown_seconds", 80.0)
-        )
-        if (
-            (analysis.on_fire or analysis.flooding)
-            and now - self.last_damage_control >= damage_control_cooldown
-            and hasattr(self.gamepad, "damage_control")
-        ):
-            self.gamepad.damage_control()
-            self.last_damage_control = now
-            logger.info(
-                "检测到%s，使用 R 损害管制",
-                "着火/漏水" if analysis.on_fire and analysis.flooding else "着火" if analysis.on_fire else "漏水",
-            )
-
-        heal_threshold = float(self.strategy.get("heal_threshold", 0.55))
-        heal_cooldown = float(
-            self.strategy.get("heal_cooldown_seconds", 80.0)
-        )
-        heal_max_uses = int(self.strategy.get("heal_max_uses", 3))
-        if (
-            0 < analysis.health <= heal_threshold
-            and analysis.health_recognized
-            and self.heal_used < heal_max_uses
-            and now - self.last_heal >= heal_cooldown
-            and hasattr(self.gamepad, "heal")
-        ):
-            self.gamepad.heal()
-            self.last_heal = now
-            self.heal_used += 1
-            logger.info(
-                "血量 %.0f%%，使用 T 维修小组 (%s/%s)",
-                analysis.health * 100,
-                self.heal_used,
-                heal_max_uses,
-            )
-
-        smoke_threshold = self.strategy.get("smoke_threshold", 0.5)
-        if (
-            self.ship.get("has_smoke")
-            and self.strategy.get("auto_smoke", False)
-            and not self.smoke_used
-            and analysis.health_recognized
-            and 0 < analysis.health < smoke_threshold
-        ):
-            self.gamepad.smoke()
-            self.smoke_used = True
-            logger.info("那不勒斯使用 4 号位烟雾 (HP: %.0f%%)", analysis.health * 100)
-
         torpedo_reload = self.ship.get("torpedo", {}).get("reload", 90)
         if (
             self.ship.get("has_torpedoes")
@@ -1760,6 +1734,84 @@ class BattleBot:
             self.gamepad.torpedo()
             self.last_torpedo = now
             logger.info("[%03d] 鱼雷指令已派发", self.tick)
+
+    def _execute_survival_consumables(
+        self, analysis: BattleAnalysis, now: float
+    ) -> bool:
+        """Dispatch R/T/smoke even while native autopilot owns steering."""
+        damage_control_cooldown = float(
+            self.strategy.get("damage_control_cooldown_seconds", 80.0)
+        )
+        if (
+            (analysis.on_fire or analysis.flooding)
+            and now - self.last_damage_control >= damage_control_cooldown
+            and hasattr(self.gamepad, "damage_control")
+        ):
+            if self.intervention.poll(self.gamepad, time.monotonic()):
+                self.mark_manual_pause()
+                return False
+            self.gamepad.damage_control()
+            self.last_damage_control = now
+            logger.info(
+                "检测到%s，使用 R 损害管制",
+                "着火/漏水"
+                if analysis.on_fire and analysis.flooding
+                else "着火"
+                if analysis.on_fire
+                else "漏水",
+            )
+
+        heal_cooldown = float(
+            self.strategy.get("heal_cooldown_seconds", 80.0)
+        )
+        heal_max_uses = int(self.strategy.get("heal_max_uses", 3))
+        heal_loss_step = max(
+            0.05,
+            min(0.50, float(self.strategy.get("heal_loss_step", 0.20))),
+        )
+        next_heal_threshold = max(
+            0.0, 1.0 - heal_loss_step * (self.heal_used + 1)
+        )
+        if (
+            analysis.health_recognized
+            and 0 < analysis.health <= next_heal_threshold + 0.005
+            and self.heal_used < heal_max_uses
+            and now - self.last_heal >= heal_cooldown
+            and hasattr(self.gamepad, "heal")
+        ):
+            if self.intervention.poll(self.gamepad, time.monotonic()):
+                self.mark_manual_pause()
+                return False
+            self.gamepad.heal()
+            self.last_heal = now
+            self.heal_used += 1
+            logger.info(
+                "数值血量 %.0f%% 已跨过 %.0f%% 档位，使用 T 维修小组 (%s/%s)",
+                analysis.health * 100,
+                next_heal_threshold * 100,
+                self.heal_used,
+                heal_max_uses,
+            )
+
+        smoke_threshold = float(self.strategy.get("smoke_threshold", 0.5))
+        if (
+            self.ship.get("has_smoke")
+            and self.strategy.get("auto_smoke", False)
+            and not self.smoke_used
+            and analysis.health_recognized
+            and 0 < analysis.health < smoke_threshold
+            and hasattr(self.gamepad, "smoke")
+        ):
+            if self.intervention.poll(self.gamepad, time.monotonic()):
+                self.mark_manual_pause()
+                return False
+            self.gamepad.smoke()
+            self.smoke_used = True
+            logger.info(
+                "那不勒斯使用 4 号位烟雾 (HP: %.0f%%)",
+                analysis.health * 100,
+            )
+        return True
 
     def _engage_visible_enemy(self, analysis: BattleAnalysis, now: float):
         if now - self.last_lock > 3:
@@ -1867,6 +1919,10 @@ class BattleBot:
     @property
     def manual_intervention_seconds(self) -> float:
         return self.intervention.continuous_seconds()
+
+    @property
+    def manual_intervention_remaining_seconds(self) -> float:
+        return float(getattr(self.intervention, "remaining_seconds", 0.0))
 
     @property
     def damage_control_ready(self) -> bool:

@@ -63,7 +63,7 @@
           <label class="quick-battle-toggle"><input id="quickBattle" type="checkbox" /><span><b>快速战斗测试</b><small>单局最多 5 分钟；计入计划局数，不统计收益或胜负</small></span></label>
           <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
           <div class="human-alert" id="interventionCard" hidden><strong>需要人工检查</strong><p id="interventionMessage"></p><button id="retryBtn">问题处理后重试</button></div>
-          <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong>手动操作保持中</strong><p>已保持原有油门与舵，系统不会继续下发新指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
+          <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong id="manualResumeTitle">用户介入暂停</strong><p id="manualResumeMessage">系统已停止截图、切窗和全部游戏指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
           <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动作战</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止作战</button></div>
           <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
         </article>
