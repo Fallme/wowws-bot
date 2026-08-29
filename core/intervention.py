@@ -68,7 +68,7 @@ class UserInterventionMonitor:
         hwnd,
         *,
         pause_seconds: float = 4.0,
-        latch_seconds: float = 15.0,
+        latch_seconds: float = 20.0,
         resume_path=None,
         pause_path=None,
         input_tick_reader=None,
@@ -94,10 +94,12 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = False
+        self._last_foreground: int | None = None
 
     def reset(self):
         self._last_seen_tick = self._input_tick_reader()
         self._keyboard_activity_reader()
+        self._last_foreground = self._foreground_reader()
         self.pause_until = 0.0
         self.intervention_started_at = None
         self.last_user_input_at = None
@@ -119,7 +121,24 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = True
+        # The Continue button is normally clicked from the browser.  Seed the
+        # foreground baseline there so that this intentional Web action does
+        # not immediately look like a fresh switch away from the game.
+        self._last_foreground = self._foreground_reader()
         return True
+
+    def _note_user_intervention(self, now: float) -> None:
+        """Extend the quiet-period pause for one verified user action."""
+        if (
+            self.intervention_started_at is None
+            or self.last_user_input_at is None
+            or now - self.last_user_input_at > self.pause_seconds
+        ):
+            self.intervention_started_at = now
+        self.last_user_input_at = now
+        self.pause_until = now + self.pause_seconds
+        if now - self.intervention_started_at >= self.latch_seconds:
+            self.latched = True
 
     @staticmethod
     def _automation_tick(controller) -> int | None:
@@ -135,6 +154,20 @@ class UserInterventionMonitor:
             return True
         if self._consume_web_resume():
             return False
+        # Losing foreground after the game was active is itself a user
+        # takeover signal.  This closes the focus-stealing race even when the
+        # Alt+Tab/Win key transition occurs while OCR is busy, or when the
+        # user switches applications with the taskbar.  Ordinary mouse use
+        # inside the current window still does not pause automation.
+        current_foreground = self._foreground_reader()
+        previous_foreground = self._last_foreground
+        if current_foreground:
+            self._last_foreground = current_foreground
+        if (
+            previous_foreground == self.hwnd
+            and current_foreground not in (0, self.hwnd)
+        ):
+            self._note_user_intervention(now)
         current_tick = self._input_tick_reader()
         previous_tick = self._last_seen_tick
         self._last_seen_tick = current_tick
@@ -158,16 +191,7 @@ class UserInterventionMonitor:
             <= AUTOMATION_TICK_TOLERANCE_MS
         )
         if not is_automation:
-            if (
-                self.intervention_started_at is None
-                or self.last_user_input_at is None
-                or now - self.last_user_input_at > self.pause_seconds
-            ):
-                self.intervention_started_at = now
-            self.last_user_input_at = now
-            self.pause_until = now + self.pause_seconds
-            if now - self.intervention_started_at >= self.latch_seconds:
-                self.latched = True
+            self._note_user_intervention(now)
         return self.latched or now < self.pause_until
 
     @property

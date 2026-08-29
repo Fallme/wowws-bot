@@ -3,8 +3,12 @@ from unittest.mock import patch
 
 import pytest
 
+import core.window as game_window
+
 from main import (
     GameWindowUnavailableWhilePaused,
+    ensure_bound_game_foreground,
+    refresh_game_window,
     shutdown_bot,
     wait_for_web_resume,
 )
@@ -92,3 +96,79 @@ def test_shutdown_with_stale_handle_closes_resources_without_game_input():
 
     activate.assert_not_called()
     assert bot.stop_calls == [False]
+
+
+def test_common_foreground_gate_never_focuses_or_maximizes_while_paused():
+    intervention = SimpleNamespace(
+        poll=lambda _controller, _now: True,
+    )
+    bot = SimpleNamespace(
+        hwnd=1234,
+        gamepad=SimpleNamespace(),
+        intervention=intervention,
+        mark_manual_pause=lambda: None,
+    )
+    with (
+        patch("main.ensure_game_window_foreground") as focus,
+        patch("main.maximize_game_window") as maximize,
+        patch("main.find_game_window") as find_window,
+    ):
+        assert not ensure_bound_game_foreground(bot)
+        assert not refresh_game_window(bot)
+
+    focus.assert_not_called()
+    maximize.assert_not_called()
+    find_window.assert_not_called()
+
+
+def test_shutdown_during_pause_never_focuses_game_window():
+    stop_calls = []
+    bot = SimpleNamespace(
+        hwnd=1234,
+        gamepad=SimpleNamespace(),
+        intervention=SimpleNamespace(poll=lambda _controller, _now: True),
+        mark_manual_pause=lambda: None,
+        stop=lambda *, release_input=True: stop_calls.append(release_input),
+    )
+    with patch("main.ensure_game_window_foreground") as focus:
+        shutdown_bot(bot)
+
+    focus.assert_not_called()
+    assert stop_calls == [False]
+
+
+def test_low_level_pause_guard_blocks_every_window_side_effect():
+    game_window.set_interaction_pause_guard(lambda: True)
+    try:
+        with (
+            patch("core.window.is_game_window") as is_game,
+            patch("core.window.activate_window") as activate,
+            patch("core.window.ctypes.windll.user32.ShowWindow") as show,
+            patch("core.window.ctypes.windll.user32.GetCursorPos") as cursor,
+        ):
+            assert not game_window.ensure_game_window_foreground(1234)
+            assert not game_window.maximize_game_window(1234)
+            assert not game_window.physical_click(100, 100, hwnd=1234)
+            assert not game_window.physical_scroll(100, 100, 1, hwnd=1234)
+            assert not game_window.window_message_click(1234, 100, 100)
+
+        is_game.assert_not_called()
+        activate.assert_not_called()
+        show.assert_not_called()
+        cursor.assert_not_called()
+    finally:
+        game_window.set_interaction_pause_guard(None)
+
+
+def test_foreground_retry_stops_if_keyboard_pause_arrives_mid_operation():
+    checks = iter([False, True])
+    game_window.set_interaction_pause_guard(lambda: next(checks))
+    try:
+        with (
+            patch("core.window.is_game_window", return_value=True),
+            patch("core.window.activate_window") as activate,
+        ):
+            assert not game_window.ensure_game_window_foreground(1234)
+        activate.assert_not_called()
+    finally:
+        game_window.set_interaction_pause_guard(None)

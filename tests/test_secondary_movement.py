@@ -32,7 +32,7 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.throttle, 1.0)
         self.assertEqual(command.rudder, 0.0)
 
-    def test_inside_capture_point_is_the_normal_slowdown_trigger(self):
+    def test_inside_capture_point_keeps_searching_instead_of_loitering(self):
         command = self.plan(
             inside_capture_point=True,
             capture_point_distance_km=1.0,
@@ -40,7 +40,7 @@ class SecondaryMovementTests(unittest.TestCase):
         )
 
         self.assertEqual(command.mode, MovementMode.CAPTURE)
-        self.assertLess(command.throttle, 0.5)
+        self.assertGreaterEqual(command.throttle, 0.7)
         self.assertLess(command.rudder, 0)
 
     def test_enemy_inside_secondary_range_does_not_cause_turn_away(self):
@@ -68,11 +68,11 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.throttle, 1.0)
         self.assertGreaterEqual(command.rudder, 0)
 
-    def test_far_enemy_only_biases_central_route(self):
+    def test_forward_far_enemy_is_prioritized_over_central_route(self):
         command = self.plan(
             target_distance_km=18.0,
             minimap_distance_km=18.0,
-            minimap_target_bearing=0.8,
+            minimap_target_bearing=0.35,
             capture_point_bearing=-0.4,
             enemy_count=1,
             route_arrived=True,
@@ -80,9 +80,8 @@ class SecondaryMovementTests(unittest.TestCase):
         )
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
-        self.assertEqual(command.throttle, 0.72)
-        # Central-cap bearing remains dominant, preventing an early about-turn.
-        self.assertLess(command.rudder, 0)
+        self.assertEqual(command.throttle, 1.0)
+        self.assertGreater(command.rudder, 0)
 
     def test_minimap_five_kilometre_grid_is_distance_fallback(self):
         command = self.plan(
@@ -95,14 +94,14 @@ class SecondaryMovementTests(unittest.TestCase):
         )
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
-        self.assertEqual(command.throttle, 0.72)
+        self.assertEqual(command.throttle, 1.0)
         self.assertIn("小地图5km网格15.0km", command.reason)
 
     def test_minimap_grid_overrides_untrusted_viewport_ocr(self):
         command = self.plan(
             target_distance_km=9.0,
             minimap_distance_km=20.0,
-            minimap_target_bearing=0.8,
+            minimap_target_bearing=0.35,
             capture_point_bearing=-0.2,
             route_arrived=True,
             inside_capture_point=True,
@@ -110,9 +109,7 @@ class SecondaryMovementTests(unittest.TestCase):
 
         self.assertEqual(command.mode, MovementMode.APPROACH)
         self.assertIn("小地图5km网格20.0km", command.reason)
-        # A distant enemy may bias the route slightly, but cannot command a
-        # hard turn away from the central objective.
-        self.assertLess(abs(command.rudder), 0.2)
+        self.assertGreater(command.rudder, 0)
 
     def test_viewport_ocr_alone_never_controls_distance(self):
         command = self.plan(
@@ -195,20 +192,33 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.throttle, 1.0)
         self.assertEqual(command.rudder, 0.0)
 
-    def test_enemy_cannot_pull_ship_off_route_before_arrival(self):
+    def test_forward_enemy_biases_route_before_arrival_without_uturn(self):
         command = self.plan(
             route_phase="transit",
             route_arrived=False,
             target_distance_km=4.0,
-            minimap_target_bearing=0.9,
+            minimap_target_bearing=0.35,
             capture_point_bearing=-0.25,
         )
 
         self.assertEqual(command.mode, MovementMode.ROUTE_TRANSIT)
         self.assertEqual(command.throttle, 1.0)
+        self.assertGreater(command.rudder, 0)
+
+    def test_rear_enemy_never_causes_about_turn(self):
+        command = self.plan(
+            route_phase="transit",
+            route_arrived=False,
+            minimap_distance_km=18.0,
+            minimap_target_bearing=0.82,
+            capture_point_bearing=-0.25,
+            enemy_count=1,
+        )
+
+        self.assertEqual(command.mode, MovementMode.ROUTE_TRANSIT)
         self.assertLess(command.rudder, 0)
 
-    def test_close_enemy_triggers_reverse_only_after_reaching_point(self):
+    def test_close_enemy_never_triggers_reverse_after_reaching_point(self):
         command = self.plan(
             route_arrived=True,
             inside_capture_point=True,
@@ -217,8 +227,8 @@ class SecondaryMovementTests(unittest.TestCase):
             minimap_target_bearing=0.4,
         )
 
-        self.assertEqual(command.mode, MovementMode.REVERSE_RANGE)
-        self.assertLess(command.throttle, 0)
+        self.assertEqual(command.mode, MovementMode.BRAWL)
+        self.assertGreaterEqual(command.throttle, 0.6)
 
     def test_torpedo_evasion_keeps_full_speed(self):
         command = self.plan(torpedoes_incoming=True)

@@ -6,6 +6,7 @@ from enum import Enum
 
 class ScreenState(str, Enum):
     PORT = "port"
+    DAILY_REWARD = "daily_reward"
     LOADING = "loading"
     BATTLE = "battle"
     ESCAPE_MENU = "escape_menu"

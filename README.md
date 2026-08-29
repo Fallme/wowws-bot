@@ -38,8 +38,9 @@ one_click_run.bat
 
 ```text
 data/            控制台设置、任务历史、收益和运行状态
-runtime/debug/   每局诊断截图与结构化事件
-runtime/manual/  手动截图工具输出
+runtime/screenshots/runs/   每局诊断截图与结构化事件
+runtime/screenshots/manual/ 手动截图工具输出
+training_assets/user_captures/ 用户反馈截图（保留为回归与训练素材）
 runtime/ocr_reports/  OCR 离线评估报告
 ```
 
@@ -61,6 +62,15 @@ powershell -ExecutionPolicy Bypass -File .\tools\build_release.ps1
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m compileall -q main.py bot.py control_server.py core strategy tools tests
 ```
+
+使用项目内的代表性截图离线回放场景识别、OCR 和拟下发驾驶指令：
+
+```powershell
+.\.venv\Scripts\python.exe .\tools\simulate_screenshot_scenarios.py
+```
+
+这个脚本不会查找游戏窗口，也不会发送键盘或鼠标操作。报告写入
+`runtime/ocr_reports/screenshot_scenario_report.json`，包含场景、三项结算资源、生命值、航速、小地图态势与拟下发任务。
 
 ## 注意事项
 

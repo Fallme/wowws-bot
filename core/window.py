@@ -12,6 +12,31 @@ import win32process
 
 logger = logging.getLogger("window")
 GAME_WINDOW_TOKENS = ("world of warships", "战舰世界", "wows")
+_INTERACTION_PAUSE_GUARD = None
+
+
+def set_interaction_pause_guard(guard=None) -> None:
+    """Install the process-wide final interlock for focus and input actions.
+
+    Scene code already checks pause before starting an operation, but a user
+    keypress can arrive during a multi-attempt foreground activation or while
+    the cursor is moving toward a verified control.  The low-level window
+    module therefore rechecks this guard immediately before every focus,
+    maximize, click and scroll side effect.
+    """
+    global _INTERACTION_PAUSE_GUARD
+    _INTERACTION_PAUSE_GUARD = guard
+
+
+def _interaction_paused() -> bool:
+    guard = _INTERACTION_PAUSE_GUARD
+    if guard is None:
+        return False
+    try:
+        return bool(guard())
+    except Exception:
+        logger.exception("底层暂停门禁检查失败；按暂停处理")
+        return True
 
 
 def _enable_dpi_awareness():
@@ -52,10 +77,15 @@ def _foreground_matches(hwnd) -> bool:
 
 def activate_window(hwnd):
     """Foreground the game and keep it maximized, without dragging it."""
+    if _interaction_paused():
+        logger.info("[USER] 暂停期间拒绝激活游戏窗口")
+        return False
     try:
         # The user requested a consistent maximized game window whenever the
         # automation returns to it.  SW_MAXIMIZE changes only the standard
         # window state; no SetWindowPos/MoveWindow/drag operation is used.
+        if _interaction_paused():
+            return False
         if win32gui.IsIconic(int(hwnd)) or not ctypes.windll.user32.IsZoomed(int(hwnd)):
             ctypes.windll.user32.ShowWindow(int(hwnd), win32con.SW_MAXIMIZE)
             time.sleep(0.18)
@@ -94,6 +124,8 @@ def activate_window(hwnd):
                 user32.AllowSetForegroundWindow(0xFFFFFFFF)
             except Exception:
                 pass
+            if _interaction_paused():
+                return False
             win32gui.BringWindowToTop(int(hwnd))
             user32.SetForegroundWindow(int(hwnd))
             user32.SetActiveWindow(int(hwnd))
@@ -136,6 +168,9 @@ def activate_window(hwnd):
 
 def maximize_game_window(hwnd) -> bool:
     """Maximize on startup; foreground returns use the same standard state."""
+    if _interaction_paused():
+        logger.info("[USER] 暂停期间拒绝最大化游戏窗口")
+        return False
     try:
         if not win32gui.IsWindow(int(hwnd)):
             return False
@@ -164,14 +199,21 @@ def is_game_window(hwnd) -> bool:
 
 def ensure_game_window_foreground(hwnd) -> bool:
     """Verify and foreground the game before any capture or input action."""
+    if _interaction_paused():
+        return False
     if not is_game_window(hwnd):
         logger.warning("目标窗口不是可见的战舰世界窗口: hwnd=%s", hwnd)
         return False
     for attempt in range(3):
+        if _interaction_paused():
+            logger.info("[USER] 前台切换重试期间检测到暂停，立即终止")
+            return False
         if _foreground_matches(hwnd):
             return True
         logger.info("游戏不在前台，切换到《战舰世界》窗口 (%s/3)", attempt + 1)
         activate_window(hwnd)
+        if _interaction_paused():
+            return False
         time.sleep(0.10 * (attempt + 1))
     logger.warning("无法将《战舰世界》切换到前台")
     return False
@@ -234,8 +276,16 @@ def get_client_rect(hwnd):
     }
 
 
-def physical_click(screen_x, screen_y, extra_delay=0.0, *, hwnd=None):
-    """Click a physical screen coordinate and restore the original cursor."""
+def physical_click(
+    screen_x, screen_y, extra_delay=0.0, *, hwnd=None, button="left"
+):
+    """Click a physical coordinate and restore the original cursor.
+
+    ``button`` is explicit so the port workflow can open the selected ship's
+    context menu without introducing a second cursor-positioning path.
+    """
+    if _interaction_paused():
+        return False
     if hwnd and not ensure_game_window_foreground(hwnd):
         return False
     original = ctypes.wintypes.POINT()
@@ -311,20 +361,33 @@ def physical_click(screen_x, screen_y, extra_delay=0.0, *, hwnd=None):
                     moved.y,
                 )
                 return False
-        ctypes.windll.user32.mouse_event(
-            win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0
+        if button not in {"left", "right"}:
+            raise ValueError(f"unsupported mouse button: {button}")
+        down_flag = (
+            win32con.MOUSEEVENTF_LEFTDOWN
+            if button == "left"
+            else win32con.MOUSEEVENTF_RIGHTDOWN
         )
+        up_flag = (
+            win32con.MOUSEEVENTF_LEFTUP
+            if button == "left"
+            else win32con.MOUSEEVENTF_RIGHTUP
+        )
+        if _interaction_paused():
+            logger.info("[USER] 鼠标移动后检测到暂停，取消本次点击")
+            return False
+        ctypes.windll.user32.mouse_event(down_flag, 0, 0, 0, 0)
         time.sleep(0.05)
-        ctypes.windll.user32.mouse_event(
-            win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0
-        )
+        ctypes.windll.user32.mouse_event(up_flag, 0, 0, 0, 0)
         time.sleep(0.1)
         return True
     finally:
         ctypes.windll.user32.SetCursorPos(original.x, original.y)
 
 
-def window_message_click(hwnd, screen_x, screen_y, extra_delay=0.0):
+def window_message_click(
+    hwnd, screen_x, screen_y, extra_delay=0.0, *, button="left"
+):
     """Deliver a verified click to a specific game window without moving the cursor.
 
     Some multi-monitor/remote desktops block global cursor warps from the
@@ -333,6 +396,8 @@ def window_message_click(hwnd, screen_x, screen_y, extra_delay=0.0):
     client mouse messages, so use this narrowly-scoped fallback only after
     screenshot recognition identified the target control.
     """
+    if _interaction_paused():
+        return False
     if not hwnd or not ensure_game_window_foreground(hwnd):
         return False
     try:
@@ -352,14 +417,25 @@ def window_message_click(hwnd, screen_x, screen_y, extra_delay=0.0):
             return False
         lparam = (int(client_y) & 0xFFFF) << 16 | (int(client_x) & 0xFFFF)
         win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
-        win32gui.PostMessage(
-            hwnd,
-            win32con.WM_LBUTTONDOWN,
-            win32con.MK_LBUTTON,
-            lparam,
+        if button not in {"left", "right"}:
+            raise ValueError(f"unsupported mouse button: {button}")
+        down_message = (
+            win32con.WM_LBUTTONDOWN
+            if button == "left"
+            else win32con.WM_RBUTTONDOWN
         )
+        up_message = (
+            win32con.WM_LBUTTONUP
+            if button == "left"
+            else win32con.WM_RBUTTONUP
+        )
+        button_mask = win32con.MK_LBUTTON if button == "left" else win32con.MK_RBUTTON
+        if _interaction_paused():
+            logger.info("[USER] 窗口消息派发前检测到暂停，取消本次点击")
+            return False
+        win32gui.PostMessage(hwnd, down_message, button_mask, lparam)
         time.sleep(0.05 + max(0.0, extra_delay))
-        win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+        win32gui.PostMessage(hwnd, up_message, 0, lparam)
         logger.info(
             "已通过窗口消息派发点击: hwnd=%s client=(%s,%s)",
             hwnd,
@@ -374,6 +450,8 @@ def window_message_click(hwnd, screen_x, screen_y, extra_delay=0.0):
 
 def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
     """Scroll at a physical coordinate and restore the user's cursor."""
+    if _interaction_paused():
+        return False
     if hwnd and not ensure_game_window_foreground(hwnd):
         return False
     original = ctypes.wintypes.POINT()
@@ -382,6 +460,9 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
     try:
         ctypes.windll.user32.SetCursorPos(int(screen_x), int(screen_y))
         time.sleep(0.10)
+        if _interaction_paused():
+            logger.info("[USER] 滚轮派发前检测到暂停，取消本次滚动")
+            return False
         ctypes.windll.user32.mouse_event(
             win32con.MOUSEEVENTF_WHEEL,
             0,

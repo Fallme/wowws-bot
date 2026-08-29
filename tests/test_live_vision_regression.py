@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from core.ocr import OcrToken
+from core.ocr import OcrToken, RapidOcrBackend
 from core.ui import NO_COMMANDER_CONFIRM_BUTTON
 from core.vision import PlayerPose, Vision
 
@@ -24,6 +24,38 @@ def test_live_health_uses_ship_status_gauge(live_frame):
     vision = Vision()
     health = vision.health_pct(vision.find_health_bar(live_frame))
     assert health == pytest.approx(52344 / 86000, abs=0.04)
+
+
+def test_health_ocr_keeps_grouped_digits_as_one_fraction(live_frame):
+    class Backend:
+        @staticmethod
+        def recognize(_image):
+            return [
+                OcrToken("波美拉尼亚", 0.99),
+                OcrToken("52 344 / 86 000", 0.96),
+            ]
+
+    assert Vision.read_health_fraction(
+        live_frame, Backend()
+    ) == pytest.approx(52344 / 86000)
+
+
+def test_health_ocr_retries_an_enhanced_crop_after_original_failure(live_frame):
+    class RetryBackend(RapidOcrBackend):
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [OcrToken("52 344 / 86 000", 0.92)]
+
+    backend = RetryBackend()
+    assert Vision.read_health_fraction(live_frame, backend) == pytest.approx(
+        52344 / 86000
+    )
+    assert backend.calls == 2
 
 
 def test_live_player_arrow_uses_range_ring(live_frame):
@@ -78,6 +110,22 @@ def test_speed_ocr_uses_kts_value_not_engine_notch_label(live_frame):
             ]
 
     assert Vision.read_speed_knots(live_frame, SpeedBackend()) == pytest.approx(23.6)
+
+
+def test_speed_ocr_retries_an_enhanced_crop_after_original_failure(live_frame):
+    class RetryBackend(RapidOcrBackend):
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [OcrToken("29.2 kts", 0.91)]
+
+    backend = RetryBackend()
+    assert Vision.read_speed_knots(live_frame, backend) == pytest.approx(29.2)
+    assert backend.calls == 2
 
 
 def test_central_capture_circle_is_selected():
@@ -310,3 +358,44 @@ def test_no_commander_detector_requires_confirm_button():
 
     image[y1:y2, x1:x2] = 45
     assert not Vision().in_no_commander_confirmation(image)
+
+
+def test_hazard_icons_are_read_from_lower_left_ship_status_only():
+    image = np.zeros((1600, 2560, 3), dtype=np.uint8)
+    # Old centre-screen false positive: two orange target/tracer fragments.
+    image[790:810, 1260:1280] = (0, 145, 255)
+    image[820:840, 1300:1320] = (0, 145, 255)
+    assert not Vision().is_on_fire(image)
+
+    # Verified fire marker position beside the numeric HP/ship silhouette.
+    image[1220:1232, 160:174] = (0, 145, 255)
+    image[1240:1252, 178:192] = (0, 145, 255)
+    assert Vision().is_on_fire(image)
+
+    flood = np.zeros_like(image)
+    flood[1320:1332, 158:172] = (255, 120, 0)
+    flood[1340:1352, 178:192] = (255, 120, 0)
+    assert Vision().is_flooding(flood)
+
+
+def test_island_aware_waypoint_bends_only_a_blocked_minimap_route():
+    island = {
+        "points": [
+            [0.43, 0.38],
+            [0.57, 0.38],
+            [0.57, 0.62],
+            [0.43, 0.62],
+        ]
+    }
+    player = (40, 160)
+    target = (280, 160)
+    waypoint = Vision.plan_island_aware_waypoint(
+        (320, 320, 3), player, target, [island]
+    )
+    assert waypoint != target
+    assert abs(waypoint[1] - 160) > 20
+
+    clear_target = (40, 30)
+    assert Vision.plan_island_aware_waypoint(
+        (320, 320, 3), player, clear_target, [island]
+    ) == clear_target

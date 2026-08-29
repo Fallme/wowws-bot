@@ -9,6 +9,7 @@ from main import (
     automatic_input_preflight,
     configure_opening_autopilot,
     prepare_battle,
+    refresh_game_window,
     run_battle,
     tactical_map_local_point,
     wait_for_battle,
@@ -97,13 +98,110 @@ def test_battle_hud_is_checked_before_commander_dialog_detector():
             return ScreenState.BATTLE
 
     bot = SimpleNamespace(hwnd=1, vision=BattleVision())
-    with (
-        patch("main.time.sleep", return_value=None),
-        patch("main.confirm_no_commander") as confirmation,
-    ):
+    with patch("main.time.sleep", return_value=None):
         assert wait_for_battle(bot, timeout=2)
 
-    confirmation.assert_not_called()
+
+def test_wait_for_battle_fails_closed_on_no_commander_warning():
+    class NoCommanderVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.full((90, 160, 3), 80, dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.UNKNOWN
+
+        @staticmethod
+        def in_no_commander_confirmation(_image):
+            return True
+
+    bot = SimpleNamespace(hwnd=1, vision=NoCommanderVision())
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.classify_runtime_screen", return_value=ScreenState.UNKNOWN),
+    ):
+        assert not wait_for_battle(bot, timeout=2)
+
+
+def test_new_round_waits_for_loading_then_fresh_upper_right_clock():
+    class NewRoundVision:
+        def __init__(self):
+            self.states = [
+                ScreenState.BATTLE,
+                ScreenState.LOADING,
+                ScreenState.BATTLE,
+                ScreenState.BATTLE,
+            ]
+            self.index = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            return np.full((90, 160, 3), 80, dtype=np.uint8)
+
+        def classify_screen(self, _image):
+            state = self.states[min(self.index, len(self.states) - 1)]
+            self.index += 1
+            return state
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return 19 * 60 + 49
+
+    vision = NewRoundVision()
+    bot = SimpleNamespace(hwnd=1, vision=vision)
+    with patch("main.time.sleep", return_value=None):
+        assert wait_for_battle(bot, timeout=2, require_new_round=True)
+
+    # The first battle-looking frame is rejected because no loading transition
+    # had been observed; the new round is accepted only after the full chain.
+    assert vision.index == 4
+
+
+def test_first_battle_hud_frame_starts_engine_before_clock_and_autopilot_finish():
+    class OpeningVision:
+        def __init__(self):
+            self.states = [
+                ScreenState.LOADING,
+                ScreenState.BATTLE,
+                ScreenState.BATTLE,
+            ]
+            self.index = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            return np.full((90, 160, 3), 80, dtype=np.uint8)
+
+        def classify_screen(self, _image):
+            state = self.states[min(self.index, len(self.states) - 1)]
+            self.index += 1
+            return state
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return 19 * 60 + 55
+
+    class OpeningController:
+        def __init__(self):
+            self.reassertions = 0
+
+        def reassert_full_speed(self):
+            self.reassertions += 1
+
+    controller = OpeningController()
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=OpeningVision(),
+        gamepad=controller,
+        intervention=None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=False),
+    ):
+        assert wait_for_battle(bot, timeout=2, require_new_round=True)
+
+    assert controller.reassertions == 1
+    assert bot._opening_motion_prestarted
 
 
 def test_run_battle_dispatches_full_speed_before_first_analysis():
@@ -132,6 +230,135 @@ def test_run_battle_dispatches_full_speed_before_first_analysis():
         assert run_battle(ImmediateBot())
 
     assert events == ["reset", "full_speed", "analyze"]
+
+
+def test_run_battle_scene_interlock_rejects_port_before_any_command():
+    events = []
+
+    class PortVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.PORT
+
+    class InterlockedBot:
+        hwnd = 1
+        vision = PortVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            events.append("reset")
+
+    with patch("main.ensure_bound_game_foreground", return_value=True):
+        assert run_battle(InterlockedBot(), resume_existing=True) == "resume_state"
+
+    assert events == []
+
+
+def test_run_battle_leaves_false_battle_after_three_non_battle_frames():
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class WaitingBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+        last_analysis = None
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        def combat_tick(self):
+            self.last_analysis = SimpleNamespace(
+                in_battle=False,
+                health=1.0,
+            )
+            return "waiting"
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert run_battle(WaitingBot()) == "resume_state"
+
+
+def test_quick_battle_timeout_is_counted_only_inside_confirmed_battle():
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class QuickBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def combat_tick():
+            raise AssertionError("五分钟已到，不应再发送战斗指令")
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.monotonic", side_effect=[0.0, 301.0]),
+    ):
+        assert run_battle(QuickBot(), quick_battle=True) == "quick_timeout"
+
+
+def test_quick_battle_death_immediately_requests_next_round():
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class SunkBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+        last_analysis = None
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        def combat_tick(self):
+            self.last_analysis = SimpleNamespace(in_battle=True, health=0.0)
+            return "waiting"
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.monotonic", side_effect=[0.0, 1.0]),
+    ):
+        assert run_battle(SunkBot(), quick_battle=True) == "quick_death"
 
 
 def test_keyboard_pause_skips_capture_focus_and_all_followup_commands():
@@ -259,3 +486,23 @@ def test_opening_autopilot_uses_map_center_not_unstable_capture_circle():
     # Capture-circle OCR is telemetry only. The first target is on the
     # player-to-centre approach ray; later retries advance farther to centre.
     assert 710 <= clicks[0][0] < 810
+
+
+def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():
+    rebound = []
+    bot = SimpleNamespace(
+        hwnd=11,
+        rebind_window=lambda hwnd: rebound.append(hwnd) or True,
+    )
+    with (
+        patch("main.is_game_window", return_value=False),
+        patch(
+            "main.find_game_window",
+            return_value=[(22, "World of Warships", (0, 0, 2560, 1440))],
+        ),
+        patch("main.maximize_game_window", return_value=True) as maximize,
+    ):
+        assert refresh_game_window(bot)
+
+    assert rebound == [22]
+    maximize.assert_called_once_with(22)

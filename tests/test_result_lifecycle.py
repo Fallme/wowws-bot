@@ -4,7 +4,7 @@ import numpy as np
 
 from core.results import BattleRewards
 from core.ui import ScreenState
-from main import collect_battle_rewards
+from main import collect_battle_rewards, return_to_port
 
 
 class SequenceVision:
@@ -64,6 +64,36 @@ def test_single_false_result_frame_does_not_commit_round():
 
     assert not confirmed
     assert state == ScreenState.BATTLE
+
+
+def test_live_battle_hud_overrides_false_result_colours():
+    bot = make_bot([ScreenState.RESULTS, ScreenState.RESULTS])
+    bot.vision._has_battle_hud = lambda _image: True
+
+    confirmed, rewards, state = collect_battle_rewards(
+        bot,
+        FixedRewardReader(),
+        attempts=2,
+    )
+
+    assert not confirmed
+    assert not rewards.recognized
+    assert state == ScreenState.BATTLE
+
+
+def test_return_to_port_never_sends_escape_while_battle_is_live():
+    class Gamepad:
+        escapes = 0
+
+        def escape(self):
+            self.escapes += 1
+
+    bot = make_bot([ScreenState.BATTLE])
+    bot.last_analysis = None
+    bot.gamepad = Gamepad()
+
+    assert not return_to_port(bot, attempts=1)
+    assert bot.gamepad.escapes == 0
 
 
 def test_reward_consensus_accepts_columns_confirmed_on_different_frames():

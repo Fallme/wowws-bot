@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from core.frame_guard import CaptureFault, FrameGuard
+from core.ocr import RapidOcrBackend, numeric_ocr_fallback_variants
 from core.ui import (
     ESCAPE_RESUME_BUTTON,
     EXIT_CONTINUE_BUTTON,
@@ -886,6 +887,135 @@ class Vision:
         ]
 
     @staticmethod
+    def plan_island_aware_waypoint(
+        minimap_shape,
+        player,
+        target,
+        island_outlines,
+        *,
+        clearance_ratio: float = 0.022,
+    ):
+        """Return a short minimap waypoint when the direct route crosses land.
+
+        The final objective remains the capture point/map centre.  This local
+        planner only bends the next leg around the first blocking static island
+        and is recomputed from the live white-arrow position every frame.
+        """
+        if player is None or target is None or not island_outlines:
+            return target
+        height, width = minimap_shape[:2]
+        if height <= 0 or width <= 0:
+            return target
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for island in island_outlines:
+            points = island.get("points", ()) if isinstance(island, dict) else ()
+            if len(points) < 3:
+                continue
+            polygon = np.array(
+                [
+                    [
+                        int(round(float(point[0]) * width)),
+                        int(round(float(point[1]) * height)),
+                    ]
+                    for point in points
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillPoly(mask, [polygon], 255)
+        clearance = max(5, int(round(min(height, width) * clearance_ratio)))
+        mask = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (clearance * 2 + 1, clearance * 2 + 1)
+            ),
+        )
+
+        def blocked(start, end, *, width_pixels=4):
+            route = np.zeros_like(mask)
+            cv2.line(
+                route,
+                tuple(int(round(value)) for value in start),
+                tuple(int(round(value)) for value in end),
+                255,
+                max(2, int(width_pixels)),
+            )
+            # Ignore a tiny disk around the current player marker.  Terrain
+            # colour can overlap the arrow when a ship is already hugging a
+            # coast; that must not make every escape candidate impossible.
+            cv2.circle(
+                route,
+                tuple(int(round(value)) for value in start),
+                clearance,
+                0,
+                -1,
+            )
+            return bool(np.any((route > 0) & (mask > 0)))
+
+        if not blocked(player, target):
+            return target
+
+        route = np.zeros_like(mask)
+        cv2.line(
+            route,
+            tuple(int(round(value)) for value in player),
+            tuple(int(round(value)) for value in target),
+            255,
+            5,
+        )
+        blocking = (route > 0) & (mask > 0)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
+        if count <= 1:
+            return target
+        intersecting_labels = labels[blocking]
+        intersecting_labels = intersecting_labels[intersecting_labels > 0]
+        if not len(intersecting_labels):
+            return target
+        component = int(
+            max(
+                set(int(value) for value in intersecting_labels),
+                key=lambda value: int(np.count_nonzero(intersecting_labels == value)),
+            )
+        )
+        x, y, component_width, component_height, _pixels = stats[component]
+        ys, xs = np.where(labels == component)
+        # Probe expanded component corners on both sides of the direct route,
+        # not a permanent preferred side.  The shorter currently-clear leg
+        # wins, preventing one map from repeatedly producing the same circle.
+        margin = clearance * 1.5
+        candidates = [
+            (
+                max(4.0, min(width - 5.0, x - margin)),
+                max(4.0, min(height - 5.0, y - margin)),
+            ),
+            (
+                max(4.0, min(width - 5.0, x - margin)),
+                max(4.0, min(height - 5.0, y + component_height + margin)),
+            ),
+            (
+                max(4.0, min(width - 5.0, x + component_width + margin)),
+                max(4.0, min(height - 5.0, y - margin)),
+            ),
+            (
+                max(4.0, min(width - 5.0, x + component_width + margin)),
+                max(4.0, min(height - 5.0, y + component_height + margin)),
+            ),
+        ]
+        clear_candidates = [
+            candidate
+            for candidate in candidates
+            if not blocked(player, candidate, width_pixels=3)
+        ]
+        if not clear_candidates:
+            return target
+        return min(
+            clear_candidates,
+            key=lambda candidate: math.dist(player, candidate)
+            + math.dist(candidate, target),
+        )
+
+    @staticmethod
     def _ray_clearance(delta_x, delta_y, heading, *, angle, scale, maximum):
         cosine = math.cos(angle)
         sine = math.sin(angle)
@@ -1147,6 +1277,81 @@ class Vision:
             return None
         return min(best_run / max(area.shape[1], 1), 1.0)
 
+    @staticmethod
+    def read_health_fraction(image, backend) -> float | None:
+        """OCR the player's numeric ``current / maximum`` HP.
+
+        The original colour crop is authoritative.  If it cannot be parsed,
+        retry a few enlarged/contrast-normalized copies; never estimate HP
+        from the bar length because that produced values such as 89% at spawn.
+        """
+        if image is None or image.size == 0 or backend is None:
+            return None
+        height, width = image.shape[:2]
+        crop = image[
+            int(height * 0.75) : int(height * 0.87),
+            0 : int(width * 0.19),
+        ]
+        if crop.size == 0:
+            return None
+        def parse(candidate_image):
+            tokens = list(backend.recognize(candidate_image) or ())
+            tokens.sort(
+                key=lambda token: (
+                    min((point[1] for point in token.box), default=0),
+                    min((point[0] for point in token.box), default=0),
+                )
+            )
+            raw = " ".join(str(token.text or "") for token in tokens)
+            normalized = (
+                raw.replace(",", " ")
+                .replace("-", " ")
+                .replace("O", "0")
+                .replace("o", "0")
+                .replace("｜", "/")
+                .replace("|", "/")
+            )
+            candidates = []
+            for match in re.finditer(
+                r"(?<!\d)(\d(?:[\d\s]{2,12}\d)?)\s*/\s*"
+                r"(\d(?:[\d\s]{2,12}\d)?)(?!\d)",
+                normalized,
+            ):
+                current_digits = re.sub(r"\D", "", match.group(1))
+                maximum_digits = re.sub(r"\D", "", match.group(2))
+                if not current_digits or not maximum_digits:
+                    continue
+                current = int(current_digits)
+                maximum = int(maximum_digits)
+                if maximum < 1000 or current < 0 or current > maximum:
+                    continue
+                confidence = min(
+                    (float(getattr(token, "confidence", 0.0)) for token in tokens),
+                    default=0.0,
+                )
+                candidates.append((maximum, confidence, current / maximum))
+            return max(candidates, default=None)
+
+        parsed = parse(crop)
+        if parsed is not None:
+            return parsed[2]
+        # Test/dummy backends often return a predetermined sequence per call.
+        # Restrict visual retries to real OCR backends so deterministic unit
+        # contracts remain one crop == one recognition call.
+        if not isinstance(backend, RapidOcrBackend):
+            return None
+        fallbacks = []
+        for variant in numeric_ocr_fallback_variants(crop):
+            candidate = parse(variant)
+            if candidate is None:
+                continue
+            fallbacks.append(candidate)
+            if candidate[1] >= 0.80:
+                break
+        if not fallbacks:
+            return None
+        return max(fallbacks, key=lambda item: (item[1], item[0]))[2]
+
     def battle_ended(self, image):
         state = self.classify_screen(image)
         return state in {ScreenState.RESULTS, ScreenState.PORT}
@@ -1198,6 +1403,48 @@ class Vision:
         # fixture (about 11.1%) while accepting the verified live port frame.
         return colorful_ratio > 0.10 and edge_ratio > 0.115
 
+    @staticmethod
+    def _visual_anchor_metrics(area):
+        """Return inexpensive structure metrics for one fixed HUD anchor."""
+        if area is None or area.size == 0:
+            return {"mean": 0.0, "std": 0.0, "edge": 0.0, "bright": 0.0}
+        gray = cv2.cvtColor(area, cv2.COLOR_BGR2GRAY)
+        pixels = max(gray.size, 1)
+        return {
+            "mean": float(gray.mean()),
+            "std": float(gray.std()),
+            "edge": float(np.count_nonzero(cv2.Canny(gray, 80, 180)) / pixels),
+            "bright": float(np.count_nonzero(gray > 165) / pixels),
+        }
+
+    def _port_anchor_votes(self, image):
+        """Vote on independent port UI regions, excluding the battle button."""
+        height, width = image.shape[:2]
+        left_menu = image[
+            int(height * 0.07) : int(height * 0.73),
+            : int(width * 0.15),
+        ]
+        ship_details = image[
+            int(height * 0.06) : int(height * 0.74),
+            int(width * 0.82) :,
+        ]
+        top_tabs = image[
+            : int(height * 0.12),
+            int(width * 0.22) : int(width * 0.73),
+        ]
+        left = self._visual_anchor_metrics(left_menu)
+        right = self._visual_anchor_metrics(ship_details)
+        tabs = self._visual_anchor_metrics(top_tabs)
+        return {
+            "ship_carousel": self._is_port_ship_bar(image),
+            "left_port_menu": (
+                (left["bright"] > 0.18 and left["edge"] > 0.02)
+                or left["edge"] > 0.08
+            ),
+            "right_ship_details": right["std"] > 25 and right["edge"] > 0.045,
+            "top_port_tabs": tabs["std"] > 30 and tabs["edge"] > 0.025,
+        }
+
     def in_port(self, image):
         battle_button = self._crop_region(image, PORT_BATTLE_BUTTON)
         if battle_button.size == 0:
@@ -1215,11 +1462,25 @@ class Vision:
         # The real port action is one solid button. Battle score markers can
         # occupy the same top-centre ROI but only form tiny disconnected blobs.
         solid_button_ratio = largest / max(colored.size, 1)
-        return self._is_port_ship_bar(image) and solid_button_ratio > 0.12
+        anchors = self._port_anchor_votes(image)
+        anchor_count = sum(bool(value) for value in anchors.values())
+        logger.debug(
+            "Port anchors: button=%.3f votes=%s",
+            solid_button_ratio,
+            anchors,
+        )
+        # ``加入战斗`` is mandatory, plus at least three independent port
+        # regions (carousel, left menu, right ship data, top tabs).  A textured
+        # loading/login picture can overlap one region but cannot satisfy the
+        # complete port layout.
+        return solid_button_ratio > 0.12 and anchor_count >= 3
 
     def in_loading(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if gray.mean() < 40 and gray.std() < 25:
+            return True
+
+        if self._is_login_splash(image):
             return True
 
         start_button = self._crop_region(image, LOADING_START_BUTTON)
@@ -1231,7 +1492,50 @@ class Vision:
         center = gray[int(height * 0.38) : int(height * 0.58), int(width * 0.43) : int(width * 0.57)]
         bright_ratio = np.count_nonzero(center > 205) / max(center.size, 1)
         bottom_right = image[int(height * 0.60) :, int(width * 0.74) :]
-        return 0.0005 < bright_ratio < 0.12 and bottom_right.std() > 12 and not self._has_battle_hud(image)
+        if 0.0005 < bright_ratio < 0.12 and bottom_right.std() > 12 and not self._has_battle_hud(image):
+            return True
+
+        # The matchmaking artwork briefly removes every label and button while
+        # the map is being assembled.  That frame has no central bright text,
+        # so the text-oriented rule above used to oscillate between LOADING and
+        # UNKNOWN.  Accept the dark textured artwork only when all port anchors
+        # are absent and the battle HUD is also absent; this keeps arbitrary
+        # modal pages out of the loading lifecycle.
+        port_votes = self._port_anchor_votes(image)
+        return bool(
+            45 < float(gray.mean()) < 105
+            and 25 < float(gray.std()) < 58
+            and float(bottom_right.std()) > 25
+            and sum(bool(value) for value in port_votes.values()) == 0
+            and not self._has_battle_hud(image)
+        )
+
+    @staticmethod
+    def _is_login_splash(image):
+        """Recognize the full-screen ``World of Warships / 登录中`` artwork."""
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        bottom = image[int(height * 0.82) :]
+        center = image[
+            int(height * 0.35) : int(height * 0.65),
+            int(width * 0.30) : int(width * 0.70),
+        ]
+        if bottom.size == 0 or center.size == 0:
+            return False
+        bottom_gray = cv2.cvtColor(bottom, cv2.COLOR_BGR2GRAY)
+        center_gray = cv2.cvtColor(center, cv2.COLOR_BGR2GRAY)
+        center_bright = np.count_nonzero(center_gray > 205) / max(
+            center_gray.size, 1
+        )
+        # The login painting has a uniquely dark, low-detail lower ocean and
+        # a large bright central wordmark.  Live battle/results fixtures fail
+        # at least one of these independent conditions.
+        return (
+            float(bottom_gray.mean()) < 45
+            and float(bottom_gray.std()) < 25
+            and 0.03 < center_bright < 0.20
+        )
 
     def in_results(self, image):
         return_to_port = self._crop_region(image, RESULTS_RETURN_TO_PORT_BUTTON)
@@ -1269,11 +1573,14 @@ class Vision:
         )
 
     def is_on_fire(self, image):
-        """Detect the orange fire-duration indicator near the screen centre."""
+        """Detect the fire marker beside the lower-left numeric health HUD."""
         height, width = image.shape[:2]
+        # The actual player-condition indicator is attached to the ship/health
+        # block in the lower left.  The former centre-screen ROI repeatedly
+        # mistook shell tracers, target markers and capture timers for fire.
         status = image[
-            int(height * 0.47) : int(height * 0.55),
-            int(width * 0.485) : int(width * 0.555),
+            int(height * 0.748) : int(height * 0.807),
+            int(width * 0.040) : int(width * 0.098),
         ]
         if status.size == 0:
             return False
@@ -1290,18 +1597,20 @@ class Vision:
             (int(value) for value in stats[1:, cv2.CC_STAT_AREA]),
             reverse=True,
         )
-        # Icon and timer glyphs are separate components. Requiring both avoids
-        # treating a single shell tracer or aiming marker as a fire condition.
-        return len(areas) >= 2 and areas[0] >= 35 and sum(areas[:4]) >= 75
+        # The verified live fire frame contains the flame outline and its
+        # interior as two compact components.  Requiring both rejects the
+        # thin orange HP remainder seen after sinking.
+        compact = [area for area in areas if 18 <= area <= 650]
+        return len(compact) >= 2 and sum(compact[:4]) >= 95
 
     def is_flooding(self, image):
-        """Conservatively detect the blue flooding status icon near the reticle."""
+        """Detect the flooding marker below the lower-left ship condition HUD."""
         if image is None or image.size == 0:
             return False
         height, width = image.shape[:2]
         status = image[
-            int(height * 0.47) : int(height * 0.55),
-            int(width * 0.485) : int(width * 0.555),
+            int(height * 0.807) : int(height * 0.875),
+            int(width * 0.040) : int(width * 0.098),
         ]
         if status.size == 0:
             return False
@@ -1317,9 +1626,11 @@ class Vision:
         if labels <= 1:
             return False
         areas = [int(value) for value in stats[1:, cv2.CC_STAT_AREA]]
-        # A blue ship/team marker is not sufficient: require a compact status
-        # glyph of meaningful size inside the dedicated HUD area.
-        return sum(area for area in areas if 18 <= area <= 520) >= 55
+        # A blue ship/team marker cannot enter this dedicated lower-left ROI.
+        # Still require multiple compact pieces so compass decoration and one
+        # anti-aliased glyph do not trigger damage control.
+        compact = [area for area in areas if 14 <= area <= 520]
+        return len(compact) >= 2 and sum(compact) >= 55
 
     @staticmethod
     def read_speed_knots(image, backend) -> float | None:
@@ -1335,51 +1646,179 @@ class Vision:
         ]
         if crop.size == 0:
             return None
-        tokens = backend.recognize(crop)
-        candidates = []
-        for token in tokens:
-            text = str(token.text or "")
-            match = re.search(
-                r"(?<!\d)(\d{1,2}(?:[\.,]\d)?)\s*(?:kts?|节)",
-                text,
-                flags=re.IGNORECASE,
-            )
-            # OCR occasionally drops the ``kts`` suffix but preserves the
-            # decimal; do not accept gear labels such as ``3/4``.
-            if match is None:
-                match = re.search(r"(?<!\d)(\d{1,2}[\.,]\d)(?!\d)", text)
-            if match is None:
-                continue
-            value = float(match.group(1).replace(",", "."))
-            if 0.0 <= value <= 75.0:
-                candidates.append((float(getattr(token, "confidence", 0.0)), value))
-        if not candidates:
+        def parse(candidate_image):
+            candidates = []
+            for token in backend.recognize(candidate_image):
+                text = str(token.text or "")
+                match = re.search(
+                    r"(?<!\d)(\d{1,2}(?:[\.,]\d)?)\s*(?:kts?|节)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                # OCR occasionally drops the ``kts`` suffix but preserves the
+                # decimal; do not accept gear labels such as ``3/4``.
+                if match is None:
+                    match = re.search(r"(?<!\d)(\d{1,2}[\.,]\d)(?!\d)", text)
+                if match is None:
+                    continue
+                value = float(match.group(1).replace(",", "."))
+                if 0.0 <= value <= 75.0:
+                    candidates.append(
+                        (float(getattr(token, "confidence", 0.0)), value)
+                    )
+            return max(candidates, default=None)
+
+        parsed = parse(crop)
+        if parsed is not None:
+            return parsed[1]
+        if not isinstance(backend, RapidOcrBackend):
             return None
-        return max(candidates, key=lambda item: item[0])[1]
+        fallbacks = []
+        for variant in numeric_ocr_fallback_variants(crop):
+            candidate = parse(variant)
+            if candidate is None:
+                continue
+            fallbacks.append(candidate)
+            if candidate[0] >= 0.80:
+                break
+        return None if not fallbacks else max(fallbacks)[1]
+
+    @staticmethod
+    def read_battle_clock_seconds(image, backend) -> int | None:
+        """Read the active match clock from the top HUD.
+
+        Different HUD layouts place the clock near the top centre or top right.
+        Reading the whole shallow top band is more stable than tying lifecycle
+        state to one resolution-specific rectangle. This value is used only as
+        new-round evidence after a loading screen; it never drives combat.
+        """
+        if image is None or image.size == 0 or backend is None:
+            return None
+        height, width = image.shape[:2]
+        # The match timer is the clock in the upper-right HUD. The two values
+        # around the top-centre score are capture/base timers and must not be
+        # accepted as evidence for a newly started round.
+        top_right = image[
+            : max(1, int(height * 0.10)),
+            int(width * 0.80) : width,
+        ]
+        if top_right.size == 0:
+            return None
+
+        pattern = re.compile(r"(?<!\d)([0-2]?\d)\s*[:：\.]\s*([0-5]\d)(?!\d)")
+
+        def parse(candidate_image):
+            candidates = []
+            for token in backend.recognize(candidate_image):
+                text = str(token.text or "")
+                for match in pattern.finditer(text):
+                    seconds = int(match.group(1)) * 60 + int(match.group(2))
+                    if 0 <= seconds <= 30 * 60:
+                        candidates.append(
+                            (float(getattr(token, "confidence", 0.0)), seconds)
+                        )
+            return max(candidates, default=None)
+
+        parsed = parse(top_right)
+        if parsed is not None:
+            return parsed[1]
+        if not isinstance(backend, RapidOcrBackend):
+            return None
+        fallbacks = []
+        for variant in numeric_ocr_fallback_variants(top_right):
+            candidate = parse(variant)
+            if candidate is None:
+                continue
+            fallbacks.append(candidate)
+            if candidate[0] >= 0.80:
+                break
+        return None if not fallbacks else max(fallbacks)[1]
 
     def in_exit_confirmation(self, image):
         button = self._crop_region(image, EXIT_CONTINUE_BUTTON)
-        blue_ratio = self._color_ratio(button, (90, 70, 70), (135, 255, 255))
+        if button.size == 0:
+            return False
+        hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([90, 70, 70]), np.array([135, 255, 255]))
+        labels, _, stats, _ = cv2.connectedComponentsWithStats(blue, connectivity=8)
+        largest = 0 if labels <= 1 else int(stats[1:, cv2.CC_STAT_AREA].max())
+        solid_button_ratio = largest / max(blue.size, 1)
         height, width = image.shape[:2]
         center_band = image[int(height * 0.34) : int(height * 0.58), int(width * 0.35) : int(width * 0.65)]
-        return blue_ratio > 0.08 and center_band.mean() < 145
+        # Snow/sea backgrounds can contain enough scattered cyan pixels to
+        # pass a raw colour ratio.  A real modal action is one solid rectangle.
+        return solid_button_ratio > 0.08 and center_band.mean() < 145
 
     def in_escape_menu(self, image):
         resume = self._crop_region(image, ESCAPE_RESUME_BUTTON)
-        olive_ratio = self._color_ratio(resume, (25, 40, 35), (85, 255, 190))
+        if resume.size == 0:
+            return False
+        hsv = cv2.cvtColor(resume, cv2.COLOR_BGR2HSV)
+        olive = cv2.inRange(hsv, np.array([25, 40, 35]), np.array([85, 255, 190]))
+        labels, _, stats, _ = cv2.connectedComponentsWithStats(olive, connectivity=8)
+        largest = 0 if labels <= 1 else int(stats[1:, cv2.CC_STAT_AREA].max())
+        solid_button_ratio = largest / max(olive.size, 1)
         height, width = image.shape[:2]
         outer = image[int(height * 0.15) : int(height * 0.85), :]
-        return olive_ratio > 0.08 and outer.mean() < 150
+        return solid_button_ratio > 0.30 and outer.mean() < 150
 
     def _has_battle_hud(self, image):
         height, width = image.shape[:2]
         minimap = self._crop_region(image, MINIMAP_REGION)
-        if minimap.size == 0 or minimap.std() < 18:
-            return False
-        lower_left = image[int(height * 0.73) :, : int(width * 0.22)]
-        gray = cv2.cvtColor(lower_left, cv2.COLOR_BGR2GRAY)
-        bright_ratio = np.count_nonzero(gray > 165) / max(gray.size, 1)
-        return bright_ratio > 0.004
+        player_hud = image[int(height * 0.70) :, : int(width * 0.25)]
+        consumables = image[
+            int(height * 0.78) :,
+            int(width * 0.34) : int(width * 0.68),
+        ]
+        score_clock = image[
+            int(height * 0.02) : int(height * 0.12),
+            int(width * 0.42) : int(width * 0.58),
+        ]
+        metrics = {
+            "minimap": self._visual_anchor_metrics(minimap),
+            "player_name_health": self._visual_anchor_metrics(player_hud),
+            "consumables": self._visual_anchor_metrics(consumables),
+            "score_clock": self._visual_anchor_metrics(score_clock),
+        }
+        anchors = {
+            "minimap": (
+                metrics["minimap"]["std"] > 18
+                and metrics["minimap"]["edge"] > 0.025
+            ),
+            "player_name_health": (
+                metrics["player_name_health"]["std"] > 14
+                and metrics["player_name_health"]["edge"] > 0.04
+                and metrics["player_name_health"]["bright"] > 0.007
+            ),
+            "consumables": (
+                metrics["consumables"]["std"] > 24
+                and metrics["consumables"]["edge"] > 0.035
+            ),
+            "score_clock": (
+                metrics["score_clock"]["std"] > 10
+                and metrics["score_clock"]["edge"] > 0.018
+            ),
+        }
+        logger.debug("Battle HUD anchors: %s", anchors)
+        # The minimap is mandatory.  Require two of the three remaining,
+        # independent HUD surfaces.  Making the lower-left player block
+        # mandatory caused bright/snowy maps and temporary damage overlays to
+        # remain classified as LOADING even though score, consumables and the
+        # minimap were all present, leaving the ship at spawn.  Port/loading
+        # fixtures have no minimap plus two of these anchors, so this remains
+        # a fail-closed multi-anchor gate.
+        return bool(
+            anchors["minimap"]
+            and sum(
+                bool(anchors[name])
+                for name in (
+                    "player_name_health",
+                    "consumables",
+                    "score_clock",
+                )
+            )
+            >= 2
+        )
 
     @staticmethod
     def _is_port_reward_overlay(image) -> bool:
@@ -1425,16 +1864,36 @@ class Vision:
         # of ever entering the combat loop.
         if self._is_port_reward_overlay(image):
             return ScreenState.UNKNOWN
+        # After a battle, the game can return to the port while leaving a
+        # right-side victory/defeat reward card open.  This is positive proof
+        # that combat ended, but it must remain PORT for navigation: marking it
+        # RESULTS would make the result-page clicker hit the ship carousel.
+        # The reward collector independently recognizes and OCRs this card.
+        from core.results import ResultRewardReader
+
+        if ResultRewardReader._looks_like_port_reward_card(image):
+            return ScreenState.PORT
         loading_seen = self.in_loading(image)
         # Resolve explicit menu pages before considering battle.  A port has
         # dense bottom cards and a real "加入战斗" action; a battle HUD must
         # never override that positive evidence.  The old ordering did the
         # reverse and let incidental port texture become a combat state.
-        if self.in_results(image):
+        battle_seen = self._has_battle_hud(image)
+        # Result-button colour alone is not sufficient: battle score markers,
+        # consumables and minimap overlays can produce the same teal/orange
+        # ratios.  A live battle HUD always wins this conflict so combat is
+        # never handed to the result-page navigator.
+        if self.in_results(image) and not battle_seen:
             return ScreenState.RESULTS
         port_seen = self.in_port(image)
         if port_seen:
             return ScreenState.LOADING if loading_seen else ScreenState.PORT
+        # The login splash has ocean-blue areas in the same location as the
+        # exit-confirmation button.  Positive startup evidence must win before
+        # modal colour checks, while normal loading still remains below the
+        # explicit escape-menu rules.
+        if loading_seen and self._is_login_splash(image):
+            return ScreenState.LOADING
         if self.in_exit_confirmation(image):
             return ScreenState.EXIT_CONFIRMATION
         if self.in_escape_menu(image):
@@ -1442,7 +1901,7 @@ class Vision:
         # Battle is deliberately the final actionable state.  ``_has_battle_hud``
         # is a visual candidate only; lifecycle callers separately require
         # consecutive battle frames before they issue combat controls.
-        if self._has_battle_hud(image):
+        if battle_seen:
             return ScreenState.BATTLE
         if loading_seen:
             return ScreenState.LOADING

@@ -33,3 +33,17 @@ def test_missing_position_clears_stationary_evidence():
         controller.update(second, (100, 200), 1.0)
     controller.update(9, None, 1.0)
     assert controller.update(11, (100, 200), 1.0) is None
+
+
+def test_recovery_uses_live_clearance_side_when_available():
+    controller = StuckRecoveryController(stationary_seconds=10)
+    command = None
+    for second in range(12):
+        command = controller.update(
+            second,
+            (100, 200),
+            1.0,
+            escape_rudder=-0.8,
+        )
+    assert command is not None
+    assert command.rudder == -1

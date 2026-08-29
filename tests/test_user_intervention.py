@@ -177,3 +177,38 @@ def test_short_user_input_resumes_automatically_after_five_seconds():
     assert monitor.poll(controller, now=10)
     assert not monitor.poll(controller, now=15.1)
     assert not monitor.latched
+
+
+def test_switching_away_from_game_pauses_before_focus_can_be_stolen_back():
+    current_tick = [100]
+    foreground = [7]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        latch_seconds=20,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: False,
+        foreground_reader=lambda: foreground[0],
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    assert not monitor.poll(controller, now=10)
+    foreground[0] = 99
+    assert monitor.poll(controller, now=10.1)
+    assert monitor.pause_until == 15.1
+    assert monitor.poll(controller, now=15.0)
+    assert not monitor.poll(controller, now=15.2)
+
+
+def test_initial_non_game_foreground_does_not_block_startup_focus():
+    monitor = UserInterventionMonitor(
+        7,
+        input_tick_reader=lambda: 100,
+        keyboard_activity_reader=lambda: False,
+        foreground_reader=lambda: 99,
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    assert not monitor.poll(controller, now=10)

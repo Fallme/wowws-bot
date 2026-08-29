@@ -144,6 +144,16 @@ class SecondaryMovementController:
         # the minimap. Viewport labels can belong to aircraft or allies.
         return state.minimap_target_bearing
 
+    @classmethod
+    def _forward_enemy_bearing(
+        cls, state: SecondaryMovementInput
+    ) -> float | None:
+        """Return only a red contact that can be pursued without a U-turn."""
+        bearing = cls._enemy_bearing(state)
+        if bearing is None or abs(bearing) > 0.50:
+            return None
+        return bearing
+
     @staticmethod
     def _objective_bearing(state: SecondaryMovementInput) -> float | None:
         if state.capture_point_bearing is not None:
@@ -163,21 +173,24 @@ class SecondaryMovementController:
         self,
         state: SecondaryMovementInput,
         *,
-        enemy_outside_secondary: bool,
+        pursue_enemy: bool,
         inside_capture: bool,
     ) -> float:
         objective = self._objective_bearing(state)
-        enemy = self._enemy_bearing(state) if enemy_outside_secondary else None
+        enemy = self._forward_enemy_bearing(state) if pursue_enemy else None
         if objective is None:
             bearing = enemy or 0.0
         elif enemy is None:
             bearing = objective
         else:
-            enemy_weight = (
-                min(self.enemy_steering_weight, 0.12)
-                if inside_capture
-                else self.enemy_steering_weight
-            )
+            # Once native autopilot has finished, a forward red contact owns
+            # most of the course.  The central objective remains a weak anchor
+            # against map-edge drift, but no rear contact may cause an about-turn.
+            # A forward red contact should own the course once it is safe to
+            # pursue.  The objective remains only as a guardrail against map
+            # edge drift; the old 68% blend left secondary ships circling in
+            # the rear half of the map instead of closing for damage.
+            enemy_weight = 0.90 if inside_capture else 0.84
             bearing = objective * (1.0 - enemy_weight) + enemy * enemy_weight
         if abs(bearing) < 0.05:
             return 0.0
@@ -247,7 +260,7 @@ class SecondaryMovementController:
         if not arrived:
             rudder = self._route_rudder(
                 state,
-                enemy_outside_secondary=False,
+                pursue_enemy=True,
                 inside_capture=False,
             )
             objective = self._objective_text(state)
@@ -268,26 +281,25 @@ class SecondaryMovementController:
         )
         rudder = self._route_rudder(
             state,
-            enemy_outside_secondary=enemy_outside,
+            pursue_enemy=True,
             inside_capture=state.inside_capture_point,
         )
 
         if distance is not None and distance < self.secondary_inner_km:
-            enemy_bearing = self._enemy_bearing(state) or 0.0
             return MovementCommand(
-                MovementMode.REVERSE_RANGE,
-                throttle=-0.45,
-                rudder=self._clamp(-enemy_bearing * 0.65, 0.42),
+                MovementMode.BRAWL,
+                throttle=0.62,
+                rudder=rudder,
                 reason=(
                     f"已到达点位，{distance_source}{distance:.1f}km过近；"
-                    f"倒船将敌舰拉回约{self.secondary_target_km:.0f}km副炮距离"
+                    "保持向前低速通过，不倒船、不追逐身后目标"
                 ),
             )
 
         if enemy_outside:
             return MovementCommand(
                 MovementMode.APPROACH,
-                throttle=0.72 if state.inside_capture_point else 1.0,
+                throttle=1.0,
                 rudder=rudder,
                 reason=(
                     f"已到达点位，{distance_source}{distance:.1f}km超出理想副炮距离；"
@@ -298,7 +310,7 @@ class SecondaryMovementController:
         if distance is not None:
             return MovementCommand(
                 MovementMode.BRAWL,
-                throttle=self.capture_throttle if state.inside_capture_point else 0.62,
+                throttle=0.82 if state.inside_capture_point else 0.88,
                 rudder=rudder,
                 reason=(
                     f"已到达点位，{distance_source}{distance:.1f}km在副炮有效区；"
@@ -306,9 +318,17 @@ class SecondaryMovementController:
                 ),
             )
 
+        if self._forward_enemy_bearing(state) is not None:
+            return MovementCommand(
+                MovementMode.APPROACH,
+                throttle=1.0,
+                rudder=rudder,
+                reason="发现前方红点，敌距未确认，优先向敌舰方向推进接敌",
+            )
+
         return MovementCommand(
             MovementMode.CAPTURE,
-            throttle=self.capture_throttle,
+            throttle=0.72,
             rudder=rudder,
-            reason="已到达中央点，敌距未确认，低速留点等待接敌",
+            reason="已到达中央点，敌距未确认，保持推进搜索前方红点",
         )

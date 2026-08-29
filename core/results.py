@@ -8,7 +8,12 @@ import re
 import cv2
 import numpy as np
 
-from core.ocr import OcrBackend, OcrToken, RapidOcrBackend
+from core.ocr import (
+    OcrBackend,
+    OcrToken,
+    RapidOcrBackend,
+    numeric_ocr_fallback_variants,
+)
 from core.ui import RelativeRegion
 
 
@@ -28,6 +33,30 @@ WIDE_RESULT_REWARD_REGIONS = {
     "credits": RelativeRegion(0.075, 0.375, 0.225, 0.47),
     "ship_xp": RelativeRegion(0.225, 0.375, 0.365, 0.47),
     "free_xp": RelativeRegion(0.355, 0.375, 0.475, 0.47),
+}
+
+# The maximized/borderless client captured by MSS is commonly 2560x1494
+# (roughly 16:9 after the client-frame chrome is removed).  Its result values
+# stay in the same columns as the 16:10 layout but the whole result block is
+# lower.  Treating this frame as either the 16:10 or ultrawide profile crops
+# through the numbers, which is why real runs read ``104`` instead of
+# ``104 115`` and missed the green free-XP value completely.
+BORDERLESS_RESULT_REWARD_REGIONS = {
+    "credits": RelativeRegion(0.17, 0.36, 0.275, 0.44),
+    "ship_xp": RelativeRegion(0.275, 0.36, 0.370, 0.44),
+    # Start a little earlier than the old column boundary.  The star between
+    # ship XP and free XP is wide, while two-digit free XP can otherwise be
+    # clipped at its leading edge.
+    "free_xp": RelativeRegion(0.350, 0.36, 0.450, 0.44),
+}
+
+# When the result page has already closed, the port keeps the last battle's
+# rewards in a right-side card.  This is a separate, compact layout and is a
+# useful fallback when the result transition was faster than one OCR cycle.
+PORT_REWARD_REGIONS = {
+    "credits": RelativeRegion(0.91, 0.525, 0.99, 0.552),
+    "ship_xp": RelativeRegion(0.91, 0.548, 0.99, 0.575),
+    "free_xp": RelativeRegion(0.91, 0.585, 0.99, 0.615),
 }
 
 
@@ -98,6 +127,30 @@ class ResultRewardReader:
             return "defeat"
         return "unknown"
 
+    @staticmethod
+    def _read_port_outcome(image) -> str:
+        """Read the green/red headline on the compact port reward card."""
+        if image is None or image.size == 0:
+            return "unknown"
+        height, width = image.shape[:2]
+        crop = image[
+            int(height * 0.39) : int(height * 0.44),
+            int(width * 0.83) : int(width * 0.94),
+        ]
+        if crop.size == 0:
+            return "unknown"
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        vivid = (hsv[:, :, 1] >= 70) & (hsv[:, :, 2] >= 80)
+        green = vivid & (hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 95)
+        red = vivid & ((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 170))
+        green_ratio = float(np.mean(green))
+        red_ratio = float(np.mean(red))
+        if green_ratio >= 0.025 and green_ratio > red_ratio * 1.5:
+            return "victory"
+        if red_ratio >= 0.018 and red_ratio > green_ratio * 1.5:
+            return "defeat"
+        return "unknown"
+
     def __init__(self, backend: OcrBackend | None = None, *, minimum_confidence=0.65):
         self.backend = backend or RapidOcrBackend()
         self.minimum_confidence = max(0.0, min(float(minimum_confidence), 1.0))
@@ -160,17 +213,13 @@ class ResultRewardReader:
                 kept[duplicate_index] = (token, piece)
         return sorted(kept, key=lambda item: cls._token_x(item[0]))
 
-    def _read_number(
+    def _read_number_once(
         self,
-        image,
-        region: RelativeRegion,
+        crop,
         maximum: int,
         *,
         grouped_thousands: bool = False,
     ):
-        height, width = image.shape[:2]
-        x1, y1, x2, y2 = region.pixels(width, height)
-        crop = image[y1:y2, x1:x2]
         tokens = sorted(self.backend.recognize(crop), key=self._token_x)
         numeric_tokens = [
             (token, re.sub(r"\D", "", token.text))
@@ -220,27 +269,56 @@ class ResultRewardReader:
         )
         return value, confidence, " | ".join(token.text for token in tokens)
 
-    def read(self, image) -> BattleRewards:
+    def _read_number(
+        self,
+        image,
+        region: RelativeRegion,
+        maximum: int,
+        *,
+        grouped_thousands: bool = False,
+        minimum_expected: int = 1,
+    ):
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = region.pixels(width, height)
+        crop = image[y1:y2, x1:x2]
+        first = self._read_number_once(
+            crop,
+            maximum,
+            grouped_thousands=grouped_thousands,
+        )
+        if first[0] >= minimum_expected or not isinstance(
+            self.backend, RapidOcrBackend
+        ):
+            return first
+
+        # Keep the fast and usually most accurate original-colour pass above.
+        # Only a missing/clipped numeric field pays for enhanced retries.
+        candidates = [first]
+        for variant in numeric_ocr_fallback_variants(crop):
+            candidate = self._read_number_once(
+                variant,
+                maximum,
+                grouped_thousands=grouped_thousands,
+            )
+            candidates.append(candidate)
+            if candidate[0] >= minimum_expected and candidate[1] >= 0.80:
+                break
+        valid = [candidate for candidate in candidates if candidate[0] >= minimum_expected]
+        if not valid:
+            return first
+        return max(valid, key=lambda candidate: (candidate[1], len(str(candidate[0]))))
+
+    def _read_regions(self, image, regions) -> BattleRewards:
         values = {}
         confidence = {}
         raw_text = {}
-        height, width = image.shape[:2]
-        # Layout follows aspect ratio, not absolute resolution.  A 2560x1600
-        # client is still 16:10 and uses the normal three-column placement;
-        # treating all high-resolution frames as ultrawide crops credit/XP
-        # groups into neighbouring columns (for example 258 / 088 / 897).
-        expanded_layout = width / max(height, 1) >= 1.82
-        regions = (
-            WIDE_RESULT_REWARD_REGIONS
-            if expanded_layout
-            else RESULT_REWARD_REGIONS
-        )
         for name, region in regions.items():
             value, score, raw = self._read_number(
                 image,
                 region,
                 self.LIMITS[name],
                 grouped_thousands=True,
+                minimum_expected=(self.MINIMUM_CREDITS if name == "credits" else 1),
             )
             values[name] = value
             confidence[name] = round(score, 4)
@@ -257,4 +335,78 @@ class ResultRewardReader:
             confidence=confidence,
             raw_text=raw_text,
             outcome=self.read_outcome(image),
+        )
+
+    @staticmethod
+    def _looks_like_port_reward_card(image) -> bool:
+        """Conservatively gate the extra three OCR calls for the port card."""
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        if width / max(height, 1) < 1.65:
+            return False
+        title = image[
+            int(height * 0.32) : int(height * 0.39),
+            int(width * 0.83) : int(width * 0.93),
+        ]
+        if title.size == 0:
+            return False
+        title_hsv = cv2.cvtColor(title, cv2.COLOR_BGR2HSV)
+        victory_green = (
+            (title_hsv[:, :, 0] >= 35)
+            & (title_hsv[:, :, 0] <= 95)
+            & (title_hsv[:, :, 1] >= 70)
+            & (title_hsv[:, :, 2] >= 80)
+        )
+        defeat_red = (
+            ((title_hsv[:, :, 0] <= 15) | (title_hsv[:, :, 0] >= 165))
+            & (title_hsv[:, :, 1] >= 80)
+            & (title_hsv[:, :, 2] >= 90)
+        )
+        # The ordinary port's ship-stat panel can contain just as much green
+        # as a reward card, but it has no green/red battle outcome heading in
+        # this narrow row.  Requiring the heading prevents normal port frames
+        # from being OCRed and counted as completed battles.
+        if float(np.mean(victory_green | defeat_red)) < 0.01:
+            return False
+        panel = image[
+            int(height * 0.38) : int(height * 0.63),
+            int(width * 0.82) : int(width * 0.995),
+        ]
+        if panel.size == 0 or float(panel.std()) < 15.0:
+            return False
+        hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)
+        vivid_green = (
+            (hsv[:, :, 0] >= 35)
+            & (hsv[:, :, 0] <= 95)
+            & (hsv[:, :, 1] >= 70)
+            & (hsv[:, :, 2] >= 80)
+        )
+        return float(np.mean(vivid_green)) >= 0.012
+
+    def read(self, image) -> BattleRewards:
+        height, width = image.shape[:2]
+        # Layout follows the captured client aspect ratio.  A maximized 16:9
+        # game often arrives as 2560x1494; it needs its own vertical profile.
+        aspect_ratio = width / max(height, 1)
+        if aspect_ratio >= 1.82:
+            regions = WIDE_RESULT_REWARD_REGIONS
+        elif aspect_ratio >= 1.65:
+            regions = BORDERLESS_RESULT_REWARD_REGIONS
+        else:
+            regions = RESULT_REWARD_REGIONS
+        rewards = self._read_regions(image, regions)
+        if rewards.recognized or not self._looks_like_port_reward_card(image):
+            return rewards
+
+        port_rewards = self._read_regions(image, PORT_REWARD_REGIONS)
+        if not port_rewards.recognized:
+            return rewards
+        return BattleRewards(
+            **port_rewards.resource_values(),
+            recognized=True,
+            provider=port_rewards.provider,
+            confidence=port_rewards.confidence,
+            raw_text=port_rewards.raw_text,
+            outcome=self._read_port_outcome(image),
         )

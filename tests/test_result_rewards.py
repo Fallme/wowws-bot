@@ -226,3 +226,34 @@ def test_overlapping_partial_ocr_hypothesis_does_not_prefix_value():
     assert rewards.credits == 198_363
     assert rewards.ship_xp == 1_143
     assert rewards.free_xp == 198
+
+
+def test_numeric_reward_ocr_retries_enhanced_crop_after_missing_original():
+    from core.ocr import RapidOcrBackend
+
+    class RetryBackend(RapidOcrBackend):
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [
+                OcrToken("198", 0.93, ((5, 2),)),
+                OcrToken("363", 0.91, ((60, 2),)),
+            ]
+
+    reader = ResultRewardReader(RetryBackend())
+    image = np.full((870, 1827, 3), 80, dtype=np.uint8)
+    value, confidence, _raw = reader._read_number(
+        image,
+        RESULT_REWARD_REGIONS["credits"],
+        reader.LIMITS["credits"],
+        grouped_thousands=True,
+        minimum_expected=reader.MINIMUM_CREDITS,
+    )
+
+    assert value == 198_363
+    assert confidence >= 0.90
+    assert reader.backend.calls == 2

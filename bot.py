@@ -2,7 +2,6 @@
 
 import logging
 import math
-import os
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -31,11 +30,8 @@ from strategy.route_planner import CoarseRoutePlanner
 from strategy.stuck_recovery import StuckRecoveryController
 
 logger = logging.getLogger("bot")
-DEFAULT_DEBUG_ROOT = Path(
-    os.environ.get(
-        "WOWS_DEBUG_DIR",
-        str(Path(__file__).resolve().parent / "runtime" / "debug"),
-    )
+DEFAULT_DEBUG_ROOT = (
+    Path(__file__).resolve().parent / "runtime" / "screenshots" / "runs"
 )
 
 
@@ -49,6 +45,7 @@ class BattleAnalysis:
     nearby_enemy_ship_types: set[str] = field(default_factory=set)
     reload_ready: bool = False
     health: float = 1.0
+    health_recognized: bool = False
     ended: bool = False
     in_battle: bool = False
     enemy_source: str = "none"
@@ -112,6 +109,36 @@ def torpedo_evasion_threat(
     )
 
 
+def select_forward_navigation_enemy(
+    vision,
+    pose,
+    enemies,
+    *,
+    max_abs_bearing: float = 0.55,
+):
+    """Choose a red minimap contact that does not require an about-turn.
+
+    A strictly-nearest selector is unstable after ships pass one another: a
+    contact just behind the stern hides every useful contact ahead and makes
+    the controller fall back to circling the objective. Keep navigation
+    forward-only and mildly prefer contacts close to the current heading.
+    """
+    candidates = []
+    for enemy in enemies or ():
+        bearing = float(vision.relative_bearing(pose, enemy))
+        if abs(bearing) > max_abs_bearing:
+            continue
+        distance = math.dist(pose.position, enemy)
+        score = distance * (1.0 + 0.35 * abs(bearing))
+        candidates.append((score, distance, abs(bearing), enemy, bearing))
+    if not candidates:
+        return None
+    _, distance, _, enemy, bearing = min(
+        candidates, key=lambda value: value[:3]
+    )
+    return enemy, distance, bearing
+
+
 class BattleBot:
     """Coordinate local visual analysis and deterministic battle rules."""
 
@@ -130,6 +157,7 @@ class BattleBot:
         self.vision = vision or Vision()
         # Keep the attribute name for compatibility with existing strategy and
         # tests; the default implementation is now native keyboard SendInput.
+        self._owns_gamepad = gamepad is None
         self.gamepad = gamepad or create_input_controller(hwnd=hwnd)
         self._distance_ocr_async = distance_reader is None
         self.distance_reader = distance_reader or TargetDistanceReader(
@@ -208,6 +236,12 @@ class BattleBot:
         self.stuck_recovery = StuckRecoveryController(
             preferred_side=int(self.strategy.get("preferred_side", 1)),
             stationary_seconds=float(self.strategy.get("stuck_seconds", 24)),
+            reverse_seconds=min(
+                4.8, float(self.strategy.get("stuck_reverse_seconds", 4.5))
+            ),
+            forward_seconds=min(
+                4.8, float(self.strategy.get("stuck_forward_seconds", 4.5))
+            ),
         )
         self.feedback = MovementFeedbackMonitor(
             timeout_seconds=float(self.strategy.get("feedback_timeout_seconds", 18)),
@@ -253,11 +287,12 @@ class BattleBot:
         self.tick = 0
         self.battle_start_time = 0.0
         self._cached_health = 1.0
+        self._health_ocr_valid = False
         self._cached_speed_knots: float | None = None
         self._cached_reload = False
-        self._health_samples = deque(maxlen=5)
         self._torpedo_samples = deque(maxlen=3)
         self._fire_samples = deque(maxlen=2)
+        self._flood_samples = deque(maxlen=2)
         self._autopilot_hud_samples = deque(maxlen=3)
         self._island_samples = deque(maxlen=5)
         self._island_avoidance_until = 0.0
@@ -268,6 +303,8 @@ class BattleBot:
         # static layer; only ship/contact markers are allowed to update later.
         self._battle_map_islands: list[dict[str, Any]] = []
         self._battle_capture_zones = []
+        self._island_layer_candidates = deque(maxlen=5)
+        self._zone_layer_candidates = deque(maxlen=5)
         self._unknown_since = None
         self._ended_state_streak = 0
         self._post_battle_grace_seconds = float(
@@ -279,9 +316,10 @@ class BattleBot:
                 self.strategy.get("manual_intervention_pause_seconds", 5.0)
             ),
             latch_seconds=float(
-                self.strategy.get("manual_intervention_latch_seconds", 15.0)
+                self.strategy.get("manual_intervention_latch_seconds", 20.0)
             ),
         )
+        self.intervention.reset()
         self.movement_verified = False
         self._last_full_speed_reassert = 0.0
         self._last_applied_rudder = 0.0
@@ -292,6 +330,7 @@ class BattleBot:
         self.opening_autopilot_active = False
         self.opening_autopilot_target = ""
         self.opening_autopilot_target_normalized = None
+        self._tactical_map_left_open = False
         self.generic_center_route_active = False
         self.movement_feedback_failures = 0
         self._last_movement_mode = None
@@ -303,6 +342,32 @@ class BattleBot:
         self.last_analysis: BattleAnalysis | None = None
         self.last_movement_command = None
         self.last_movement_reason = ""
+
+    def rebind_window(self, hwnd) -> bool:
+        """Bind capture, intervention and native input to a replacement HWND.
+
+        World of Warships can recreate its top-level window while changing
+        display mode or recovering from a launcher/login transition.  Keeping
+        the old handle makes both OCR and the keyboard focus guard target a
+        dead window.  Custom/test controllers are intentionally preserved;
+        only the controller owned by this bot is rebuilt.
+        """
+        new_hwnd = int(hwnd or 0)
+        if not new_hwnd:
+            return False
+        old_hwnd = int(self.hwnd or 0)
+        self.hwnd = new_hwnd
+        if self._owns_gamepad and new_hwnd != old_hwnd:
+            self.gamepad = create_input_controller(hwnd=new_hwnd)
+        intervention = getattr(self, "intervention", None)
+        if intervention is not None:
+            intervention.hwnd = new_hwnd
+            intervention.reset()
+        if new_hwnd != old_hwnd:
+            self.feedback.reset()
+            self.movement_verified = False
+            logger.info("游戏窗口已重新绑定: %s -> %s", old_hwnd, new_hwnd)
+        return True
 
     def reset(self, *, preserve_movement=False):
         now = time.monotonic()
@@ -324,11 +389,12 @@ class BattleBot:
         self.tick = 0
         self.battle_start_time = now
         self._cached_health = 1.0
+        self._health_ocr_valid = False
         self._cached_speed_knots = None
         self._cached_reload = False
-        self._health_samples.clear()
         self._torpedo_samples.clear()
         self._fire_samples.clear()
+        self._flood_samples.clear()
         self._autopilot_hud_samples.clear()
         self._island_samples.clear()
         self._island_avoidance_until = 0.0
@@ -346,9 +412,12 @@ class BattleBot:
         if not preserve_movement:
             self._battle_map_islands = []
             self._battle_capture_zones = []
+            self._island_layer_candidates.clear()
+            self._zone_layer_candidates.clear()
             self.opening_autopilot_active = False
             self.opening_autopilot_target = ""
             self.opening_autopilot_target_normalized = None
+            self._tactical_map_left_open = False
             self.generic_center_route_active = False
         self.movement_feedback_failures = 0
         self._last_movement_mode = None
@@ -375,12 +444,91 @@ class BattleBot:
         self.viewport_target_filter.reset()
         self.viewport_target_tracker.reset()
         self.distance_filter.reset()
-        self.intervention.reset()
+        # Do not clear a real keyboard pause at a lifecycle boundary. The
+        # monitor is seeded in __init__ and injected input is filtered by the
+        # controller's timestamp; reset here used to erase intervention that
+        # arrived while a new battle was being recognized.
         if self._distance_ocr_async:
             self.distance_ocr_service.close()
             self.distance_ocr_service = DistanceOcrService(self.distance_reader)
         if not preserve_movement:
             self.gamepad.stop()
+
+    @staticmethod
+    def _island_layer_signature(islands) -> tuple:
+        shapes = []
+        for island in islands or ():
+            points = island.get("points", ()) if isinstance(island, dict) else ()
+            if len(points) < 3:
+                continue
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            shapes.append(
+                (
+                    round(sum(xs) / len(xs) / 0.035),
+                    round(sum(ys) / len(ys) / 0.035),
+                    round((max(xs) - min(xs)) / 0.04),
+                    round((max(ys) - min(ys)) / 0.04),
+                )
+            )
+        return tuple(sorted(shapes))
+
+    @staticmethod
+    def _zone_layer_signature(zones, minimap_shape) -> tuple:
+        height, width = minimap_shape[:2]
+        scale = max(min(height, width), 1)
+        return tuple(
+            sorted(
+                (
+                    str(getattr(zone, "label", "") or "").upper(),
+                    round((zone.center[0] / max(width, 1)) / 0.025),
+                    round((zone.center[1] / max(height, 1)) / 0.025),
+                    round((float(zone.radius) / scale) / 0.02),
+                )
+                for zone in (zones or ())
+            )
+        )
+
+    @staticmethod
+    def _confirmed_static_layer(samples, signature, items, *, required=3):
+        if not items or not signature:
+            samples.clear()
+            return None
+        samples.append((signature, list(items)))
+        if len(samples) < required:
+            return None
+        recent = list(samples)[-required:]
+        if all(sample_signature == signature for sample_signature, _ in recent):
+            return recent[-1][1]
+        return None
+
+    @staticmethod
+    def _refresh_zone_states(fixed_zones, observed_zones):
+        """Keep fixed point geometry while allowing ownership colour to update."""
+        refreshed = []
+        for fixed in fixed_zones:
+            compatible = [
+                candidate
+                for candidate in observed_zones
+                if (
+                    not getattr(fixed, "label", "")
+                    or not getattr(candidate, "label", "")
+                    or str(candidate.label).upper() == str(fixed.label).upper()
+                )
+                and math.dist(candidate.center, fixed.center)
+                <= max(float(fixed.radius) * 0.35, 12.0)
+            ]
+            if compatible:
+                nearest = min(
+                    compatible,
+                    key=lambda candidate: math.dist(candidate.center, fixed.center),
+                )
+                refreshed.append(
+                    replace(fixed, state=getattr(nearest, "state", "unknown"))
+                )
+            else:
+                refreshed.append(fixed)
+        return refreshed
 
     def enable_opening_autopilot(
         self,
@@ -538,6 +686,18 @@ class BattleBot:
             and now - self._rudder_commanded_at < hold_seconds
         ):
             return self._last_applied_rudder
+        # Never switch directly from Q to E (or vice versa), including island
+        # avoidance. Battleships react late; an immediate opposite command
+        # makes successive minimap frames alternate and eventually circle.
+        if (
+            current_direction
+            and desired_direction
+            and desired_direction != current_direction
+        ):
+            self._last_applied_rudder = 0.0
+            self._rudder_commanded_at = 0.0
+            self._rudder_release_until = now + 0.65
+            return 0.0
         if changing_direction:
             self._rudder_commanded_at = now
         self._last_applied_rudder = desired
@@ -557,7 +717,17 @@ class BattleBot:
         height, width = image.shape[:2]
         analysis = BattleAnalysis(image=image, width=width, height=height)
         state = self.vision.classify_screen(image)
-        raw_ended = state in {ScreenState.RESULTS, ScreenState.PORT}
+        # While a battle controller is active, the broad port detector is not
+        # authoritative. A live HUD can resemble the port carousel when the
+        # minimap/consumables are dense. Require a positive result surface to
+        # end the battle so a false PORT frame can never launch ship selection.
+        battle_hud_detector = getattr(self.vision, "_has_battle_hud", None)
+        battle_hud_visible = bool(
+            callable(battle_hud_detector) and battle_hud_detector(image)
+        )
+        if state == ScreenState.PORT and battle_hud_visible:
+            state = ScreenState.BATTLE
+        raw_ended = state == ScreenState.RESULTS
         if raw_ended:
             self._ended_state_streak += 1
         else:
@@ -599,10 +769,15 @@ class BattleBot:
                 )
                 if island_outline_finder is not None and not self._battle_map_islands:
                     detected_islands = island_outline_finder(minimap)
-                    if detected_islands:
-                        self._battle_map_islands = list(detected_islands)
+                    confirmed_islands = self._confirmed_static_layer(
+                        self._island_layer_candidates,
+                        self._island_layer_signature(detected_islands),
+                        detected_islands,
+                    )
+                    if confirmed_islands:
+                        self._battle_map_islands = list(confirmed_islands)
                         logger.info(
-                            "已锁定本局小地图山体图层: %s 个轮廓",
+                            "连续三帧一致，已锁定本局小地图山体图层: %s 个轮廓",
                             len(self._battle_map_islands),
                         )
                 analysis.minimap_islands = list(self._battle_map_islands)
@@ -653,17 +828,34 @@ class BattleBot:
                     # white or hostile red point wins over a friendly green
                     # point, then the nearest eligible point is selected.
                     zone_finder = getattr(self.vision, "find_capture_zones", None)
-                    if self._battle_capture_zones:
-                        minimap_zones = list(self._battle_capture_zones)
-                    elif zone_finder is not None:
+                    if zone_finder is not None:
                         detected_zones = zone_finder(minimap, player=player)
-                        if detected_zones:
-                            self._battle_capture_zones = list(detected_zones)
+                    else:
+                        detected_zones = []
+                    if self._battle_capture_zones:
+                        self._battle_capture_zones = self._refresh_zone_states(
+                            self._battle_capture_zones,
+                            detected_zones,
+                        )
+                        minimap_zones = list(self._battle_capture_zones)
+                    elif detected_zones:
+                        confirmed_zones = self._confirmed_static_layer(
+                            self._zone_layer_candidates,
+                            self._zone_layer_signature(
+                                detected_zones, minimap.shape
+                            ),
+                            detected_zones,
+                        )
+                        if confirmed_zones:
+                            self._battle_capture_zones = list(confirmed_zones)
                             logger.info(
-                                "已锁定本局占领点图层: %s 个点位",
+                                "连续三帧一致，已锁定本局占领点图层: %s 个点位",
                                 len(self._battle_capture_zones),
                             )
                         minimap_zones = list(self._battle_capture_zones)
+                    else:
+                        self._zone_layer_candidates.clear()
+                        minimap_zones = []
                     analysis.capture_zones = [
                         {
                             "label": zone.label,
@@ -763,6 +955,43 @@ class BattleBot:
                             self.opening_autopilot_target_normalized
                         )
                         analysis.navigation_source = "native_autopilot"
+                    if (
+                        not self.opening_autopilot_active
+                        and analysis.navigation_target_normalized is not None
+                        and self._battle_map_islands
+                    ):
+                        final_target = (
+                            analysis.navigation_target_normalized[0]
+                            * minimap.shape[1],
+                            analysis.navigation_target_normalized[1]
+                            * minimap.shape[0],
+                        )
+                        waypoint_planner = getattr(
+                            self.vision, "plan_island_aware_waypoint", None
+                        )
+                        if waypoint_planner is not None:
+                            safe_target = waypoint_planner(
+                                minimap.shape,
+                                player,
+                                final_target,
+                                self._battle_map_islands,
+                            )
+                            if safe_target is not None:
+                                analysis.capture_point_bearing = (
+                                    self.vision.relative_bearing(
+                                        navigation_pose, safe_target
+                                    )
+                                )
+                                if math.dist(safe_target, final_target) > 2.0:
+                                    analysis.navigation_target_normalized = (
+                                        safe_target[0]
+                                        / max(minimap.shape[1], 1),
+                                        safe_target[1]
+                                        / max(minimap.shape[0], 1),
+                                    )
+                                    analysis.navigation_source = (
+                                        "minimap_island_waypoint"
+                                    )
                 island_risk = None
                 if pose is not None and course_heading is not None:
                     try:
@@ -782,33 +1011,31 @@ class BattleBot:
                         island_risk.avoidance_rudder,
                     )
                 if pose is not None and minimap_enemies:
-                    nearest_map_enemy = min(
+                    navigation_enemy = select_forward_navigation_enemy(
+                        self.vision,
+                        navigation_pose,
                         minimap_enemies,
-                        key=lambda enemy: (enemy[0] - player[0]) ** 2
-                        + (enemy[1] - player[1]) ** 2,
                     )
-                    diagonal = math.hypot(minimap.shape[1], minimap.shape[0])
-                    minimap_pixels = math.hypot(
-                        nearest_map_enemy[0] - player[0],
-                        nearest_map_enemy[1] - player[1],
-                    )
-                    analysis.minimap_distance = minimap_pixels / max(
-                        diagonal, 1
-                    )
-                    analysis.minimap_distance_km = (
-                        self.vision.minimap_pixels_to_km(
-                            minimap, minimap_pixels
+                    if navigation_enemy is not None:
+                        selected_enemy, minimap_pixels, enemy_bearing = (
+                            navigation_enemy
                         )
-                    )
-                    analysis.minimap_target_bearing = (
-                        self.vision.relative_bearing(
-                            navigation_pose, nearest_map_enemy
+                        diagonal = math.hypot(
+                            minimap.shape[1], minimap.shape[0]
                         )
-                    )
-                    analysis.nearest_enemy_normalized = (
-                        nearest_map_enemy[0] / max(minimap.shape[1], 1),
-                        nearest_map_enemy[1] / max(minimap.shape[0], 1),
-                    )
+                        analysis.minimap_distance = minimap_pixels / max(
+                            diagonal, 1
+                        )
+                        analysis.minimap_distance_km = (
+                            self.vision.minimap_pixels_to_km(
+                                minimap, minimap_pixels
+                            )
+                        )
+                        analysis.minimap_target_bearing = enemy_bearing
+                        analysis.nearest_enemy_normalized = (
+                            selected_enemy[0] / max(minimap.shape[1], 1),
+                            selected_enemy[1] / max(minimap.shape[0], 1),
+                        )
                 analysis.minimap_contacts = [
                     {
                         "position": [
@@ -917,35 +1144,48 @@ class BattleBot:
                 self.viewport_target_tracker.update([], preferred_x=width / 2)
                 self.distance_filter.update(observed_at, None, None)
 
-        health = self.vision.health_pct(
-            self.vision.find_health_bar(image)
-        )
+        health = None
+        health_reader = getattr(self.vision, "read_health_fraction", None)
+        if health_reader is not None and self.tick % 3 == 0:
+            try:
+                health = health_reader(
+                    image,
+                    getattr(self.distance_reader, "backend", None),
+                )
+            except Exception:
+                logger.debug("生命值 OCR 本帧不可用", exc_info=True)
+        # Health is calculated exclusively from the numeric ``current/max``
+        # readout.  Never estimate it from the padded colour bar: on this HUD a
+        # visually full bar occupies only about 88.8% of the old crop.
         if health is not None:
-            # Sample every control tick so repair and low-health decisions do
-            # not inherit the old multi-second delay.
             health = max(0.0, min(float(health), 1.0))
-            self._health_samples.append(health)
-            if len(self._health_samples) >= 3:
-                ordered = sorted(self._health_samples)
-                spread = ordered[-1] - ordered[0]
-                if spread <= 0.18:
-                    median_health = ordered[len(ordered) // 2]
-                    if median_health <= self._cached_health + 0.05:
-                        self._cached_health = median_health
+            self._cached_health = health
+            self._health_ocr_valid = True
         self._fire_samples.append(bool(self.vision.is_on_fire(image)))
         analysis.on_fire = (
             len(self._fire_samples) == self._fire_samples.maxlen
             and all(self._fire_samples)
         )
+        flooding_detector = getattr(self.vision, "is_flooding", None)
+        self._flood_samples.append(
+            bool(flooding_detector is not None and flooding_detector(image))
+        )
+        analysis.flooding = (
+            len(self._flood_samples) == self._flood_samples.maxlen
+            and all(self._flood_samples)
+        )
+        if self._health_ocr_valid and self._cached_health <= 0.0:
+            # Sunk ships can retain orange wreck/HP decoration in the status
+            # ROIs. Death is authoritative and suppresses hazard reporting as
+            # well as every input command.
+            analysis.on_fire = False
+            analysis.flooding = False
         if self.tick % 3 == 0:
             self._cached_reload = self.vision.reload_ready(
                 self.vision.find_reload_bar(image)
             )
         analysis.health = self._cached_health
-        flooding_detector = getattr(self.vision, "is_flooding", None)
-        analysis.flooding = bool(
-            flooding_detector is not None and flooding_detector(image)
-        )
+        analysis.health_recognized = self._health_ocr_valid
         speed_reader = getattr(self.vision, "read_speed_knots", None)
         if speed_reader is not None and self.tick % 3 == 0:
             try:
@@ -1167,6 +1407,14 @@ class BattleBot:
     def combat_tick(self):
         analysis = self.analyze()
         self.last_analysis = analysis
+        if analysis.health_recognized and analysis.health <= 0.0:
+            # The ship is already destroyed. Do not release, reassert or alter
+            # any control: simply observe until a genuine result page appears.
+            self.last_movement_command = None
+            self.last_movement_reason = "舰船生命值为0，停止下发指令并等待结算画面"
+            self._last_movement_mode = "awaiting_results"
+            self._finish_tick(analysis)
+            return "waiting"
         if analysis.ended:
             # Screen classification is intentionally tentative here.  Keep
             # the existing telegraph/rudder until the lifecycle confirms the
@@ -1312,7 +1560,6 @@ class BattleBot:
                 return
             self.movement_verified = feedback.verified
             return
-            return
 
         enemy_count = analysis.minimap_enemy_count
         command = self.movement.plan(
@@ -1360,8 +1607,15 @@ class BattleBot:
                 now,
                 analysis.player_position,
                 command.throttle,
+                escape_rudder=analysis.island_avoidance_rudder,
             )
         if recovery is not None:
+            # A keyboard event can arrive after the frame-level pause check but
+            # before movement planning finishes.  Re-check at the exact input
+            # boundary so even the recovery branch cannot leak one command.
+            if self.intervention.poll(self.gamepad, time.monotonic()):
+                self.mark_manual_pause()
+                return
             self.gamepad.set_movement(recovery.throttle, recovery.rudder)
             self._movement_feedback_update(
                 now, analysis.player_position, recovery.throttle
@@ -1379,6 +1633,9 @@ class BattleBot:
                 self._last_movement_mode = recovery_mode
             return
 
+        if self.intervention.poll(self.gamepad, time.monotonic()):
+            self.mark_manual_pause()
+            return
         self.gamepad.set_movement(command.throttle, command.rudder)
         if (
             command.throttle >= 0.95
@@ -1419,7 +1676,6 @@ class BattleBot:
         )
         if (
             (analysis.on_fire or analysis.flooding)
-            and analysis.health < 0.99
             and now - self.last_damage_control >= damage_control_cooldown
             and hasattr(self.gamepad, "damage_control")
         ):
@@ -1437,6 +1693,7 @@ class BattleBot:
         heal_max_uses = int(self.strategy.get("heal_max_uses", 3))
         if (
             0 < analysis.health <= heal_threshold
+            and analysis.health_recognized
             and self.heal_used < heal_max_uses
             and now - self.last_heal >= heal_cooldown
             and hasattr(self.gamepad, "heal")
@@ -1456,6 +1713,7 @@ class BattleBot:
             self.ship.get("has_smoke")
             and self.strategy.get("auto_smoke", False)
             and not self.smoke_used
+            and analysis.health_recognized
             and 0 < analysis.health < smoke_threshold
         ):
             self.gamepad.smoke()
@@ -1489,6 +1747,9 @@ class BattleBot:
             tick=self.tick,
             in_battle=analysis.in_battle,
             health=analysis.health,
+            health_recognized=analysis.health_recognized,
+            on_fire=analysis.on_fire,
+            flooding=analysis.flooding,
             enemies=max(len(analysis.enemies), analysis.minimap_enemy_count),
             target_track_id=analysis.target_track_id,
             # Keep the public/control distance aligned with movement logic.
@@ -1522,9 +1783,11 @@ class BattleBot:
         )
         if self.tick % 4 == 0:
             logger.info(
-                "[%03d] HP:%.0f%% 装填:%s 敌人:%s 距离:%s 鱼雷:%s 反馈:%s",
+                "[%03d] HP:%s 装填:%s 敌人:%s 距离:%s 鱼雷:%s 反馈:%s",
                 self.tick,
-                analysis.health * 100,
+                f"{analysis.health * 100:.0f}%"
+                if analysis.health_recognized
+                else "识别中",
                 "完成" if analysis.reload_ready else "等待",
                 max(len(analysis.enemies), analysis.minimap_enemy_count),
                 "未知"

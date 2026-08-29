@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 try:
     import cv2
 except ImportError:  # The production environment installs requirements.txt.
@@ -29,6 +31,13 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.LOADING,
         )
 
+    def test_login_startup_artwork_is_loading_never_battle_or_modal(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "login_startup.png"))
+        self.assertIsNotNone(image)
+        self.assertTrue(self.vision._is_login_splash(image))
+        self.assertFalse(self.vision._has_battle_hud(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.LOADING)
+
     def test_reference_port_and_battle_frames_remain_distinct(self):
         self.assertEqual(
             self.classify(self.FIXTURE_ROOT / "port_ship_selected.png"),
@@ -56,6 +65,13 @@ class ScreenStateRegressionTests(unittest.TestCase):
         self.assertTrue(self.vision.in_port(image))
         self.assertEqual(self.vision.classify_screen(image), ScreenState.PORT)
 
+    def test_port_with_ship_tooltip_still_requires_and_passes_port_anchors(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_with_ship_tooltip.png"))
+        self.assertIsNotNone(image)
+        votes = self.vision._port_anchor_votes(image)
+        self.assertGreaterEqual(sum(bool(value) for value in votes.values()), 3)
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.PORT)
+
     def test_escape_menu_overrides_broad_loading_signal(self):
         self.assertEqual(
             self.classify(self.FIXTURE_ROOT / "escape_menu.png"),
@@ -68,11 +84,59 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.BATTLE,
         )
 
+    def test_bright_live_battle_from_walkthrough_is_battle(self):
+        self.assertEqual(
+            self.classify(
+                self.FIXTURE_ROOT
+                / "live_run_20260829"
+                / "08_battle_start.png"
+            ),
+            ScreenState.BATTLE,
+        )
+
+    def test_battle_remains_actionable_when_player_hud_is_temporarily_obscured(self):
+        image = cv2.imread(
+            str(
+                self.FIXTURE_ROOT
+                / "live_run_20260829"
+                / "08_battle_start.png"
+            )
+        )
+        self.assertIsNotNone(image)
+        height, width = image.shape[:2]
+        image[int(height * 0.70) :, : int(width * 0.25)] = 0
+
+        self.assertTrue(self.vision._has_battle_hud(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.BATTLE)
+
+    def test_unlabelled_matchmaking_artwork_is_loading(self):
+        self.assertEqual(
+            self.classify(
+                self.FIXTURE_ROOT / "live_run_20260829" / "07_loading.png"
+            ),
+            ScreenState.LOADING,
+        )
+
     def test_live_result_screen_is_not_exit_confirmation(self):
         self.assertEqual(
             self.classify(self.FIXTURE_ROOT / "results.png"),
             ScreenState.RESULTS,
         )
+
+    def test_scattered_ocean_blue_is_not_an_exit_confirmation_button(self):
+        image = np.full((1000, 1600, 3), 120, dtype=np.uint8)
+        # Several disconnected cyan patches can exceed the old colour ratio,
+        # but they are not one rectangular modal action.
+        for x in range(860, 980, 24):
+            cv2.circle(image, (x, 485), 9, (200, 120, 40), -1)
+        self.assertFalse(self.vision.in_exit_confirmation(image))
+
+    def test_mode_card_colour_is_not_an_escape_resume_button(self):
+        image = np.full((1000, 1600, 3), 78, dtype=np.uint8)
+        # A small green/olive emblem in the same ROI must not stand in for the
+        # large solid resume bar used by the actual escape menu.
+        cv2.circle(image, (800, 490), 24, (70, 105, 70), -1)
+        self.assertFalse(self.vision.in_escape_menu(image))
 
     def test_port_reward_overlay_can_never_enter_battle_state(self):
         image = cv2.imread(str(self.FIXTURE_ROOT / "port_reward_overlay.png"))
@@ -85,6 +149,26 @@ class ScreenStateRegressionTests(unittest.TestCase):
             battle = cv2.imread(str(self.FIXTURE_ROOT / filename))
             self.assertFalse(self.vision._is_port_reward_overlay(battle), filename)
             self.assertEqual(self.vision.classify_screen(battle), ScreenState.BATTLE)
+
+    def test_port_reward_card_is_port_not_live_battle(self):
+        from core.results import ResultRewardReader
+
+        normal_port = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+        self.assertFalse(ResultRewardReader._looks_like_port_reward_card(normal_port))
+        candidates = sorted(
+            Path("runtime/screenshots/runs").rglob(
+                "result_unrecognized_*.png"
+            )
+        )
+        port_cards = [
+            image
+            for image in (cv2.imread(str(path)) for path in candidates)
+            if image is not None
+            and ResultRewardReader._looks_like_port_reward_card(image)
+        ]
+        self.assertGreaterEqual(len(port_cards), 1)
+        for image in port_cards:
+            self.assertEqual(self.vision.classify_screen(image), ScreenState.PORT)
 
 if __name__ == "__main__":
     unittest.main()

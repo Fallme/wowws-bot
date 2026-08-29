@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#081116" />
     <meta name="description" content="战舰世界本地自动作战控制台" />
     <title>战舰自动化控制台</title>
-    <link rel="stylesheet" href="/styles.css" />
-    <link rel="stylesheet" href="/custom_ship.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260829_1" />
+    <link rel="stylesheet" href="/custom_ship.css?v=20260829_1" />
   </head>
   <body>
     <main class="app-shell">
@@ -29,13 +29,20 @@
           <div class="control-group"><label>战斗模式</label><div class="choice-grid" id="modeGrid"></div></div>
           <div class="control-group">
             <div class="label-row"><label>选择舰船</label><span id="shipCount">0 艘</span></div>
-            <div class="ship-list" id="shipList"></div>
-            <div class="custom-ship-fields" id="customShipFields" hidden>
+            <div class="ship-selector-tabs" role="tablist" aria-label="舰船选择方式">
+              <button class="ship-selector-tab active" id="presetShipTab" data-ship-tab="presets" role="tab" aria-controls="shipPresetPanel" aria-selected="true">预设舰船</button>
+              <button class="ship-selector-tab" id="customShipTab" data-ship-tab="custom" role="tab" aria-controls="customShipFields" aria-selected="false">自定义舰船</button>
+            </div>
+            <div class="ship-tab-panel" id="shipPresetPanel" role="tabpanel" aria-labelledby="presetShipTab">
+              <div class="ship-list ship-preset-scroll" id="shipList"></div>
+            </div>
+            <div class="custom-ship-fields ship-tab-panel" id="customShipFields" role="tabpanel" aria-labelledby="customShipTab" hidden>
               <label for="customShipName">完整舰船名称</label>
               <input id="customShipName" type="text" maxlength="64" autocomplete="off" placeholder="例如：大选帝侯" />
               <label for="customSecondaryRange">副炮射程</label>
               <div class="range-input"><input id="customSecondaryRange" type="number" min="1" max="30" step="0.1" value="10.0" /><span>km</span></div>
-              <p>名称须与港口显示完全一致；输入会自动保存在本机。</p>
+              <button class="save-preset-button" id="saveCustomPresetBtn" type="button">保存到预设</button>
+              <p>名称须与港口显示完全一致；保存后可在“预设舰船”中直接选择。</p>
             </div>
           </div>
           <div class="control-group stop-plan">
@@ -57,15 +64,15 @@
           <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
           <div class="human-alert" id="interventionCard" hidden><strong>需要人工检查</strong><p id="interventionMessage"></p><button id="retryBtn">问题处理后重试</button></div>
           <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong>手动操作保持中</strong><p>已保持原有油门与舵，系统不会继续下发新指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
-          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动作战</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>安全停止</button></div>
+          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动作战</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止作战</button></div>
           <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
         </article>
 
         <article class="deck-card live-card">
           <div class="section-title"><span>02</span><div><small>LIVE OPERATION</small><h2>当前状态</h2></div><em id="liveBadge">OFFLINE</em></div>
+          <div class="operation-copy operation-banner"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
           <div class="live-workspace">
             <div class="map-column">
-              <div class="operation-copy"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
               <div class="route-visual" id="routeVisual">
                 <div class="route-ring ring-one"></div><div class="route-ring ring-two"></div>
                 <div class="radar-island-layer" id="mapIslands"></div>
@@ -86,7 +93,7 @@
             <div class="telemetry-panel">
               <div class="telemetry-grid">
                 <div><small>航线阶段</small><strong id="routePhase">未规划</strong></div><div><small>航线进度</small><strong id="routeProgress">0%</strong></div>
-                <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>最近敌舰</small><strong id="targetDistance">—</strong></div>
+                <div><small>距点位</small><strong id="captureDistance">—</strong></div><div><small>前方接敌目标</small><strong id="targetDistance">—</strong></div>
                 <div><small>舰船 / 模式</small><strong id="activeSetup">—</strong></div><div><small>视觉 / 计算</small><strong id="visionStatus">—</strong></div>
                 <div><small>位移反馈</small><strong id="feedbackStatus">—</strong></div><div><small>本轮状态</small><strong id="roundState">未开始</strong></div>
                 <div><small>自动航行</small><strong id="autopilotStatus">未开启</strong></div><div><small>当前舵位</small><strong id="rudderStatus">中舵</strong></div>
@@ -96,7 +103,7 @@
               </div>
             </div>
           </div>
-          <div class="log-pane" aria-label="实时日志"><div class="log-pane-heading"><span>实时日志</span><small>自动刷新</small></div><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></div>
+          <div class="log-pane" aria-label="实时日志"><div class="log-pane-heading"><span>实时日志</span><div><small id="screenshotUsage">截图统计中</small><button id="clearScreenshotsBtn" type="button">清理截图</button></div></div><pre id="logOutput">[SYSTEM] 控制台已就绪</pre></div>
           <div class="run-id-line">运行编号 <span id="runId">—</span></div>
         </article>
 
@@ -113,6 +120,6 @@
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/app.js" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260829_2" defer></script>
   </body>
 </html>

@@ -7,7 +7,9 @@ import cv2
 from core.window import find_game_window
 from dxgi_capture import ScreenCapture
 
-SNAPSHOT_DIR = Path(__file__).resolve().parent / "runtime" / "manual"
+SNAPSHOT_DIR = (
+    Path(__file__).resolve().parent / "runtime" / "screenshots" / "manual"
+)
 
 
 def main():

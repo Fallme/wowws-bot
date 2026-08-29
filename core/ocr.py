@@ -63,6 +63,43 @@ class OcrBackend(Protocol):
     def recognize(self, image: np.ndarray) -> list[OcrToken]: ...
 
 
+def numeric_ocr_fallback_variants(image: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Build conservative high-resolution variants for small HUD numbers.
+
+    The game renders HP, speed and result values with glow/outline effects.
+    RapidOCR normally reads the original colour crop best, so callers always
+    try that first.  These variants are only used after parsing the original
+    crop failed; they enlarge the glyphs and suppress the background without
+    changing the production OCR model or its CUDA-first execution policy.
+    """
+    if image is None or image.size == 0:
+        return ()
+    height, width = image.shape[:2]
+    scale = 2.4 if min(height, width) < 180 else 1.8
+    enlarged = cv2.resize(
+        image,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+    adaptive = cv2.adaptiveThreshold(
+        clahe,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        7,
+    )
+    return (
+        enlarged,
+        cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR),
+    )
+
+
 class RapidOcrBackend:
     """Lazy offline RapidOCR backend with CUDA-first, CPU fallback execution."""
 

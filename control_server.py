@@ -32,6 +32,9 @@ PAUSE_PATH = DATA_DIR / "pause.request"
 RESUME_PATH = DATA_DIR / "resume.request"
 LOG_PATH = DATA_DIR / "runtime.log"
 CUSTOM_SHIP_PATH = DATA_DIR / "custom_ship.json"
+CUSTOM_SHIP_PRESETS_PATH = DATA_DIR / "custom_ship_presets.json"
+SCREENSHOT_ROOT = BASE_DIR / "runtime" / "screenshots"
+SCREENSHOT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 CUSTOM_SHIP_LOCK = threading.Lock()
 MODES = {
     "cooperative": "联合作战",
@@ -96,6 +99,140 @@ def save_custom_ship(name, secondary_range):
             encoding="utf-8",
         )
         temporary.replace(CUSTOM_SHIP_PATH)
+
+
+def load_custom_ship_presets():
+    """Load reusable custom-ship choices without trusting persisted JSON."""
+    try:
+        payload = json.loads(CUSTOM_SHIP_PRESETS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    presets = []
+    seen_ids = set()
+    for item in payload[:50]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            name, secondary_range = validate_custom_ship(
+                {
+                    "custom_ship_name": item.get("name", ""),
+                    "custom_secondary_range": item.get("secondary_range", 0),
+                }
+            )
+        except ValueError:
+            continue
+        preset_id = str(item.get("id", "")).strip()
+        if (
+            not preset_id
+            or len(preset_id) > 40
+            or not all(character.isalnum() or character in "-_" for character in preset_id)
+            or preset_id in seen_ids
+        ):
+            continue
+        seen_ids.add(preset_id)
+        presets.append(
+            {
+                "id": preset_id,
+                "name": name,
+                "secondary_range": secondary_range,
+            }
+        )
+    return presets
+
+
+def resolve_custom_ship_for_run(payload):
+    """Resolve the immutable custom ship selected for a new worker process.
+
+    A preset id is authoritative over editable form fields and the last custom
+    ship file.  This prevents stale data such as ``石见`` from replacing the
+    preset the player actually clicked, such as ``冯·祖克霍夫``.
+    """
+    requested_preset_id = str(payload.get("custom_ship_preset_id", "")).strip()
+    if not requested_preset_id:
+        return validate_custom_ship(payload)
+    preset = next(
+        (
+            item
+            for item in load_custom_ship_presets()
+            if item["id"] == requested_preset_id
+        ),
+        None,
+    )
+    if preset is None:
+        raise ValueError("所选舰船预设不存在，请重新选择")
+    return preset["name"], float(preset["secondary_range"])
+
+
+def save_custom_ship_preset(name, secondary_range, preset_id=""):
+    """Create or update a reusable custom ship and return the full list."""
+    name, secondary_range = validate_custom_ship(
+        {
+            "custom_ship_name": name,
+            "custom_secondary_range": secondary_range,
+        }
+    )
+    requested_id = str(preset_id or "").strip()
+    if requested_id and (
+        len(requested_id) > 40
+        or not all(character.isalnum() or character in "-_" for character in requested_id)
+    ):
+        raise ValueError("舰船预设编号无效")
+    with CUSTOM_SHIP_LOCK:
+        presets = load_custom_ship_presets()
+        normalized_name = name.casefold()
+        existing = next(
+            (
+                item
+                for item in presets
+                if item["id"] == requested_id
+                or item["name"].casefold() == normalized_name
+            ),
+            None,
+        )
+        if existing is None:
+            existing = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "secondary_range": secondary_range,
+            }
+            presets.append(existing)
+        else:
+            existing["name"] = name
+            existing["secondary_range"] = secondary_range
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PRESETS_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(presets, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PRESETS_PATH)
+        return dict(existing), presets
+
+
+def delete_custom_ship_preset(preset_id):
+    """Delete one custom preset by its stable id; built-ins are never touched."""
+    requested_id = str(preset_id or "").strip()
+    if (
+        not requested_id
+        or len(requested_id) > 40
+        or not all(character.isalnum() or character in "-_" for character in requested_id)
+    ):
+        raise ValueError("舰船预设编号无效")
+    with CUSTOM_SHIP_LOCK:
+        presets = load_custom_ship_presets()
+        remaining = [item for item in presets if item["id"] != requested_id]
+        if len(remaining) == len(presets):
+            raise ValueError("未找到要删除的舰船预设")
+        CUSTOM_SHIP_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CUSTOM_SHIP_PRESETS_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(remaining, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(CUSTOM_SHIP_PRESETS_PATH)
+        return remaining
 
 
 class ControlStore:
@@ -465,7 +602,7 @@ class RunnerManager:
             custom_ship_name = ""
             custom_secondary_range = 0.0
             if ship == CUSTOM_SHIP_KEY:
-                custom_ship_name, custom_secondary_range = validate_custom_ship(
+                custom_ship_name, custom_secondary_range = resolve_custom_ship_for_run(
                     payload
                 )
                 save_custom_ship(custom_ship_name, custom_secondary_range)
@@ -544,7 +681,7 @@ class RunnerManager:
         """Release either a Web pause or a keyboard-intervention hold."""
         with self.lock:
             self._reconcile()
-            if self.process is None:
+            if self.process is None or STOP_PATH.exists():
                 return False
             PAUSE_PATH.unlink(missing_ok=True)
             RESUME_PATH.write_text("resume", encoding="utf-8")
@@ -554,7 +691,7 @@ class RunnerManager:
         """Cooperatively freeze new system commands without stopping the ship."""
         with self.lock:
             self._reconcile()
-            if self.process is None:
+            if self.process is None or STOP_PATH.exists():
                 return False
             RESUME_PATH.unlink(missing_ok=True)
             PAUSE_PATH.write_text("pause", encoding="utf-8")
@@ -597,6 +734,7 @@ class RunnerManager:
         for key, value in defaults.items():
             state.setdefault(key, value)
         paused_by_user = bool(running and PAUSE_PATH.exists())
+        state["terminating"] = bool(running and STOP_PATH.exists())
         state["paused_by_user"] = paused_by_user
         if paused_by_user:
             state["manual_intervention_latched"] = True
@@ -729,6 +867,59 @@ def tail_log(lines=80):
         return []
 
 
+def screenshot_storage_status():
+    """Report generated screenshot usage inside the project folder."""
+    files = (
+        [
+            path
+            for path in SCREENSHOT_ROOT.rglob("*")
+            if path.is_file() and path.suffix.lower() in SCREENSHOT_SUFFIXES
+        ]
+        if SCREENSHOT_ROOT.exists()
+        else []
+    )
+    return {
+        "count": len(files),
+        "bytes": sum(path.stat().st_size for path in files),
+        "path": str(SCREENSHOT_ROOT.relative_to(BASE_DIR)),
+    }
+
+
+def clear_generated_screenshots():
+    """Delete only image files below the fixed project screenshot root."""
+    if RUNNER.status().get("running"):
+        raise RuntimeError("自动任务运行中，不能清理截图")
+    root = SCREENSHOT_ROOT.resolve()
+    removed = 0
+    reclaimed = 0
+    if not root.exists():
+        return {"removed": 0, "bytes": 0, **screenshot_storage_status()}
+    for path in root.rglob("*"):
+        resolved = path.resolve()
+        if (
+            path.is_file()
+            and resolved.is_relative_to(root)
+            and path.suffix.lower() in SCREENSHOT_SUFFIXES
+        ):
+            reclaimed += path.stat().st_size
+            path.unlink()
+            removed += 1
+    for directory in sorted(
+        (path for path in root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return {
+        "removed": removed,
+        "bytes": reclaimed,
+        **screenshot_storage_status(),
+    }
+
+
 STORE = ControlStore()
 RUNNER = RunnerManager(STORE)
 CALIBRATION = WebCalibrationWorkflow()
@@ -763,6 +954,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     "ships": load_ships(),
                     "modes": MODES,
                     "custom_ship": load_custom_ship(),
+                    "custom_ship_presets": load_custom_ship_presets(),
                     "calibration": CalibrationStore().status().to_dict(),
                     "game": game_status(),
                 }
@@ -783,6 +975,9 @@ class ControlHandler(SimpleHTTPRequestHandler):
         if path == "/api/dashboard":
             self._json(STORE.dashboard())
             return
+        if path == "/api/screenshots":
+            self._json(screenshot_storage_status())
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -799,6 +994,22 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 )
                 save_custom_ship(name, secondary_range)
                 self._json({"ok": True})
+                return
+            if path == "/api/custom-ship-presets":
+                name, secondary_range = validate_custom_ship(payload)
+                preset, presets = save_custom_ship_preset(
+                    name,
+                    secondary_range,
+                    payload.get("preset_id", ""),
+                )
+                self._json(
+                    {"ok": True, "preset": preset, "presets": presets},
+                    HTTPStatus.CREATED,
+                )
+                return
+            if path == "/api/custom-ship-presets/delete":
+                presets = delete_custom_ship_preset(payload.get("preset_id", ""))
+                self._json({"ok": True, "presets": presets})
                 return
             if path == "/api/run/stop":
                 self._json({"ok": RUNNER.stop()})
@@ -843,6 +1054,9 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     str(payload.get("note", "")),
                 )
                 self._json({"ok": True, "entry_id": entry_id}, HTTPStatus.CREATED)
+                return
+            if path == "/api/screenshots/clear":
+                self._json({"ok": True, **clear_generated_screenshots()})
                 return
             self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
         except (ValueError, RuntimeError, json.JSONDecodeError) as error:

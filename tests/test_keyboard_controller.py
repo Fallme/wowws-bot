@@ -1,6 +1,6 @@
 import pytest
 
-from core.keyboard import KeyboardController
+from core.keyboard import KeyboardController, VK
 
 
 class RecordingBackend:
@@ -90,6 +90,17 @@ def test_action_bindings_use_native_keyboard_and_mouse():
         ("tap", "r"),
         ("tap", "t"),
     ]
+
+
+def test_escape_has_a_valid_windows_virtual_key_binding():
+    backend = RecordingBackend()
+    controller = KeyboardController(backend)
+
+    controller.escape()
+
+    assert VK["esc"] == 0x1B
+    assert backend.events == [("tap", "esc")]
+    assert controller.last_dispatch.action == "escape"
 
 
 def test_tactical_map_and_autopilot_takeover_use_native_keys():

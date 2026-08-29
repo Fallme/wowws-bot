@@ -18,7 +18,6 @@ from core.ui import (
     BATTLE_TYPE_SEARCH_AREA,
     ESCAPE_RESUME_BUTTON,
     EXIT_CONTINUE_BUTTON,
-    NO_COMMANDER_CONFIRM_BUTTON,
     PORT_BATTLE_BUTTON,
     PORT_DIALOG_CLOSE,
     PORT_MODE_SELECTOR,
@@ -63,10 +62,25 @@ SHIP_TIER_PREFIXES = frozenset(
 ASYMMETRIC_PURPLE_LOWER = np.array([125, 65, 45])
 ASYMMETRIC_PURPLE_UPPER = np.array([170, 255, 255])
 _WINDOW_CAPTURE = ScreenCapture()
+_LAST_SELECTED_CARD_POINT = None
 
 
 class ShipSelectionError(RuntimeError):
     """Raised when a requested custom ship cannot be found and verified."""
+
+
+def _operation_paused(should_abort=None) -> bool:
+    """Check the shared lifecycle gate before every port-side action."""
+    if should_abort is None:
+        return False
+    try:
+        paused = bool(should_abort())
+    except Exception:
+        logger.exception("港口操作暂停门禁检查失败；按暂停处理")
+        paused = True
+    if paused:
+        logger.info("[USER] 港口操作已被暂停门禁拦截，不再截图、切窗或点击")
+    return paused
 
 
 def _remember_selected_ship(ship_key):
@@ -113,6 +127,24 @@ def _click_local(hwnd, point):
         logger.warning("物理点击未派发，改用窗口消息点击: local=%s", point)
         return window_message_click(hwnd, screen_x, screen_y)
     return False
+
+
+def _right_click_local(hwnd, point):
+    """Open a verified game context menu without leaving the game window."""
+    if not ensure_game_window_foreground(hwnd):
+        return False
+    time.sleep(0.12)
+    origin_x, origin_y = _screen_origin(hwnd)
+    screen_x, screen_y = origin_x + point[0], origin_y + point[1]
+    if physical_click(screen_x, screen_y, hwnd=hwnd, button="right"):
+        return True
+    logger.warning("物理右键未派发，改用窗口消息右键: local=%s", point)
+    return window_message_click(
+        hwnd,
+        screen_x,
+        screen_y,
+        button="right",
+    )
 
 
 def _click_region(hwnd, image, region: RelativeRegion):
@@ -173,7 +205,9 @@ def click_battle(hwnd=None, image=None):
     return clicked
 
 
-def _observe_battle_entry(hwnd, vision, *, samples=8, interval=0.35):
+def _observe_battle_entry(
+    hwnd, vision, *, samples=8, interval=0.35, should_abort=None
+):
     """Verify one Join Battle click without blindly clicking it again.
 
     A successful transition can be the loading page, the battle HUD, a queue
@@ -188,7 +222,11 @@ def _observe_battle_entry(hwnd, vision, *, samples=8, interval=0.35):
     sample_count = max(1, int(samples))
 
     for sample in range(sample_count):
+        if _operation_paused(should_abort):
+            return False
         time.sleep(max(0.0, float(interval)))
+        if _operation_paused(should_abort):
+            return False
         try:
             image = _capture(hwnd)
         except Exception as error:
@@ -204,13 +242,10 @@ def _observe_battle_entry(hwnd, vision, *, samples=8, interval=0.35):
             lambda _image: False,
         )
         if no_commander_detector(image):
-            if confirm_no_commander(hwnd, image, vision):
-                logger.info("无指挥官确认已处理，继续观察入场状态")
-                stable_actionable_port = 0
-                transition_frames = 0
-                continue
-            logger.warning("无指挥官确认框已识别，但确认点击未能安全派发")
-            return True
+            logger.warning(
+                "检测到无指挥官拦截页；拒绝绕过提示进入战斗，返回港口重新复核指定舰船"
+            )
+            return False
 
         state = vision.classify_screen(image)
         if state in {ScreenState.LOADING, ScreenState.BATTLE}:
@@ -255,13 +290,20 @@ def _observe_battle_entry(hwnd, vision, *, samples=8, interval=0.35):
 
 
 def confirm_no_commander(hwnd=None, image=None, vision=None):
-    """Accept the known no-commander warning only when positively detected."""
+    """Fail closed on the post-Join no-commander warning.
+
+    Commander recovery belongs exclusively to
+    :func:`ensure_selected_ship_commander`, where the requested ship name and
+    the selected detail panel can both be verified.  The modal shown after
+    ``加入战斗`` does not prove which carousel ship produced it, so clicking its
+    continue button would violate the selected-ship interlock.
+    """
     vision = vision or Vision()
     image = image if image is not None else _capture(hwnd)
     if not vision.in_no_commander_confirmation(image):
         return False
-    logger.info("检测到无指挥官确认框，选择继续进入战斗")
-    return _click_region(hwnd, image, NO_COMMANDER_CONFIRM_BUTTON)
+    logger.warning("无指挥官拦截页已确认；禁止自动点击继续")
+    return False
 
 
 def open_mode_selector(hwnd=None, vision=None):
@@ -382,7 +424,9 @@ def select_mode_from_screen(hwnd, requested_mode, image=None):
     return _click_local(hwnd, point)
 
 
-def ensure_requested_mode(hwnd=None, requested_mode="asymmetric", vision=None):
+def ensure_requested_mode(
+    hwnd=None, requested_mode="asymmetric", vision=None, *, should_abort=None
+):
     """Select the configured mode and verify it again after returning to port."""
     requested_mode = (requested_mode or "asymmetric").strip().lower()
     if requested_mode not in SUPPORTED_MODES:
@@ -390,6 +434,8 @@ def ensure_requested_mode(hwnd=None, requested_mode="asymmetric", vision=None):
         return False
     vision = vision or Vision()
     for attempt in range(1, 4):
+        if _operation_paused(should_abort):
+            return False
         image = _capture(hwnd)
         selector_open = in_battle_type_selector(image)
         current = None if selector_open else detect_port_mode(image)
@@ -409,6 +455,8 @@ def ensure_requested_mode(hwnd=None, requested_mode="asymmetric", vision=None):
             return True
 
         if not selector_open:
+            if _operation_paused(should_abort):
+                return False
             if vision.classify_screen(image) != ScreenState.PORT:
                 logger.warning("当前不是港口或模式选择页，本轮不执行模式点击")
                 return False
@@ -429,7 +477,11 @@ def ensure_requested_mode(hwnd=None, requested_mode="asymmetric", vision=None):
         # Selection animation and port restoration are asynchronous. Require
         # both selector closure and a matching right-side port emblem.
         for verification in range(6):
+            if _operation_paused(should_abort):
+                return False
             time.sleep(0.5 if verification else 1.0)
+            if _operation_paused(should_abort):
+                return False
             confirmation = _capture(hwnd)
             if in_battle_type_selector(confirmation):
                 continue
@@ -507,6 +559,111 @@ def _token_geometry(token):
     if not xs or not ys:
         return None
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def daily_reward_claim_point(image, backend=None):
+    """Return the verified ``领取`` action on the daily login reward page.
+
+    The page is positively identified from its heading before any action is
+    considered. This keeps the orange-button fallback safe when seasonal
+    artwork or reward-card positions change between game updates.
+    """
+    if image is None or not hasattr(image, "size") or image.size == 0:
+        return None
+    backend = backend or RapidOcrBackend()
+    tokens = list(backend.recognize(image) or ())
+    normalized = [
+        (_normalize_ship_name(token.text), token)
+        for token in tokens
+        if float(token.confidence) >= 0.58
+    ]
+    combined = "".join(text for text, _token in normalized)
+    daily_evidence = any(
+        keyword in combined
+        for keyword in (
+            _normalize_ship_name("每日奖励"),
+            _normalize_ship_name("每日补给"),
+            _normalize_ship_name("每日登录"),
+            _normalize_ship_name("登录奖励"),
+            "dailyrewards",
+            "dailyreward",
+        )
+    )
+    if not daily_evidence:
+        return None
+
+    height, width = image.shape[:2]
+    actions = []
+    for text, token in normalized:
+        if text.startswith(_normalize_ship_name("已领取")):
+            continue
+        if not any(
+            keyword in text
+            for keyword in (
+                _normalize_ship_name("领取"),
+                _normalize_ship_name("收取"),
+                _normalize_ship_name("收集您的奖励"),
+                _normalize_ship_name("收集奖励"),
+                _normalize_ship_name("收集"),
+                "claim",
+            )
+        ):
+            continue
+        geometry = _token_geometry(token)
+        if geometry is None:
+            continue
+        x1, y1, x2, y2 = geometry
+        center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        # Explanatory text near the heading often says ``有3天时间来领取奖励``.
+        # It is not a button.  Claim actions are confined to the lower content
+        # area and away from the window edges.
+        if center[1] < height * 0.45:
+            continue
+        if not width * 0.20 <= center[0] <= width * 0.80:
+            continue
+        # Prefer the large lower-centre action; headings and already-claimed
+        # day cards are not valid click targets.
+        score = float(token.confidence)
+        score += 0.15
+        score += 0.10 if width * 0.25 <= center[0] <= width * 0.75 else 0.0
+        actions.append((score, center))
+    if actions:
+        return max(actions, key=lambda item: item[0])[1]
+
+    # OCR can miss white text on the glowing orange button. The visual
+    # fallback is allowed only after the page heading was positively read.
+    return _largest_color_center(
+        image,
+        # Daily-reward layouts vary, but the primary claim action remains in
+        # the lower centre.  Keeping this fallback narrow prevents a large
+        # orange reward card or seasonal illustration from becoming a click
+        # target when OCR reads the heading but misses the button text.
+        RelativeRegion(0.30, 0.60, 0.70, 0.94),
+        [((5, 70, 80), (35, 255, 255))],
+        minimum_ratio=0.012,
+    )
+
+
+def is_daily_reward_page(image, backend=None):
+    return daily_reward_claim_point(image, backend) is not None
+
+
+def claim_daily_reward(
+    hwnd,
+    image=None,
+    *,
+    backend=None,
+    should_abort=None,
+):
+    """Claim the first-login daily reward after OCR verification."""
+    if _operation_paused(should_abort):
+        return False
+    image = image if image is not None else _capture(hwnd)
+    point = daily_reward_claim_point(image, backend)
+    if point is None:
+        return False
+    logger.info("识别到每日奖励页面，点击领取: local=%s", point)
+    return _click_local(hwnd, point)
 
 
 def _ocr_name_matches(
@@ -635,6 +792,138 @@ def is_custom_ship_selected(image, full_name, backend=None, minimum_confidence=0
     return False
 
 
+def is_selected_ship_without_commander(image, backend=None):
+    """Read ``没有指挥官`` only from the selected ship detail panel."""
+    if image is None or image.size == 0:
+        return False
+    backend = backend or RapidOcrBackend()
+    height, width = image.shape[:2]
+    panel = image[
+        int(height * 0.04) : int(height * 0.30),
+        int(width * 0.79) : width,
+    ]
+    wanted = _normalize_ship_name("没有指挥官")
+    for token in backend.recognize(panel):
+        text = _normalize_ship_name(token.text)
+        if token.confidence >= 0.72 and wanted in text:
+            logger.info(
+                "右上角舰船详情确认无指挥官: confidence=%.3f",
+                token.confidence,
+            )
+            return True
+    return False
+
+
+def _find_recall_commander_action(image, backend):
+    """Return the OCR centre of the ``召回指挥官`` context-menu action."""
+    height = image.shape[0]
+    search_top = int(height * 0.58)
+    wanted = _normalize_ship_name("召回指挥官")
+    matches = []
+    for token in backend.recognize(image[search_top:, :]):
+        geometry = _token_geometry(token)
+        if token.confidence < 0.72 or geometry is None:
+            continue
+        if wanted not in _normalize_ship_name(token.text):
+            continue
+        x1, y1, x2, y2 = geometry
+        matches.append(
+            (
+                float(token.confidence),
+                (int((x1 + x2) / 2), search_top + int((y1 + y2) / 2)),
+            )
+        )
+    return max(matches, default=(0.0, None), key=lambda item: item[0])[1]
+
+
+def ensure_selected_ship_commander(
+    hwnd,
+    ship_key,
+    *,
+    custom_name=None,
+    backend=None,
+    should_abort=None,
+    attempts=2,
+):
+    """Recall the selected ship's commander before joining matchmaking.
+
+    The operation is authorized only by three positive observations: the upper
+    right detail panel must name the requested ship, that same panel must say
+    ``没有指挥官``, and the opened context menu must contain the OCR text
+    ``召回指挥官``.  No blind right-click or menu coordinate is used.
+    """
+    global _LAST_SELECTED_CARD_POINT
+    backend = backend or RapidOcrBackend()
+    ship_key = (ship_key or "").strip().lower()
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        if _operation_paused(should_abort):
+            return False
+        image = _capture(hwnd)
+        if ship_key == CUSTOM_SHIP_KEY:
+            requested_selected = bool(custom_name) and is_custom_ship_selected(
+                image,
+                custom_name,
+                backend,
+            )
+        else:
+            requested_selected = is_requested_ship_selected(image, ship_key)
+        if not requested_selected:
+            logger.warning(
+                "拒绝召回指挥官：右上角当前舰船不是指定舰船 (%s)",
+                custom_name if ship_key == CUSTOM_SHIP_KEY else ship_key,
+            )
+            return False
+        if not is_selected_ship_without_commander(image, backend):
+            return True
+        action = _find_recall_commander_action(image, backend)
+        if action is not None:
+            logger.info("检测到已打开的召回菜单，直接点击已识别文字: local=%s", action)
+            if _click_local(hwnd, action):
+                time.sleep(1.2)
+                if not is_selected_ship_without_commander(_capture(hwnd), backend):
+                    logger.info("指挥官召回复核通过")
+                    return True
+            continue
+        if ship_key == CUSTOM_SHIP_KEY:
+            match = find_custom_ship_card(image, custom_name or "", backend)
+        else:
+            match = find_ship_card(image, ship_key)
+        if match is None:
+            point = _LAST_SELECTED_CARD_POINT
+            if point is None:
+                logger.warning("已确认无指挥官，但未定位当前舰船卡片")
+                return False
+            logger.info("舰名被菜单遮挡，沿用刚确认的选船卡片位置: %s", point)
+        else:
+            point = match[0]
+        logger.info(
+            "当前舰船无指挥官，右键舰船卡片召回 (%s/%s): local=%s",
+            attempt,
+            attempts,
+            point,
+        )
+        if not _right_click_local(hwnd, point):
+            continue
+        time.sleep(0.45)
+        if _operation_paused(should_abort):
+            return False
+        menu = _capture(hwnd)
+        action = _find_recall_commander_action(menu, backend)
+        if action is None:
+            logger.warning("舰船右键菜单中未识别到“召回指挥官”")
+            continue
+        if not _click_local(hwnd, action):
+            continue
+        time.sleep(1.2)
+        if _operation_paused(should_abort):
+            return False
+        if not is_selected_ship_without_commander(_capture(hwnd), backend):
+            logger.info("指挥官召回复核通过")
+            return True
+        logger.warning("召回指挥官后右上角仍显示无指挥官")
+    return False
+
+
 def find_ship_card(image, ship_key, minimum_score=0.55):
     """Find a supported ship by matching its gold name glyphs in the carousel."""
     ship_key = (ship_key or "").strip().lower()
@@ -745,9 +1034,13 @@ def _confirm_custom_ship_after_click(
     *,
     click_attempts=2,
     confirmation_seconds=4.0,
+    should_abort=None,
 ):
     """Try the chosen card twice, then stop; never scroll after a card hit."""
+    global _LAST_SELECTED_CARD_POINT
     for click_attempt in range(1, max(1, int(click_attempts)) + 1):
+        if _operation_paused(should_abort):
+            return False
         logger.info(
             "点击自定义舰船 %s (%s/%s)",
             full_name,
@@ -756,9 +1049,14 @@ def _confirm_custom_ship_after_click(
         )
         if not _click_local(hwnd, point):
             continue
+        _LAST_SELECTED_CARD_POINT = tuple(point)
         deadline = time.monotonic() + max(0.5, float(confirmation_seconds))
         while time.monotonic() < deadline:
+            if _operation_paused(should_abort):
+                return False
             time.sleep(0.5)
+            if _operation_paused(should_abort):
+                return False
             if is_custom_ship_selected(_capture(hwnd), full_name, backend):
                 _remember_selected_ship(f"custom:{full_name}")
                 return True
@@ -772,7 +1070,7 @@ def _confirm_custom_ship_after_click(
     )
 
 
-def _rewind_ship_carousel(hwnd, rect, *, steps=20):
+def _rewind_ship_carousel(hwnd, rect, *, steps=20, should_abort=None):
     """Put the port carousel at its first card before doing one full sweep.
 
     Mouse-wheel paging in the port is horizontal, but its visible direction
@@ -787,6 +1085,8 @@ def _rewind_ship_carousel(hwnd, rect, *, steps=20):
     logger.info("舰船栏先回到顶部/起点，再单向向下遍历")
     moved = False
     for _ in range(max(1, int(steps))):
+        if _operation_paused(should_abort):
+            return False
         if not physical_scroll(carousel_x, carousel_y, 8, hwnd=hwnd):
             break
         moved = True
@@ -801,7 +1101,11 @@ def _scroll_ship_carousel_down(hwnd, rect, *, step=6):
     return physical_scroll(carousel_x, carousel_y, -abs(int(step)), hwnd=hwnd)
 
 
-def _select_custom_ship(hwnd, image, full_name, backend, max_scrolls=18):
+def _select_custom_ship(
+    hwnd, image, full_name, backend, max_scrolls=18, *, should_abort=None
+):
+    if _operation_paused(should_abort):
+        return False
     if is_custom_ship_selected(image, full_name, backend):
         logger.info("目标自定义舰船已选中: %s", full_name)
         _remember_selected_ship(f"custom:{full_name}")
@@ -809,7 +1113,10 @@ def _select_custom_ship(hwnd, image, full_name, backend, max_scrolls=18):
 
     rect = get_client_rect(hwnd) if hwnd else None
     if hwnd and rect:
-        _rewind_ship_carousel(hwnd, rect)
+        if not _rewind_ship_carousel(hwnd, rect, should_abort=should_abort):
+            return False
+        if _operation_paused(should_abort):
+            return False
         image = _capture(hwnd)
         if is_custom_ship_selected(image, full_name, backend):
             logger.info("回到舰船栏起点后已确认目标自定义舰船: %s", full_name)
@@ -817,6 +1124,8 @@ def _select_custom_ship(hwnd, image, full_name, backend, max_scrolls=18):
             return True
     match = find_custom_ship_card(image, full_name, backend)
     for attempt in range(max_scrolls + 1):
+        if _operation_paused(should_abort):
+            return False
         if match is not None:
             point, confidence = match
             logger.info(
@@ -830,6 +1139,7 @@ def _select_custom_ship(hwnd, image, full_name, backend, max_scrolls=18):
                 point,
                 full_name,
                 backend,
+                should_abort=should_abort,
             )
         if not hwnd or attempt >= max_scrolls:
             break
@@ -842,6 +1152,8 @@ def _select_custom_ship(hwnd, image, full_name, backend, max_scrolls=18):
         if not _scroll_ship_carousel_down(hwnd, rect):
             break
         time.sleep(0.35)
+        if _operation_paused(should_abort):
+            return False
         image = _capture(hwnd)
         if is_custom_ship_selected(image, full_name, backend):
             _remember_selected_ship(f"custom:{full_name}")
@@ -861,9 +1173,12 @@ def select_requested_ship(
     custom_name=None,
     ocr_backend=None,
     custom_max_scrolls=18,
+    should_abort=None,
 ):
     """Select a built-in template ship or an exact custom ship OCR name."""
     ship_key = (ship_key or "").strip().lower()
+    if _operation_paused(should_abort):
+        return False
     is_custom = ship_key == CUSTOM_SHIP_KEY
     if ship_key not in SUPPORTED_SHIPS and not is_custom:
         logger.error("不支持的舰船: %s", ship_key)
@@ -883,6 +1198,7 @@ def select_requested_ship(
             full_name,
             ocr_backend or RapidOcrBackend(),
             max_scrolls=max(0, int(custom_max_scrolls)),
+            should_abort=should_abort,
         )
     if is_requested_ship_selected(image, ship_key):
         logger.info("目标舰船已选中: %s", ship_key)
@@ -891,7 +1207,10 @@ def select_requested_ship(
     match = find_ship_card(image, ship_key)
     if match is None and hwnd:
         rect = get_client_rect(hwnd)
-        _rewind_ship_carousel(hwnd, rect)
+        if not _rewind_ship_carousel(hwnd, rect, should_abort=should_abort):
+            return False
+        if _operation_paused(should_abort):
+            return False
         image = _capture(hwnd)
         if is_requested_ship_selected(image, ship_key):
             _remember_selected_ship(ship_key)
@@ -900,6 +1219,8 @@ def select_requested_ship(
         # A single direction sweep avoids revisiting cards and never leaves the
         # requested ship just outside a reverse-search boundary.
         for attempt in range(18):
+            if _operation_paused(should_abort):
+                return False
             if match is not None:
                 break
             logger.info(
@@ -910,6 +1231,8 @@ def select_requested_ship(
             if not _scroll_ship_carousel_down(hwnd, rect):
                 break
             time.sleep(0.25)
+            if _operation_paused(should_abort):
+                return False
             image = _capture(hwnd)
             if is_requested_ship_selected(image, ship_key):
                 _remember_selected_ship(ship_key)
@@ -929,7 +1252,11 @@ def select_requested_ship(
     logger.info("按截图定位舰船 %s: local=%s score=%.3f", ship_key, point, score)
     if not _click_local(hwnd, point):
         return False
+    global _LAST_SELECTED_CARD_POINT
+    _LAST_SELECTED_CARD_POINT = tuple(point)
     time.sleep(1.8)
+    if _operation_paused(should_abort):
+        return False
     if not is_requested_ship_selected(_capture(hwnd), ship_key):
         logger.warning("舰船选择复核失败: %s", ship_key)
         return False
@@ -943,9 +1270,13 @@ def click_center(hwnd=None):
     return _click_local(hwnd, (width // 2, height // 2))
 
 
-def enter_battle(hwnd=None, *, vision=None, configure_port=True):
+def enter_battle(
+    hwnd=None, *, vision=None, configure_port=True, should_abort=None
+):
     """Click ``加入战斗`` once, then verify or conservatively await transition."""
     vision = vision or Vision()
+    if _operation_paused(should_abort):
+        return False
     image = _capture(hwnd)
     state = vision.classify_screen(image)
     if state != ScreenState.PORT:
@@ -957,6 +1288,7 @@ def enter_battle(hwnd=None, *, vision=None, configure_port=True):
             hwnd,
             os.environ.get("WOWS_SHIP", "pommern"),
             vision,
+            should_abort=should_abort,
         ):
             logger.warning("未能安全选择目标舰船")
             return False
@@ -965,17 +1297,24 @@ def enter_battle(hwnd=None, *, vision=None, configure_port=True):
             hwnd,
             os.environ.get("WOWS_MODE", "asymmetric"),
             vision,
+            should_abort=should_abort,
         ):
             logger.warning("未能安全选择目标战斗模式")
             return False
 
+    if _operation_paused(should_abort):
+        return False
     image = _capture(hwnd)
     if not click_battle(hwnd, image):
         return False
-    return _observe_battle_entry(hwnd, vision)
+    return _observe_battle_entry(
+        hwnd,
+        vision,
+        should_abort=should_abort,
+    )
 
 
-def queue_next_battle(hwnd=None, *, vision=None):
+def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
     """Queue the next battle from a positively identified result screen.
 
     The orange button is used only after the complete result-screen colour
@@ -983,10 +1322,16 @@ def queue_next_battle(hwnd=None, *, vision=None):
     return-to-port path when this returns ``False``.
     """
     vision = vision or Vision()
+    if _operation_paused(should_abort):
+        logger.info("[USER] 结算续局已暂停，不点击“继续战斗”")
+        return False
     image = _capture(hwnd)
     state = vision.classify_screen(image)
     if state != ScreenState.RESULTS:
         logger.warning("当前界面为 %s，不点击“继续战斗”", state.value)
+        return False
+    if _operation_paused(should_abort):
+        logger.info("[USER] 点击续局前检测到介入，保留结算页")
         return False
     logger.info("结算界面已确认，点击“继续战斗”自动进入下一局")
     if not _click_region(hwnd, image, RESULTS_REQUEUE_BUTTON):
@@ -996,6 +1341,9 @@ def queue_next_battle(hwnd=None, *, vision=None):
     # of reporting success for a click the game ignored.
     retried = False
     for attempt in range(24):
+        if _operation_paused(should_abort):
+            logger.info("[USER] 等待下一局期间暂停，不再派发续局动作")
+            return False
         time.sleep(0.25)
         confirmation = _capture(hwnd)
         state = vision.classify_screen(confirmation)
@@ -1004,11 +1352,11 @@ def queue_next_battle(hwnd=None, *, vision=None):
         if state == ScreenState.PORT:
             logger.info("继续战斗返回了港口，改用港口常规入口")
             return False
-        if (
-            state == ScreenState.UNKNOWN
-            and confirm_no_commander(hwnd, confirmation, vision)
+        if state == ScreenState.UNKNOWN and vision.in_no_commander_confirmation(
+            confirmation
         ):
-            return True
+            logger.warning("续局遇到无指挥官拦截页；停止续局并返回港口复核指定舰船")
+            return False
         if state == ScreenState.RESULTS and attempt >= 7 and not retried:
             logger.info("继续战斗按钮未生效，重新点击一次")
             if not _click_region(hwnd, confirmation, RESULTS_REQUEUE_BUTTON):
@@ -1018,7 +1366,7 @@ def queue_next_battle(hwnd=None, *, vision=None):
     return False
 
 
-def handle_post_battle(hwnd=None, *, vision=None, max_steps=4):
+def handle_post_battle(hwnd=None, *, vision=None, max_steps=4, should_abort=None):
     """Advance result screens without blind center clicks.
 
     Escape menus are treated as active-battle states: the bot resumes the
@@ -1026,6 +1374,9 @@ def handle_post_battle(hwnd=None, *, vision=None, max_steps=4):
     """
     vision = vision or Vision()
     for _ in range(max_steps):
+        if _operation_paused(should_abort):
+            logger.info("[USER] 结算导航暂停，不切窗口、不点击")
+            return False
         image = _capture(hwnd)
         state = vision.classify_screen(image)
         logger.info("结算导航识别: %s", state.value)
@@ -1035,14 +1386,20 @@ def handle_post_battle(hwnd=None, *, vision=None, max_steps=4):
             time.sleep(2)
             continue
         if state == ScreenState.RESULTS:
+            if _operation_paused(should_abort):
+                return False
             _click_region(hwnd, image, RESULTS_RETURN_TO_PORT_BUTTON)
             time.sleep(2)
             continue
         if state == ScreenState.EXIT_CONFIRMATION:
+            if _operation_paused(should_abort):
+                return False
             _click_region(hwnd, image, EXIT_CONTINUE_BUTTON)
             logger.warning("检测到离开战斗确认框，已选择继续战斗")
             return False
         if state == ScreenState.ESCAPE_MENU:
+            if _operation_paused(should_abort):
+                return False
             _click_region(hwnd, image, ESCAPE_RESUME_BUTTON)
             logger.warning("检测到战斗菜单，已返回游戏")
             return False

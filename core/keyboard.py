@@ -34,6 +34,7 @@ VK = {
     "t": 0x54,
     "r": 0x52,
     "u": 0x55,
+    "esc": 0x1B,
 }
 
 ULONG_PTR = ctypes.wintypes.WPARAM

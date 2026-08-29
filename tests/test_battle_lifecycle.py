@@ -41,3 +41,23 @@ def test_missing_hud_still_faults_after_transition_grace():
 
     with pytest.raises(SafetyFault, match="无法确认战斗 HUD"):
         bot.combat_tick()
+
+
+def test_zero_numeric_health_sends_no_more_controls_and_waits_for_results():
+    analysis = BattleAnalysis(
+        image=None,
+        width=0,
+        height=0,
+        in_battle=True,
+        health=0.0,
+        health_recognized=True,
+    )
+    bot = make_lifecycle_bot(analysis)
+    bot._last_movement_mode = "route_transit"
+    bot.last_movement_command = object()
+    bot.last_movement_reason = "moving"
+
+    assert bot.combat_tick() == "waiting"
+    assert bot.gamepad.stop_calls == 0
+    assert bot._last_movement_mode == "awaiting_results"
+    assert bot.last_movement_command is None

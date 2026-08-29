@@ -21,8 +21,8 @@ class StuckRecoveryController:
         preferred_side=1,
         stationary_seconds=24.0,
         stationary_pixels=5.0,
-        reverse_seconds=9.0,
-        forward_seconds=7.0,
+        reverse_seconds=4.5,
+        forward_seconds=4.5,
         cooldown_seconds=45.0,
     ):
         self.preferred_side = 1 if preferred_side >= 0 else -1
@@ -34,11 +34,15 @@ class StuckRecoveryController:
         self.samples = deque()
         self.recovery_started = None
         self.cooldown_until = 0.0
+        self.active_side = self.preferred_side
+        self._next_fallback_side = self.preferred_side
 
     def reset(self):
         self.samples.clear()
         self.recovery_started = None
         self.cooldown_until = 0.0
+        self.active_side = self.preferred_side
+        self._next_fallback_side = self.preferred_side
 
     def cancel(self):
         """Yield immediately to a higher-priority live safety manoeuvre."""
@@ -63,14 +67,14 @@ class StuckRecoveryController:
         origin = points[0]
         return max(math.dist(origin, point) for point in points) <= self.stationary_pixels
 
-    def update(self, now, position, intended_throttle):
+    def update(self, now, position, intended_throttle, escape_rudder=None):
         self._record(now, position)
         if self.recovery_started is not None:
             elapsed = now - self.recovery_started
             if elapsed < self.reverse_seconds:
-                return RecoveryCommand(-1.0, self.preferred_side, "reverse")
+                return RecoveryCommand(-1.0, self.active_side, "reverse")
             if elapsed < self.reverse_seconds + self.forward_seconds:
-                return RecoveryCommand(0.82, -self.preferred_side, "forward_turn")
+                return RecoveryCommand(0.82, -self.active_side, "forward_turn")
             self.recovery_started = None
             self.cooldown_until = now + self.cooldown_seconds
             self.samples.clear()
@@ -80,6 +84,13 @@ class StuckRecoveryController:
             return None
         if self._stationary(now):
             self.recovery_started = now
+            if escape_rudder is not None and abs(float(escape_rudder)) >= 0.2:
+                self.active_side = 1 if float(escape_rudder) > 0 else -1
+            else:
+                # With no reliable clearance signal, alternate recovery sides
+                # so repeated contacts cannot produce the same circular trap.
+                self.active_side = self._next_fallback_side
+                self._next_fallback_side *= -1
             self.samples.clear()
-            return RecoveryCommand(-1.0, self.preferred_side, "reverse")
+            return RecoveryCommand(-1.0, self.active_side, "reverse")
         return None

@@ -37,3 +37,49 @@ def test_queue_next_battle_refuses_unknown_screen():
         assert not port_navigator.queue_next_battle(vision=vision)
 
     click.assert_not_called()
+
+
+def test_queue_next_battle_never_bypasses_no_commander_warning():
+    image = np.zeros((1063, 1707, 3), dtype=np.uint8)
+    vision = Mock()
+    vision.classify_screen.side_effect = [ScreenState.RESULTS, ScreenState.UNKNOWN]
+    vision.in_no_commander_confirmation.return_value = True
+
+    with (
+        patch.object(port_navigator, "_capture", return_value=image),
+        patch.object(port_navigator, "_click_region", return_value=True) as click,
+        patch.object(port_navigator.time, "sleep"),
+    ):
+        assert not port_navigator.queue_next_battle(vision=vision)
+
+    assert click.call_count == 1
+
+
+def test_queue_next_battle_honors_user_pause_before_capture_or_click():
+    vision = Mock()
+    with (
+        patch("port_navigator._capture") as capture,
+        patch("port_navigator._click_region") as click,
+    ):
+        assert not port_navigator.queue_next_battle(
+            vision=vision,
+            should_abort=lambda: True,
+        )
+
+    capture.assert_not_called()
+    click.assert_not_called()
+
+
+def test_post_battle_navigation_honors_pause_before_foreground_capture():
+    vision = Mock()
+    with (
+        patch("port_navigator._capture") as capture,
+        patch("port_navigator._click_region") as click,
+    ):
+        assert not port_navigator.handle_post_battle(
+            vision=vision,
+            should_abort=lambda: True,
+        )
+
+    capture.assert_not_called()
+    click.assert_not_called()

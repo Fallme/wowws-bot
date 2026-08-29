@@ -56,7 +56,7 @@ pommern:
     opening_autopilot_minimum_seconds: 35.0 # 开局至少保留游戏自动航行，避免出生点红色误报取消
     enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
     manual_intervention_pause_seconds: 5.0
-    manual_intervention_latch_seconds: 15.0
+    manual_intervention_latch_seconds: 20.0
     secondary_target_distance_km: 10.0
     secondary_inner_distance_km: 7.0
     capture_zone_match_ratio: 0.08
@@ -120,7 +120,7 @@ napoli:
     opening_autopilot_minimum_seconds: 35.0
     enable_minimap_torpedo_evasion: true
     manual_intervention_pause_seconds: 5.0
-    manual_intervention_latch_seconds: 15.0
+    manual_intervention_latch_seconds: 20.0
     secondary_target_distance_km: 10.0
     secondary_inner_distance_km: 7.0
     capture_zone_match_ratio: 0.08
