@@ -3,6 +3,7 @@ import time
 import unittest
 from pathlib import Path
 
+from main import count_quick_battle_for_plan
 from runtime_control import RunLimits, RuntimeReporter
 
 
@@ -17,6 +18,22 @@ class RunLimitsTests(unittest.TestCase):
         self.assertTrue(limits.reached(0, time.monotonic() - 61))
         self.assertTrue(limits.schedule_reached(0, time.monotonic() - 61))
         self.assertFalse(limits.stop_requested())
+
+    def test_quick_battle_completion_closes_round_limited_plan_without_results(self):
+        limits = RunLimits(max_rounds=2, quick_battle=True)
+        started_at = time.monotonic()
+        completed = 0
+
+        completed = count_quick_battle_for_plan(completed, "quick_timeout")
+        self.assertEqual(completed, 1)
+        self.assertFalse(limits.schedule_reached(completed, started_at))
+
+        completed = count_quick_battle_for_plan(completed, "quick_death")
+        self.assertEqual(completed, 2)
+        self.assertTrue(limits.schedule_reached(completed, started_at))
+
+    def test_non_quick_completion_signal_does_not_advance_quick_counter(self):
+        self.assertEqual(count_quick_battle_for_plan(3, "results"), 3)
 
     def test_stop_file_requests_shutdown(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -480,7 +480,7 @@ def test_battle_feedback_accepts_slow_battleship_minimap_progress():
     assert bot.feedback.update(12, (102, 100), 1.0).verified
 
 
-def test_failed_native_autopilot_falls_through_to_generic_center_route():
+def test_lost_native_autopilot_requests_retry_before_generic_qe_route():
     class FallbackGamepad(RecordingGamepad):
         def __init__(self):
             super().__init__()
@@ -527,17 +527,41 @@ def test_failed_native_autopilot_falls_through_to_generic_center_route():
 
     bot._execute_rules(analysis, now + 0.2)
 
-    # Native navigation ended by itself; the controller does not send a
-    # synthetic cancellation/full-speed command on this transition frame.
+    # The route disappeared before a confirmed arrival. Q/E remains blocked
+    # while the lifecycle receives a request to retry the tactical-map route.
     assert gamepad.takeovers == 0
     assert gamepad.movements == []
     assert not bot.opening_autopilot_active
-    assert bot.generic_center_route_active
-    assert analysis.capture_point_bearing == analysis.map_center_bearing
-    assert analysis.capture_point_distance_km == analysis.map_center_distance_km
+    assert bot.autopilot_retry_pending
+    assert not bot.generic_center_route_active
 
-    # The cancellation frame is deliberately steering-free.  Minimap driving
-    # is allowed only on the following control frame.
+
+def test_native_autopilot_arrival_allows_qe_on_following_frame():
+    gamepad = RecordingGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.enable_opening_autopilot(
+        "地图中心敌方远端",
+        target_normalized=(0.50, 0.25),
+    )
+    now = time.monotonic()
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1600,
+        player_position=(100, 100),
+        minimap_player_normalized=(0.52, 0.29),
+        map_center_bearing=0.15,
+        map_center_distance_km=12.0,
+    )
+
+    for offset in (0.0, 0.1, 0.2):
+        bot._execute_rules(analysis, now + offset)
+
+    assert not bot.autopilot_retry_pending
+    assert bot.generic_center_route_active
+    assert gamepad.movements == []
+
     bot._execute_rules(analysis, now + 0.3)
     assert len(gamepad.movements) == 1
 

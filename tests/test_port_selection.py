@@ -42,6 +42,7 @@ class PortSelectionTests(unittest.TestCase):
         )
         from core.ocr import OcrToken
         from port_navigator import (
+            _find_mode_card_from_ocr,
             ShipSelectionError,
             detect_port_mode,
             ensure_requested_mode,
@@ -50,11 +51,13 @@ class PortSelectionTests(unittest.TestCase):
             is_custom_ship_selected,
             is_requested_ship_selected,
             in_battle_type_selector,
+            is_battle_survey_page,
             select_requested_ship,
             selected_ship_scores,
         )
 
         cls.OcrToken = OcrToken
+        cls.find_mode_card_from_ocr = staticmethod(_find_mode_card_from_ocr)
         cls.ShipSelectionError = ShipSelectionError
         cls.detect_port_mode = staticmethod(detect_port_mode)
         cls.ensure_requested_mode = staticmethod(ensure_requested_mode)
@@ -63,6 +66,7 @@ class PortSelectionTests(unittest.TestCase):
         cls.is_custom_ship_selected = staticmethod(is_custom_ship_selected)
         cls.is_requested_ship_selected = staticmethod(is_requested_ship_selected)
         cls.in_battle_type_selector = staticmethod(in_battle_type_selector)
+        cls.is_battle_survey_page = staticmethod(is_battle_survey_page)
         cls.select_requested_ship = staticmethod(select_requested_ship)
         cls.selected_ship_scores = staticmethod(selected_ship_scores)
 
@@ -81,6 +85,24 @@ class PortSelectionTests(unittest.TestCase):
         image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
         self.assertEqual(self.detect_port_mode(image), "cooperative")
 
+    def test_exact_mode_ocr_rejects_random_as_cooperative(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+        backend = self.backend(self.OcrToken("随机战", 0.99))
+
+        self.assertEqual(
+            self.detect_port_mode(image, backend=backend),
+            "random",
+        )
+
+    def test_exact_mode_ocr_confirms_cooperative(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
+        backend = self.backend(self.OcrToken("联合作战", 0.99))
+
+        self.assertEqual(
+            self.detect_port_mode(image, backend=backend),
+            "cooperative",
+        )
+
     def test_normal_port_is_not_confused_with_battle_type_selector(self):
         image = cv2.imread(str(self.FIXTURE_ROOT / "port_mode_selector.png"))
 
@@ -91,6 +113,48 @@ class PortSelectionTests(unittest.TestCase):
         cv2.circle(image, (1580, 875), 60, (180, 30, 180), -1)
 
         self.assertTrue(self.in_battle_type_selector(image))
+
+    def test_current_battle_type_page_fixture_is_detected(self):
+        image = cv2.imread(
+            str(self.FIXTURE_ROOT / "battle_type_selector_current.jpg")
+        )
+
+        self.assertTrue(self.in_battle_type_selector(image))
+
+    def test_battle_survey_requires_specific_question_and_close_action(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        survey = self.backend(
+            self.OcrToken("您对刚刚进行的这场战斗满意度如何？", 0.99),
+            self.OcrToken("非常不满意 不满意 一般 满意 非常满意", 0.98),
+            self.OcrToken("关闭", 0.99),
+        )
+        unrelated = self.backend(
+            self.OcrToken("返回港口", 0.99),
+            self.OcrToken("关闭", 0.99),
+        )
+
+        self.assertTrue(self.is_battle_survey_page(image, backend=survey))
+        self.assertFalse(self.is_battle_survey_page(image, backend=unrelated))
+
+    def test_mode_card_click_point_comes_from_ocr_box(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "联合作战",
+                0.99,
+                ((100, 200), (220, 200), (220, 240), (100, 240)),
+            )
+        )
+
+        point = self.find_mode_card_from_ocr(
+            image,
+            "cooperative",
+            backend,
+        )
+
+        # Search crop begins at (288, 200); click follows the OCR box centre,
+        # not a 2560x1440-specific hard-coded card coordinate.
+        self.assertEqual(point, (448, 420))
 
     def test_mode_selection_page_must_close_before_coop_is_verified(self):
         selector = np.full((1600, 2560, 3), 70, dtype=np.uint8)

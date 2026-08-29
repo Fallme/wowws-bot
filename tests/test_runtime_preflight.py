@@ -13,6 +13,7 @@ from main import (
     run_battle,
     tactical_map_local_point,
     wait_for_battle,
+    wait_for_recognized_screen,
 )
 from core.vision import CaptureZone, PlayerPose
 
@@ -34,6 +35,133 @@ class FakeController:
 
     def stop(self):
         self.stop_calls += 1
+
+
+def test_startup_recovers_stable_mode_selector_before_port_workflow():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    backend = object()
+
+    class SelectorVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SelectorVision(),
+        gamepad=SimpleNamespace(),
+        intervention=None,
+        distance_reader=SimpleNamespace(backend=backend),
+    )
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.time.sleep", return_value=None),
+        patch(
+            "main.classify_runtime_screen",
+            side_effect=[
+                ScreenState.UNKNOWN,
+                ScreenState.UNKNOWN,
+                ScreenState.PORT,
+                ScreenState.PORT,
+            ],
+        ),
+        patch(
+            "main.in_battle_type_selector",
+            side_effect=[True, True, False, False],
+        ),
+        patch("main.select_mode_from_screen", return_value=True) as select_mode,
+        patch.dict("main.os.environ", {"WOWS_MODE": "cooperative"}),
+    ):
+        image, state = wait_for_recognized_screen(bot, timeout=2)
+
+    assert image is frame
+    assert state == ScreenState.PORT
+    select_mode.assert_called_once_with(
+        1,
+        "cooperative",
+        image=frame,
+        backend=backend,
+    )
+
+
+def test_startup_exits_mode_selector_when_target_card_ocr_fails():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    escape_calls = []
+
+    class SelectorVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SelectorVision(),
+        gamepad=SimpleNamespace(escape=lambda: escape_calls.append("escape")),
+        intervention=None,
+        distance_reader=SimpleNamespace(backend=object()),
+    )
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.time.sleep", return_value=None),
+        patch(
+            "main.classify_runtime_screen",
+            side_effect=[
+                ScreenState.UNKNOWN,
+                ScreenState.UNKNOWN,
+                ScreenState.PORT,
+                ScreenState.PORT,
+            ],
+        ),
+        patch(
+            "main.in_battle_type_selector",
+            side_effect=[True, True, False, False],
+        ),
+        patch("main.select_mode_from_screen", return_value=False),
+    ):
+        _image, state = wait_for_recognized_screen(bot, timeout=2)
+
+    assert state == ScreenState.PORT
+    assert escape_calls == ["escape"]
+
+
+def test_startup_dismisses_stable_battle_survey_then_rechecks_scene():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    escape_calls = []
+
+    class SurveyVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SurveyVision(),
+        gamepad=SimpleNamespace(escape=lambda: escape_calls.append("escape")),
+        intervention=None,
+        distance_reader=SimpleNamespace(backend=object()),
+    )
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.time.sleep", return_value=None),
+        patch(
+            "main.classify_runtime_screen",
+            side_effect=[
+                ScreenState.UNKNOWN,
+                ScreenState.UNKNOWN,
+                ScreenState.PORT,
+                ScreenState.PORT,
+            ],
+        ),
+        patch(
+            "main.is_battle_survey_page",
+            side_effect=[True, True, False, False],
+        ),
+        patch("main.in_battle_type_selector", return_value=False),
+    ):
+        _image, state = wait_for_recognized_screen(bot, timeout=2)
+
+    assert state == ScreenState.PORT
+    assert escape_calls == ["escape"]
 
 
 def test_automatic_port_preflight_releases_input_and_saves_status(tmp_path):
@@ -260,6 +388,66 @@ def test_run_battle_scene_interlock_rejects_port_before_any_command():
     assert events == []
 
 
+def test_resumed_battle_reasserts_full_speed_before_autopilot_setup():
+    events = []
+
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def is_autopilot_enabled(_image):
+            return False
+
+    class Controller:
+        @staticmethod
+        def reassert_full_speed():
+            events.append("full_speed")
+
+    class ResumedBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = Controller()
+        intervention = None
+        last_movement_reason = ""
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            events.append("reset")
+
+        @staticmethod
+        def enable_generic_center_route(_reason):
+            events.append("center_route")
+
+        @staticmethod
+        def combat_tick():
+            events.append("analyze")
+            return "ended"
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch(
+            "main.configure_opening_autopilot",
+            side_effect=lambda _bot: events.append("autopilot") or False,
+        ),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert run_battle(ResumedBot(), resume_existing=True)
+
+    assert events == [
+        "full_speed",
+        "reset",
+        "autopilot",
+        "center_route",
+        "analyze",
+    ]
+
+
 def test_run_battle_leaves_false_battle_after_three_non_battle_frames():
     class BattleVision:
         @staticmethod
@@ -294,6 +482,58 @@ def test_run_battle_leaves_false_battle_after_three_non_battle_frames():
         patch("main.time.sleep", return_value=None),
     ):
         assert run_battle(WaitingBot()) == "resume_state"
+
+
+def test_run_battle_retries_lost_autopilot_before_enabling_generic_qe():
+    retry_flags = []
+    events = []
+
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class RetryBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+        autopilot_retry_pending = False
+        last_analysis = SimpleNamespace(in_battle=True, health=1.0)
+        ticks = 0
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        def combat_tick(self):
+            self.ticks += 1
+            if self.ticks == 1:
+                self.autopilot_retry_pending = True
+                return "waiting"
+            return "ended"
+
+        def enable_generic_center_route(self, reason):
+            self.autopilot_retry_pending = False
+            events.append(reason)
+
+    def configure(_bot, *, retrying=False):
+        retry_flags.append(retrying)
+        return not retrying
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", side_effect=configure),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert run_battle(RetryBot())
+
+    assert retry_flags == [False, True]
+    assert events == ["原生自动航行三次敌方偏移重试均失败，Q/E小地图驾驶接管"]
 
 
 def test_quick_battle_timeout_is_counted_only_inside_confirmed_battle():
@@ -431,7 +671,7 @@ def test_prepare_battle_cancels_port_actions_when_second_frame_is_battle():
     enter.assert_not_called()
 
 
-def test_opening_autopilot_uses_map_center_not_unstable_capture_circle():
+def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
     minimap = np.zeros((200, 200, 3), dtype=np.uint8)
     events = []
 
@@ -481,11 +721,101 @@ def test_opening_autopilot_uses_map_center_not_unstable_capture_circle():
     ):
         assert configure_opening_autopilot(bot)
 
-    assert events == ["toggle", "toggle", "地图中心"]
+    assert events == ["toggle", "toggle", "地图中心敌方远端"]
     assert len(clicks) == 1
-    # Capture-circle OCR is telemetry only. The first target is on the
-    # player-to-centre approach ray; later retries advance farther to centre.
-    assert 710 <= clicks[0][0] < 810
+    # Capture-circle OCR is telemetry only. The first target already crosses
+    # the centre on the spawn-to-centre ray; later retries advance farther
+    # into the enemy half.
+    assert 810 < clicks[0][0] <= 930
+
+
+def test_opening_autopilot_refuses_short_center_click_without_player_arrow():
+    minimap = np.zeros((200, 200, 3), dtype=np.uint8)
+
+    class MissingPlayerVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def find_minimap(_image):
+            return minimap
+
+        @staticmethod
+        def find_player_pose_on_minimap(_minimap):
+            return None
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=MissingPlayerVision(),
+        gamepad=SimpleNamespace(toggle_tactical_map=lambda: None),
+        enable_opening_autopilot=lambda *_args, **_kwargs: None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.physical_click") as click,
+    ):
+        assert not configure_opening_autopilot(bot)
+
+    click.assert_not_called()
+
+
+def test_lost_autopilot_retries_three_progressive_enemy_biased_destinations():
+    minimap = np.zeros((200, 200, 3), dtype=np.uint8)
+    clicks = []
+
+    class RetryVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def find_minimap(_image):
+            return minimap
+
+        @staticmethod
+        def find_player_pose_on_minimap(_minimap):
+            return PlayerPose(position=(40, 180), heading=(0.0, -1.0))
+
+        @staticmethod
+        def analyze_minimap(_minimap):
+            return [(160, 40)], False
+
+        @staticmethod
+        def is_autopilot_enabled(_image):
+            return False
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=RetryVision(),
+        gamepad=SimpleNamespace(toggle_tactical_map=lambda: None),
+        intervention=None,
+        enable_opening_autopilot=lambda *_args, **_kwargs: None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch(
+            "main.get_client_rect",
+            return_value={"left": 0, "top": 0, "right": 1600, "bottom": 1000},
+        ),
+        patch(
+            "main.physical_click",
+            side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
+        ),
+    ):
+        assert not configure_opening_autopilot(bot, retrying=True)
+
+    assert len(clicks) == 3
+    assert clicks[0][0] < clicks[1][0] < clicks[2][0]
+    assert clicks[0][1] > clicks[1][1] > clicks[2][1]
 
 
 def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():

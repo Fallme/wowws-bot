@@ -37,8 +37,11 @@ from port_navigator import (
     ensure_selected_ship_commander,
     ensure_requested_mode,
     handle_post_battle,
+    in_battle_type_selector,
+    is_battle_survey_page,
     queue_next_battle,
     is_daily_reward_page,
+    select_mode_from_screen,
     select_requested_ship,
     ShipSelectionError,
 )
@@ -50,6 +53,19 @@ logger = logging.getLogger("runner")
 
 class GameWindowUnavailableWhilePaused(RuntimeError):
     """Raised after the paused workflow loses its game window for a grace period."""
+
+
+QUICK_BATTLE_COMPLETION_REASONS = frozenset(
+    {"quick_timeout", "quick_death", "quick_ended"}
+)
+
+
+def count_quick_battle_for_plan(completed_rounds: int, battle_finished) -> int:
+    """Advance plan progress for a confirmed quick-battle completion only."""
+
+    if battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
+        return max(0, int(completed_rounds)) + 1
+    return max(0, int(completed_rounds))
 
 
 def is_game_window_alive(hwnd) -> bool:
@@ -221,6 +237,9 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
     last_state = ScreenState.UNKNOWN
     previous_state = ScreenState.UNKNOWN
     consecutive = 0
+    selector_consecutive = 0
+    survey_consecutive = 0
+    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
     while time.monotonic() < deadline:
         if operation_paused(bot):
             # Keyboard/Web pause applies before the first recognized page too.
@@ -237,6 +256,76 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
             time.sleep(2)
             continue
         last_state = classify_runtime_screen(bot, image)
+
+        # The optional post-battle satisfaction survey is neither a result
+        # page nor a port.  Exact OCR lets us dismiss only this known dialog;
+        # unknown pages continue through the ordinary bounded recovery path.
+        try:
+            survey_open = is_battle_survey_page(image, backend=backend)
+        except Exception:
+            logger.debug("战斗评价页面识别失败", exc_info=True)
+            survey_open = False
+        survey_consecutive = survey_consecutive + 1 if survey_open else 0
+        if survey_consecutive >= 2:
+            if operation_paused(bot):
+                time.sleep(0.15)
+                continue
+            escape = getattr(getattr(bot, "gamepad", None), "escape", None)
+            if escape is not None:
+                logger.info("已确认战斗评价页面，按 Esc 关闭后重新判断场景")
+                escape()
+            survey_consecutive = 0
+            previous_state = ScreenState.UNKNOWN
+            consecutive = 0
+            time.sleep(0.8)
+            continue
+
+        # Starting/restarting the bot while the battle-type picker is already
+        # open used to leave the lifecycle observer waiting for five minutes:
+        # the picker is intentionally neither PORT nor BATTLE.  Recover it as
+        # its own stable scene and click only an OCR-located supported card.
+        # This branch remains behind the global pause gate above, so it cannot
+        # steal focus or send input during user intervention.
+        try:
+            selector_open = in_battle_type_selector(image, backend=backend)
+        except Exception:
+            logger.debug("战斗模式选择页识别失败", exc_info=True)
+            selector_open = False
+        selector_consecutive = (
+            selector_consecutive + 1 if selector_open else 0
+        )
+        if selector_consecutive >= 2:
+            requested_mode = (
+                os.environ.get("WOWS_MODE", "asymmetric").strip().lower()
+                or "asymmetric"
+            )
+            if operation_paused(bot):
+                time.sleep(0.15)
+                continue
+            if select_mode_from_screen(
+                bot.hwnd,
+                requested_mode,
+                image=image,
+                backend=backend,
+            ):
+                logger.info(
+                    "启动恢复：已在模式选择页点击目标模式 %s，等待返回港口复核",
+                    requested_mode,
+                )
+            else:
+                logger.warning(
+                    "启动恢复：模式页未定位到目标卡片，按 Esc 返回港口后重试"
+                )
+                if not operation_paused(bot):
+                    escape = getattr(getattr(bot, "gamepad", None), "escape", None)
+                    if escape is not None:
+                        escape()
+            selector_consecutive = 0
+            previous_state = ScreenState.UNKNOWN
+            consecutive = 0
+            time.sleep(0.8)
+            continue
+
         if last_state == previous_state:
             consecutive += 1
         else:
@@ -280,7 +369,14 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
     if verified_state == ScreenState.UNKNOWN:
         raise SafetyFault("输入释放后无法确认游戏画面，自动自检未通过")
 
-    window_size = [rect[2] - rect[0], rect[3] - rect[1]]
+    # Steam first exposes a tiny transient WoWS surface (for example 202x56)
+    # before the DirectX client finishes maximizing. Persist the live client
+    # size observed at calibration time, never that stale launch rectangle.
+    try:
+        live_rect = get_client_rect(bot.hwnd)
+        window_size = [live_rect["width"], live_rect["height"]]
+    except Exception:
+        window_size = [rect[2] - rect[0], rect[3] - rect[1]]
     capture_backend = getattr(bot.vision.screen_capture, "last_backend", "unknown")
     record = InputCalibration(
         backend=configured_input_backend(),
@@ -458,6 +554,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
             bot.hwnd,
             mode,
             vision=bot.vision,
+            backend=getattr(getattr(bot, "distance_reader", None), "backend", None),
             should_abort=port_action_paused,
         ):
             logger.warning("未能安全选择目标战斗模式")
@@ -607,6 +704,7 @@ def run_battle(
     quick_seconds=300.0,
 ):
     intervention = getattr(bot, "intervention", None)
+    resume_motion_reasserted = False
     while intervention is not None:
         # Poll before the first focus/capture. A player who is already using
         # the keyboard must not have the game raised behind their input.
@@ -637,6 +735,28 @@ def run_battle(
         if classify_runtime_screen(bot, control_frame) != ScreenState.BATTLE:
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
             return "resume_state"
+        # Resuming an already-active battle bypasses ``wait_for_battle``, so it
+        # also bypassed that function's first-HUD full-speed command. This was
+        # especially visible after scene recovery: the bot spent several
+        # seconds trying M-map autopilot while the telegraph remained STOP.
+        # Reassert propulsion immediately unless the game already confirms a
+        # native autopilot route; W would cancel that route.
+        if resume_existing:
+            autopilot_visible = False
+            detector = getattr(bot.vision, "is_autopilot_enabled", None)
+            if detector is not None:
+                try:
+                    autopilot_visible = bool(detector(control_frame))
+                except Exception:
+                    autopilot_visible = False
+            if not autopilot_visible:
+                reassert = getattr(bot.gamepad, "reassert_full_speed", None)
+                if reassert is not None:
+                    reassert()
+                else:
+                    bot.gamepad.full_speed()
+                resume_motion_reasserted = True
+                logger.info("恢复战斗 HUD 已确认，先立即重发全速前进，再配置航线")
     preconfigured_autopilot = bool(
         getattr(bot, "_opening_autopilot_preconfigured", False)
     )
@@ -698,11 +818,12 @@ def run_battle(
             enable_center_route(
                 "战术地图自动航行设置失败，通用驾驶向地图中央接管"
             )
-        reassert = getattr(bot.gamepad, "reassert_full_speed", None)
-        if reassert is not None:
-            reassert()
-        else:
-            bot.gamepad.full_speed()
+        if not resume_motion_reasserted:
+            reassert = getattr(bot.gamepad, "reassert_full_speed", None)
+            if reassert is not None:
+                reassert()
+            else:
+                bot.gamepad.full_speed()
     # Do not reset intervention state here. The monitor already distinguishes
     # injected keyboard ticks, while reset() would erase a real user keypress
     # that arrived during tactical-map setup and leak later commands.
@@ -781,13 +902,44 @@ def run_battle(
             logger.warning("游戏前台切换尚未完成；跳过本帧控制并重试")
             time.sleep(0.5)
             continue
+        if bool(getattr(bot, "autopilot_retry_pending", False)):
+            # A confirmed loss before reaching the stored destination gets
+            # one bounded native-map recovery cycle. The helper itself clicks
+            # three progressively farther, enemy-biased destinations. Q/E is
+            # forbidden throughout this cycle and begins only next frame if
+            # all three verification checks fail.
+            if operation_paused(bot):
+                continue
+            logger.warning(
+                "原生自动航行提前失效，开始三次敌方方向航点重试；期间禁止Q/E"
+            )
+            if configure_opening_autopilot(bot, retrying=True):
+                logger.info("原生自动航行重建成功，继续保持Q/E互锁")
+            elif operation_paused(bot):
+                # The retry request remains pending and will resume only after
+                # the user releases the keyboard/Web pause.
+                continue
+            else:
+                setattr(bot, "autopilot_retry_pending", False)
+                enable_center_route = getattr(
+                    bot, "enable_generic_center_route", None
+                )
+                if enable_center_route is not None:
+                    enable_center_route(
+                        "原生自动航行三次敌方偏移重试均失败，Q/E小地图驾驶接管"
+                    )
+                logger.warning(
+                    "三次自动航点重试均未生效；下一控制帧启用Q/E小地图驾驶"
+                )
+            continue
         if tick_result == "ended":
             if quick_battle:
                 # Quick battles never wait on or OCR the result page.  Whether
                 # the five-minute limit ended the battle or the ship was sunk,
                 # Esc immediately returns to port and the next loop queues a
-                # fresh battle without touching task totals.
-                logger.info("快速战斗已离开战斗 HUD，立即回港重开；不统计收益")
+                # fresh battle.  The lifecycle counts it toward plan progress
+                # after this positively identified battle loop returns.
+                logger.info("快速战斗已离开战斗 HUD，立即回港；计入计划局数但不统计收益")
                 return "quick_ended"
             break
         last_analysis = getattr(bot, "last_analysis", None)
@@ -839,7 +991,7 @@ def tactical_map_local_point(
     )
 
 
-def configure_opening_autopilot(bot: BattleBot) -> bool:
+def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bool:
     """Set one game-native autopilot destination on the tactical map."""
     toggle_map = getattr(bot.gamepad, "toggle_tactical_map", None)
     enable = getattr(bot, "enable_opening_autopilot", None)
@@ -852,18 +1004,62 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
         height, width = image.shape[:2]
         # A/B/C/D circle detection is retained for the radar only.  Maps have
         # different layouts and a false circle must never redirect the opening
-        # route.  Map centre is the invariant, safe initial objective.
+        # route.  The stable opening vector runs from the player's spawn,
+        # through the map centre, and onward into the enemy half.
         normalized_target = (0.5, 0.5)
         player_normalized = None
-        minimap = bot.vision.find_minimap(image)
-        if minimap is not None:
-            pose = bot.vision.find_player_pose_on_minimap(minimap)
-            if pose is not None:
-                player_normalized = (
-                    pose.position[0] / max(minimap.shape[1], 1),
-                    pose.position[1] / max(minimap.shape[0], 1),
-                )
-        target_label = "地图中心"
+        # A far-side target is meaningful only relative to the live white
+        # player arrow.  Sample a few fresh frames because the marker can be
+        # briefly covered by loading/friendly labels.  If it still cannot be
+        # found, fail over to closed-loop minimap steering instead of clicking
+        # the geometric centre and creating the short route reported by users.
+        for pose_attempt in range(3):
+            minimap = bot.vision.find_minimap(image)
+            if minimap is not None:
+                pose = bot.vision.find_player_pose_on_minimap(minimap)
+                if pose is not None:
+                    player_normalized = (
+                        pose.position[0] / max(minimap.shape[1], 1),
+                        pose.position[1] / max(minimap.shape[0], 1),
+                    )
+                    break
+            if pose_attempt < 2:
+                time.sleep(0.15)
+                image = bot.vision.grab(bot.hwnd, allow_stale=True)
+                if classify_runtime_screen(bot, image) != ScreenState.BATTLE:
+                    return False
+                height, width = image.shape[:2]
+        if player_normalized is None:
+            logger.warning(
+                "连续三帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管"
+            )
+            return False
+        enemy_bias = None
+        if retrying:
+            minimap_analyzer = getattr(bot.vision, "analyze_minimap", None)
+            if minimap_analyzer is not None and minimap is not None:
+                try:
+                    enemies, _torpedoes = minimap_analyzer(minimap)
+                except Exception:
+                    enemies = []
+                if 1 <= len(enemies) <= 16:
+                    px, py = player_normalized
+                    direction = (0.5 - px, 0.5 - py)
+                    # Prefer the red contact farthest along the player's
+                    # spawn-to-centre attack axis. It nudges the route toward
+                    # the enemy half without following a contact behind us.
+                    enemy = max(
+                        enemies,
+                        key=lambda point: (
+                            (point[0] / max(minimap.shape[1], 1) - px) * direction[0]
+                            + (point[1] / max(minimap.shape[0], 1) - py) * direction[1]
+                        ),
+                    )
+                    enemy_bias = (
+                        enemy[0] / max(minimap.shape[1], 1),
+                        enemy[1] / max(minimap.shape[0], 1),
+                    )
+        target_label = "敌方方向重试航点" if retrying else "地图中心敌方远端"
         rect = get_client_rect(bot.hwnd)
         verify_autopilot = getattr(bot.vision, "is_autopilot_enabled", None)
         accepted = False
@@ -878,21 +1074,34 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
                     mark_pause()
                 logger.info("用户键盘介入，取消本次自动航行设置")
                 return False
-            # Retry farther along the player-to-centre ray.  The first point
-            # is a safe central approach, then every retry advances deeper
-            # toward the centre with a small lateral variation.  This avoids
-            # repeatedly clicking an ignored target while never following a
-            # false capture-circle detection.
+            # Every attempt is beyond the centre on the spawn-to-centre ray.
+            # Retrying advances still farther into the enemy half, matching
+            # the game's native route semantics without trusting unstable
+            # capture-circle or main-viewport detections.
             attempt_target = normalized_target
             if player_normalized is not None:
-                progress = (0.70, 0.86, 1.00)[attempt]
+                progress = (
+                    (1.55, 1.75, 1.90)
+                    if retrying
+                    else (1.45, 1.65, 1.85)
+                )[attempt]
                 dx = 0.5 - player_normalized[0]
                 dy = 0.5 - player_normalized[1]
-                lateral = random.uniform(-0.018, 0.018) if attempt < 2 else 0.0
+                lateral = (
+                    0.0
+                    if enemy_bias is not None
+                    else random.uniform(-0.018, 0.018) if attempt < 2 else 0.0
+                )
                 attempt_target = (
                     max(0.08, min(0.92, player_normalized[0] + dx * progress - dy * lateral)),
                     max(0.08, min(0.92, player_normalized[1] + dy * progress + dx * lateral)),
                 )
+                if enemy_bias is not None:
+                    weight = (0.16, 0.22, 0.28)[attempt]
+                    attempt_target = (
+                        max(0.08, min(0.92, attempt_target[0] * (1.0 - weight) + enemy_bias[0] * weight)),
+                        max(0.08, min(0.92, attempt_target[1] * (1.0 - weight) + enemy_bias[1] * weight)),
+                    )
             local_x, local_y = tactical_map_local_point(
                 width, height, attempt_target
             )
@@ -942,7 +1151,7 @@ def configure_opening_autopilot(bot: BattleBot) -> bool:
                 accepted = True
                 break
             logger.warning(
-                "战术地图落点未出现自动驾驶标识，向地图中心更远处重试 %s/3",
+                "战术地图落点未出现自动驾驶标识，向敌方远端继续延伸 %s/3",
                 attempt + 1,
             )
         if not accepted:
@@ -1114,6 +1323,18 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
             time.sleep(0.5)
             continue
         state = classify_runtime_screen(bot, image)
+        backend = getattr(
+            getattr(bot, "distance_reader", None), "backend", None
+        )
+        if is_battle_survey_page(image, backend=backend):
+            if operation_paused(bot):
+                return False
+            escape = getattr(getattr(bot, "gamepad", None), "escape", None)
+            if escape is not None:
+                logger.info("检测到战斗评价页面，按 Esc 关闭并继续回港检查")
+                escape()
+            time.sleep(0.8)
+            continue
         if state == ScreenState.PORT:
             logger.info("已返回港口")
             return True
@@ -1961,12 +2182,28 @@ def run():
                 if battle_finished:
                     battle_recovery_failures = 0
 
-            if battle_finished in {"quick_timeout", "quick_death", "quick_ended"}:
+            if battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
+                # A quick battle deliberately leaves before the ordinary
+                # settlement lifecycle, so its plan progress cannot depend on
+                # a results page.  Reaching this branch already requires a
+                # positively identified battle HUD and one of three independent
+                # completion signals: five-minute timeout, numeric HP=0, or a
+                # stable natural battle-end surface.  Count the round for run
+                # scheduling, but explicitly skip reward/history persistence.
+                completed_rounds = count_quick_battle_for_plan(
+                    completed_rounds,
+                    battle_finished,
+                )
+                battle_observed_in_run = False
                 reporter.update(
                     "returning",
-                    "快速战斗结束，正在 Esc 返回港口并重新开局；本局不统计收益",
+                    "快速战斗已计入计划局数，正在 Esc 返回港口；本局不统计收益",
                     current_round=current_round,
                     completed_rounds=completed_rounds,
+                    rewards_status="skipped",
+                    rewards_round=0,
+                    last_rewards={},
+                    last_outcome="unknown",
                 )
                 escape = getattr(bot.gamepad, "escape", None)
                 if escape is not None:
@@ -1974,6 +2211,27 @@ def run():
                     time.sleep(0.8)
                 return_to_port(bot, attempts=5)
                 port_configured = False
+                if should_stop():
+                    reporter.update(
+                        "completed",
+                        "快速战斗计划已完成",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        rewards_status="skipped",
+                        rewards_round=0,
+                        last_rewards={},
+                        movement_mode="idle",
+                        movement_reason="计划已完成，控制已安全释放",
+                        route_phase="unplanned",
+                        route_progress=0.0,
+                        route_waypoint=0,
+                        route_arrived=False,
+                        inside_capture_point=False,
+                        paused_by_user=False,
+                        manual_intervention_active=False,
+                        manual_intervention_latched=False,
+                    )
+                    return 0
                 continue
             if not battle_finished:
                 if user_stop_requested():

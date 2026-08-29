@@ -344,8 +344,47 @@ def _mode_header_scores(image):
     }
 
 
-def detect_port_mode(image):
-    """Classify the selected PvE mode from its port-header emblem."""
+def _detect_port_mode_ocr(image, backend):
+    """Read the exact current-mode label from the port header.
+
+    Random and co-op emblems share enough desaturated teal pixels that colour
+    alone can confuse them. The visible Chinese label is unambiguous, so a
+    configured OCR backend is authoritative and deliberately fails closed.
+    """
+    if image is None or image.size == 0 or backend is None:
+        return None
+    height, width = image.shape[:2]
+    header = image[
+        : max(1, int(height * 0.075)),
+        int(width * 0.525) : int(width * 0.680),
+    ]
+    if header.size == 0:
+        return None
+    try:
+        tokens = backend.recognize(header)
+    except Exception:
+        logger.exception("港口战斗模式 OCR 失败")
+        return None
+    text = "".join(
+        unicodedata.normalize("NFKC", str(token.text or ""))
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.65
+    ).replace(" ", "")
+    if "非对称战斗" in text or "非对称作战" in text:
+        return "asymmetric"
+    if "联合作战" in text:
+        return "cooperative"
+    if "随机战" in text:
+        # Random is intentionally not an automation target. Returning it here
+        # makes the mismatch explicit instead of silently treating it as co-op.
+        return "random"
+    return None
+
+
+def detect_port_mode(image, backend=None):
+    """Classify the selected mode, preferring the exact visible label."""
+    if backend is not None:
+        return _detect_port_mode_ocr(image, backend)
     scores = _mode_header_scores(image)
     if scores["asymmetric"] >= 0.018:
         return "asymmetric"
@@ -385,7 +424,73 @@ def _find_asymmetric_card(image):
     return candidates[0][1], candidates[0][2]
 
 
-def in_battle_type_selector(image):
+def _selector_title_seen(image, backend) -> bool:
+    if image is None or image.size == 0 or backend is None:
+        return False
+    height, width = image.shape[:2]
+    heading = image[
+        : max(1, int(height * 0.13)),
+        int(width * 0.20) : int(width * 0.80),
+    ]
+    try:
+        tokens = backend.recognize(heading)
+    except Exception:
+        logger.exception("战斗类型页面标题 OCR 失败")
+        return False
+    text = "".join(
+        unicodedata.normalize("NFKC", str(token.text or ""))
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.65
+    ).replace(" ", "")
+    return "选择一种战斗模式" in text
+
+
+def is_battle_survey_page(image, backend=None) -> bool:
+    """Recognize the optional post-battle satisfaction survey by OCR.
+
+    The dialog is deliberately not detected from its dark backdrop or button
+    colours: both are common on loading and confirmation pages.  Production
+    therefore requires the survey-specific question plus either its Close
+    action or multiple satisfaction choices before Esc recovery is allowed.
+    """
+    if image is None or image.size == 0 or backend is None:
+        return False
+    height, width = image.shape[:2]
+    dialog = image[
+        int(height * 0.24) : int(height * 0.62),
+        int(width * 0.24) : int(width * 0.76),
+    ]
+    try:
+        tokens = backend.recognize(dialog)
+    except Exception:
+        logger.debug("战斗评价页面 OCR 失败", exc_info=True)
+        return False
+    try:
+        tokens = list(tokens or [])
+    except TypeError:
+        logger.debug("战斗评价页面 OCR 返回了非序列结果")
+        return False
+    text = "".join(
+        unicodedata.normalize("NFKC", str(token.text or ""))
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.60
+    ).replace(" ", "")
+    question_seen = (
+        "满意度如何" in text
+        or (
+            "刚刚进行" in text
+            and "这场战斗" in text
+            and "满意" in text
+        )
+    )
+    choice_hits = sum(
+        label in text
+        for label in ("非常不满意", "不满意", "一般", "满意", "非常满意")
+    )
+    return bool(question_seen and ("关闭" in text or choice_hits >= 2))
+
+
+def in_battle_type_selector(image, backend=None):
     """Confirm that the full battle-type card page is still open.
 
     The old port-header colour check also returned ``cooperative`` on this
@@ -393,6 +498,12 @@ def in_battle_type_selector(image):
     The asymmetric purple card is a stable page-specific anchor and is absent
     from normal port screenshots.
     """
+    if backend is not None:
+        # Production has OCR available.  Fail closed on the exact page title
+        # instead of allowing a purple carousel/commander tile in port to be
+        # mistaken for the selector.  The colour anchor remains only for
+        # fixture/legacy callers that explicitly have no OCR backend.
+        return _selector_title_seen(image, backend)
     point = _find_asymmetric_card(image)
     if point is None:
         return False
@@ -406,26 +517,73 @@ def in_battle_type_selector(image):
     )
 
 
-def select_mode_from_screen(hwnd, requested_mode, image=None):
+def _find_mode_card_from_ocr(image, requested_mode, backend):
+    """Locate the requested card by its rendered label at any UI scale."""
+    if image is None or image.size == 0 or backend is None:
+        return None
+    height, width = image.shape[:2]
+    left, top = int(width * 0.18), int(height * 0.20)
+    right, bottom = int(width * 0.82), int(height * 0.68)
+    cards = image[top:bottom, left:right]
+    aliases = (
+        ("联合作战",)
+        if requested_mode == "cooperative"
+        else ("非对称战斗", "非对称作战")
+    )
+    try:
+        tokens = backend.recognize(cards)
+    except Exception:
+        logger.exception("战斗类型卡片 OCR 失败")
+        return None
+    candidates = []
+    for token in tokens:
+        if float(getattr(token, "confidence", 0.0)) < 0.70:
+            continue
+        text = unicodedata.normalize("NFKC", str(token.text or "")).replace(" ", "")
+        if not any(alias in text for alias in aliases):
+            continue
+        box = tuple(getattr(token, "box", ()) or ())
+        if len(box) < 2:
+            continue
+        center_x = left + int(round(sum(point[0] for point in box) / len(box)))
+        center_y = top + int(round(sum(point[1] for point in box) / len(box)))
+        candidates.append((float(token.confidence), center_x, center_y))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
+def select_mode_from_screen(hwnd, requested_mode, image=None, backend=None):
     """Select one of the two supported PvE cards on the opened menu."""
     image = image if image is not None else _capture(hwnd)
-    if not in_battle_type_selector(image):
+    if not in_battle_type_selector(image, backend=backend):
         logger.warning("未确认战斗模式选择页，拒绝按固定卡片位置点击")
         return False
     height, width = image.shape[:2]
-    if requested_mode == "cooperative":
-        point = BATTLE_TYPE_COOPERATIVE_CARD.center(width, height)
-    else:
-        point = _find_asymmetric_card(image)
-        if point is None:
-            logger.warning("未在战斗类型页识别到非对称作战紫色徽标")
-            return False
+    point = _find_mode_card_from_ocr(image, requested_mode, backend)
+    if backend is not None and point is None:
+        logger.warning("模式选择页 OCR 未定位到目标卡片: %s", requested_mode)
+        return False
+    if point is None:
+        if requested_mode == "cooperative":
+            point = BATTLE_TYPE_COOPERATIVE_CARD.center(width, height)
+        else:
+            point = _find_asymmetric_card(image)
+            if point is None:
+                logger.warning("未在战斗类型页识别到非对称作战紫色徽标")
+                return False
     logger.info("按截图定位战斗模式 %s: local=%s", requested_mode, point)
     return _click_local(hwnd, point)
 
 
 def ensure_requested_mode(
-    hwnd=None, requested_mode="asymmetric", vision=None, *, should_abort=None
+    hwnd=None,
+    requested_mode="asymmetric",
+    vision=None,
+    *,
+    backend=None,
+    should_abort=None,
 ):
     """Select the configured mode and verify it again after returning to port."""
     requested_mode = (requested_mode or "asymmetric").strip().lower()
@@ -437,8 +595,12 @@ def ensure_requested_mode(
         if _operation_paused(should_abort):
             return False
         image = _capture(hwnd)
-        selector_open = in_battle_type_selector(image)
-        current = None if selector_open else detect_port_mode(image)
+        selector_open = in_battle_type_selector(image, backend=backend)
+        current = (
+            None
+            if selector_open
+            else detect_port_mode(image, backend=backend)
+        )
         logger.info(
             "模式校验 (%s/3): 页面=%s 当前=%s 目标=%s",
             attempt,
@@ -464,13 +626,18 @@ def ensure_requested_mode(
                 continue
             time.sleep(1.0)
             image = _capture(hwnd)
-            selector_open = in_battle_type_selector(image)
+            selector_open = in_battle_type_selector(image, backend=backend)
 
         if not selector_open:
             logger.warning("点击港口右侧模式入口后，未确认模式选择页")
             time.sleep(0.5)
             continue
-        if not select_mode_from_screen(hwnd, requested_mode, image=image):
+        if not select_mode_from_screen(
+            hwnd,
+            requested_mode,
+            image=image,
+            backend=backend,
+        ):
             time.sleep(0.5)
             continue
 
@@ -483,11 +650,11 @@ def ensure_requested_mode(
             if _operation_paused(should_abort):
                 return False
             confirmation = _capture(hwnd)
-            if in_battle_type_selector(confirmation):
+            if in_battle_type_selector(confirmation, backend=backend):
                 continue
             if vision.classify_screen(confirmation) != ScreenState.PORT:
                 continue
-            selected = detect_port_mode(confirmation)
+            selected = detect_port_mode(confirmation, backend=backend)
             if selected == requested_mode:
                 logger.info("模式选择完成并通过港口复核: %s", requested_mode)
                 return True

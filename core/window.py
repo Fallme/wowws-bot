@@ -3,6 +3,9 @@
 import ctypes
 import ctypes.wintypes
 import logging
+import os
+from pathlib import Path
+import re
 import time
 
 import win32con
@@ -11,8 +14,111 @@ import win32process
 
 
 logger = logging.getLogger("window")
-GAME_WINDOW_TOKENS = ("world of warships", "战舰世界", "wows")
+DEFAULT_GAME_PROCESS_NAMES = frozenset(
+    {
+        "worldofwarships.exe",
+        "worldofwarships64.exe",
+        "worldofwarships32.exe",
+    }
+)
 _INTERACTION_PAUSE_GUARD = None
+
+
+def configured_game_process_names() -> frozenset[str]:
+    """Return exact executable names allowed to own the game window.
+
+    ``WOWS_GAME_PROCESS_NAMES`` can add regional/custom client names separated
+    by commas or semicolons.  Window titles are deliberately not used: a video,
+    browser tab or media player can contain "World of Warships" in its title.
+    """
+
+    configured = os.environ.get("WOWS_GAME_PROCESS_NAMES", "")
+    additions = {
+        Path(value.strip().strip('"')).name.lower()
+        for value in re.split(r"[,;]", configured)
+        if value.strip()
+    }
+    return frozenset(DEFAULT_GAME_PROCESS_NAMES | additions)
+
+
+def window_process_identity(hwnd) -> tuple[int, str, str]:
+    """Return ``(pid, executable_name, executable_path)`` for one HWND.
+
+    Process lookup is fail-closed.  Automation must never focus or send input
+    to an unverified window merely because its title resembles the game.
+    """
+
+    if not hwnd:
+        return 0, "", ""
+    process_handle = 0
+    try:
+        _thread_id, process_id = win32process.GetWindowThreadProcessId(int(hwnd))
+        process_id = int(process_id or 0)
+        if not process_id:
+            return 0, "", ""
+        kernel32 = ctypes.windll.kernel32
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        ]
+        open_process.restype = ctypes.wintypes.HANDLE
+        query_image = kernel32.QueryFullProcessImageNameW
+        query_image.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.LPWSTR,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        ]
+        query_image.restype = ctypes.wintypes.BOOL
+        process_handle = open_process(
+            0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            process_id,
+        )
+        if not process_handle:
+            return process_id, "", ""
+        capacity = 32768
+        buffer = ctypes.create_unicode_buffer(capacity)
+        size = ctypes.wintypes.DWORD(capacity)
+        if not query_image(
+            process_handle,
+            0,
+            buffer,
+            ctypes.byref(size),
+        ):
+            return process_id, "", ""
+        executable_path = buffer.value.strip()
+        return process_id, Path(executable_path).name.lower(), executable_path
+    except Exception:
+        logger.debug("无法读取窗口进程身份: hwnd=%s", hwnd, exc_info=True)
+        return 0, "", ""
+    finally:
+        if process_handle:
+            try:
+                close_handle = ctypes.windll.kernel32.CloseHandle
+                close_handle.argtypes = [ctypes.wintypes.HANDLE]
+                close_handle.restype = ctypes.wintypes.BOOL
+                close_handle(process_handle)
+            except Exception:
+                pass
+
+
+def is_game_process_window(hwnd) -> bool:
+    process_id, executable_name, executable_path = window_process_identity(hwnd)
+    matched = bool(
+        process_id and executable_name in configured_game_process_names()
+    )
+    logger.debug(
+        "窗口进程校验: hwnd=%s pid=%s exe=%s path=%s matched=%s",
+        hwnd,
+        process_id,
+        executable_name or "unknown",
+        executable_path or "unknown",
+        matched,
+    )
+    return matched
 
 
 def set_interaction_pause_guard(guard=None) -> None:
@@ -185,14 +291,13 @@ def maximize_game_window(hwnd) -> bool:
 
 
 def is_game_window(hwnd) -> bool:
-    """Return whether ``hwnd`` is a visible World of Warships window."""
+    """Return whether ``hwnd`` is visible and owned by the game process."""
     if not hwnd:
         return False
     try:
         if not win32gui.IsWindow(int(hwnd)) or not win32gui.IsWindowVisible(int(hwnd)):
             return False
-        title = win32gui.GetWindowText(int(hwnd)).strip().lower()
-        return any(token in title for token in GAME_WINDOW_TOKENS)
+        return is_game_process_window(int(hwnd))
     except Exception:
         return False
 
@@ -220,14 +325,14 @@ def ensure_game_window_foreground(hwnd) -> bool:
 
 
 def find_game_window():
-    """Return visible matching windows as ``(hwnd, title, rect)`` tuples."""
+    """Return visible game-process windows as ``(hwnd, title, rect)`` tuples."""
     result = []
 
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
             return True
-        title = win32gui.GetWindowText(hwnd)
-        if any(target in title.lower() for target in GAME_WINDOW_TOKENS):
+        if is_game_process_window(hwnd):
+            title = win32gui.GetWindowText(hwnd)
             rect = get_window_rect(hwnd)
             result.append(
                 (
@@ -239,6 +344,15 @@ def find_game_window():
         return True
 
     win32gui.EnumWindows(callback, None)
+    # A DirectX client can briefly expose more than one visible top-level
+    # surface while changing display modes.  The rendering window is the
+    # largest one; keep it first so lifecycle binding never selects a small
+    # helper/dialog owned by the same verified process.
+    result.sort(
+        key=lambda item: max(0, item[2][2] - item[2][0])
+        * max(0, item[2][3] - item[2][1]),
+        reverse=True,
+    )
     return result
 
 

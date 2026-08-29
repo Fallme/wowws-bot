@@ -94,6 +94,18 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.BATTLE,
         )
 
+    def test_muted_ocean_battle_wins_over_false_blue_exit_button(self):
+        image = cv2.imread(
+            str(self.FIXTURE_ROOT / "live_battle_muted_hud.jpg")
+        )
+        self.assertIsNotNone(image)
+        # This real frame previously matched the blue confirmation-button ROI
+        # because open sea filled that whole crop. Its independent HUD anchors
+        # must keep the active match in BATTLE.
+        self.assertTrue(self.vision.in_exit_confirmation(image))
+        self.assertTrue(self.vision._has_battle_hud(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.BATTLE)
+
     def test_battle_remains_actionable_when_player_hud_is_temporarily_obscured(self):
         image = cv2.imread(
             str(

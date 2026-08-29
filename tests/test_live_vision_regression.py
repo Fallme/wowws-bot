@@ -360,22 +360,49 @@ def test_no_commander_detector_requires_confirm_button():
     assert not Vision().in_no_commander_confirmation(image)
 
 
-def test_hazard_icons_are_read_from_lower_left_ship_status_only():
+def test_fire_requires_both_ship_model_and_consumable_status_anchors():
     image = np.zeros((1600, 2560, 3), dtype=np.uint8)
     # Old centre-screen false positive: two orange target/tracer fragments.
     image[790:810, 1260:1280] = (0, 145, 255)
     image[820:840, 1300:1320] = (0, 145, 255)
     assert not Vision().is_on_fire(image)
 
-    # Verified fire marker position beside the numeric HP/ship silhouette.
-    image[1220:1232, 160:174] = (0, 145, 255)
-    image[1240:1252, 178:192] = (0, 145, 255)
-    assert Vision().is_on_fire(image)
+    fire = cv2.imread(str(Path("tests") / "fixtures" / "fire_dual_anchor.jpg"))
+    assert fire is not None
+    vision = Vision()
+    assert vision.is_on_fire(fire)
 
-    flood = np.zeros_like(image)
-    flood[1320:1332, 158:172] = (255, 120, 0)
-    flood[1340:1352, 178:192] = (255, 120, 0)
+    height, width = fire.shape[:2]
+    without_left_anchor = fire.copy()
+    without_left_anchor[
+        int(height * 0.865) : int(height * 0.930),
+        int(width * 0.025) : int(width * 0.105),
+    ] = 0
+    assert not vision.is_on_fire(without_left_anchor)
+
+    without_center_anchor = fire.copy()
+    without_center_anchor[
+        int(height * 0.815) : int(height * 0.905),
+        int(width * 0.470) : int(width * 0.540),
+    ] = 0
+    assert not vision.is_on_fire(without_center_anchor)
+
+
+def test_flooding_requires_blue_icons_below_health_and_above_consumables():
+    flood = np.zeros((1600, 2560, 3), dtype=np.uint8)
+    # One compact blue icon below the numeric HP block.
+    flood[1300:1318, 150:172] = (255, 120, 0)
+    # The matching central condition icon above the consumable bar.
+    flood[1340:1364, 1270:1296] = (255, 120, 0)
     assert Vision().is_flooding(flood)
+
+    left_only = flood.copy()
+    left_only[1304:1400, 1203:1382] = 0
+    assert not Vision().is_flooding(left_only)
+
+    center_only = flood.copy()
+    center_only[1264:1400, 64:307] = 0
+    assert not Vision().is_flooding(center_only)
 
 
 def test_island_aware_waypoint_bends_only_a_blocked_minimap_route():

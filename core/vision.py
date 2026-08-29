@@ -1573,44 +1573,103 @@ class Vision:
         )
 
     def is_on_fire(self, image):
-        """Detect the fire marker beside the lower-left numeric health HUD."""
-        height, width = image.shape[:2]
-        # The actual player-condition indicator is attached to the ship/health
-        # block in the lower left.  The former centre-screen ROI repeatedly
-        # mistook shell tracers, target markers and capture timers for fire.
-        status = image[
-            int(height * 0.748) : int(height * 0.807),
-            int(width * 0.040) : int(width * 0.098),
-        ]
-        if status.size == 0:
-            return False
-        hsv = cv2.cvtColor(status, cv2.COLOR_BGR2HSV)
-        orange = cv2.inRange(
-            hsv, np.array([0, 150, 130]), np.array([25, 255, 255])
-        )
-        labels, _, stats, _ = cv2.connectedComponentsWithStats(
-            orange, connectivity=8
-        )
-        if labels <= 1:
-            return False
-        areas = sorted(
-            (int(value) for value in stats[1:, cv2.CC_STAT_AREA]),
-            reverse=True,
-        )
-        # The verified live fire frame contains the flame outline and its
-        # interior as two compact components.  Requiring both rejects the
-        # thin orange HP remainder seen after sinking.
-        compact = [area for area in areas if 18 <= area <= 650]
-        return len(compact) >= 2 and sum(compact[:4]) >= 95
+        """Confirm fire from both dedicated battle-HUD indicators.
 
-    def is_flooding(self, image):
-        """Detect the flooding marker below the lower-left ship condition HUD."""
+        The lower-left ship-condition model shows one compact flame marker per
+        active fire, while the consumable/status strip shows a wide triangular
+        fire warning.  Requiring both prevents viewport flames, shell tracers,
+        HP decoration, port icons and capture markers from triggering R.
+        """
         if image is None or image.size == 0:
             return False
         height, width = image.shape[:2]
+        pixel_scale = max((width * height) / float(2560 * 1436), 0.20)
+        linear_scale = math.sqrt(pixel_scale)
+
+        def orange_components(x1, y1, x2, y2):
+            crop = image[
+                int(height * y1) : int(height * y2),
+                int(width * x1) : int(width * x2),
+            ]
+            if crop.size == 0:
+                return []
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            orange = cv2.inRange(
+                hsv,
+                np.array([0, 110, 110]),
+                np.array([40, 255, 255]),
+            )
+            labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                orange, connectivity=8
+            )
+            return [
+                (
+                    int(stats[index, cv2.CC_STAT_AREA]),
+                    int(stats[index, cv2.CC_STAT_WIDTH]),
+                    int(stats[index, cv2.CC_STAT_HEIGHT]),
+                )
+                for index in range(1, labels)
+            ]
+
+        left_flames = [
+            (area, component_width, component_height)
+            for area, component_width, component_height in orange_components(
+                0.025, 0.865, 0.105, 0.930
+            )
+            if 95 * pixel_scale <= area <= 500 * pixel_scale
+            and 0.55
+            <= component_width / max(component_height, 1)
+            <= 1.25
+            and 7 * linear_scale <= component_height <= 32 * linear_scale
+        ]
+        center_components = orange_components(0.470, 0.815, 0.540, 0.905)
+        center_warning_bodies = [
+            (area, component_width, component_height)
+            for area, component_width, component_height in center_components
+            if 100 * pixel_scale <= area <= 1200 * pixel_scale
+            and component_width >= 12 * linear_scale
+            and component_height >= 8 * linear_scale
+        ]
+        center_warning_bars = [
+            (area, component_width, component_height)
+            for area, component_width, component_height in center_components
+            if 30 * pixel_scale <= area <= 1200 * pixel_scale
+            and component_width >= component_height * 1.30
+            and component_width >= 16 * linear_scale
+        ]
+        center_warning = bool(
+            center_warning_bodies
+            and (
+                center_warning_bars
+                or any(
+                    component_width >= component_height * 1.30
+                    for _, component_width, component_height in center_warning_bodies
+                )
+            )
+        )
+        logger.debug(
+            "Fire HUD anchors: left=%s center_body=%s center_bar=%s",
+            left_flames,
+            center_warning_bodies,
+            center_warning_bars,
+        )
+        # One active fire produces one ship-model marker.  The second required
+        # anchor is the independent central warning, not a second fire stack.
+        return bool(left_flames) and center_warning
+
+    def is_flooding(self, image):
+        """Detect the blue flooding icon directly below the numeric HP HUD."""
+        if image is None or image.size == 0:
+            return False
+        height, width = image.shape[:2]
+        pixel_scale = max((width * height) / float(2560 * 1436), 0.20)
+        linear_scale = math.sqrt(pixel_scale)
+        # Flooding is represented in the fixed lower-left condition block.
+        # Keep the ROI away from the sea/viewport and do not infer flooding
+        # from water splashes around the rendered ship.
         status = image[
-            int(height * 0.807) : int(height * 0.875),
-            int(width * 0.040) : int(width * 0.098),
+            int(height * 0.790) : int(height * 0.875),
+            int(width * 0.025) : int(width * 0.120),
         ]
         if status.size == 0:
             return False
@@ -1625,12 +1684,55 @@ class Vision:
         )
         if labels <= 1:
             return False
-        areas = [int(value) for value in stats[1:, cv2.CC_STAT_AREA]]
-        # A blue ship/team marker cannot enter this dedicated lower-left ROI.
-        # Still require multiple compact pieces so compass decoration and one
-        # anti-aliased glyph do not trigger damage control.
-        compact = [area for area in areas if 14 <= area <= 520]
-        return len(compact) >= 2 and sum(compact) >= 55
+        left_icons = []
+        for index in range(1, labels):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            aspect = component_width / max(component_height, 1)
+            if (
+                30 * pixel_scale <= area <= 900 * pixel_scale
+                and 4 * linear_scale <= component_width <= 55 * linear_scale
+                and 4 * linear_scale <= component_height <= 55 * linear_scale
+                and 0.40 <= aspect <= 1.50
+            ):
+                left_icons.append((area, component_width, component_height))
+
+        central_status = image[
+            int(height * 0.815) : int(height * 0.905),
+            int(width * 0.470) : int(width * 0.540),
+        ]
+        center_icons = []
+        if central_status.size:
+            center_hsv = cv2.cvtColor(central_status, cv2.COLOR_BGR2HSV)
+            center_blue = cv2.inRange(
+                center_hsv,
+                np.array([88, 110, 120]),
+                np.array([125, 255, 255]),
+            )
+            center_labels, _, center_stats, _ = cv2.connectedComponentsWithStats(
+                center_blue, connectivity=8
+            )
+            for index in range(1, center_labels):
+                area = int(center_stats[index, cv2.CC_STAT_AREA])
+                component_width = int(center_stats[index, cv2.CC_STAT_WIDTH])
+                component_height = int(center_stats[index, cv2.CC_STAT_HEIGHT])
+                aspect = component_width / max(component_height, 1)
+                if (
+                    45 * pixel_scale <= area <= 1200 * pixel_scale
+                    and 6 * linear_scale <= component_width <= 65 * linear_scale
+                    and 6 * linear_scale <= component_height <= 65 * linear_scale
+                    and 0.40 <= aspect <= 1.80
+                ):
+                    center_icons.append((area, component_width, component_height))
+        logger.debug(
+            "Flooding HUD anchors: left=%s center=%s",
+            left_icons,
+            center_icons,
+        )
+        # BattleBot additionally requires this icon on two consecutive
+        # frames before it exposes flooding or uses damage control.
+        return bool(left_icons and center_icons)
 
     @staticmethod
     def read_speed_knots(image, backend) -> float | None:
@@ -1786,13 +1888,14 @@ class Vision:
                 and metrics["minimap"]["edge"] > 0.025
             ),
             "player_name_health": (
-                metrics["player_name_health"]["std"] > 14
-                and metrics["player_name_health"]["edge"] > 0.04
-                and metrics["player_name_health"]["bright"] > 0.007
+                metrics["player_name_health"]["std"] > 18
+                and metrics["player_name_health"]["edge"] > 0.030
+                and metrics["player_name_health"]["bright"] > 0.005
             ),
             "consumables": (
-                metrics["consumables"]["std"] > 24
-                and metrics["consumables"]["edge"] > 0.035
+                metrics["consumables"]["std"] > 15
+                and metrics["consumables"]["edge"] > 0.030
+                and metrics["consumables"]["bright"] > 0.003
             ),
             "score_clock": (
                 metrics["score_clock"]["std"] > 10
@@ -1894,15 +1997,17 @@ class Vision:
         # explicit escape-menu rules.
         if loading_seen and self._is_login_splash(image):
             return ScreenState.LOADING
+        # A live HUD takes priority over the broad blue/teal modal colour
+        # candidates below. On low-contrast ocean maps the sea can fill the
+        # historical ``继续战斗`` button ROI and look like one solid blue
+        # component. The minimap plus two independent HUD anchors prevent that
+        # sea patch from ejecting an active battle into Esc recovery.
+        if battle_seen:
+            return ScreenState.BATTLE
         if self.in_exit_confirmation(image):
             return ScreenState.EXIT_CONFIRMATION
         if self.in_escape_menu(image):
             return ScreenState.ESCAPE_MENU
-        # Battle is deliberately the final actionable state.  ``_has_battle_hud``
-        # is a visual candidate only; lifecycle callers separately require
-        # consecutive battle frames before they issue combat controls.
-        if battle_seen:
-            return ScreenState.BATTLE
         if loading_seen:
             return ScreenState.LOADING
         return ScreenState.UNKNOWN

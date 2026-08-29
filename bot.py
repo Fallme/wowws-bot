@@ -330,6 +330,7 @@ class BattleBot:
         self.opening_autopilot_active = False
         self.opening_autopilot_target = ""
         self.opening_autopilot_target_normalized = None
+        self.autopilot_retry_pending = False
         self._tactical_map_left_open = False
         self.generic_center_route_active = False
         self.movement_feedback_failures = 0
@@ -409,6 +410,7 @@ class BattleBot:
         self._rudder_release_until = 0.0
         self._manual_intervention_active = False
         self._manual_intervention_latched = False
+        self.autopilot_retry_pending = False
         if not preserve_movement:
             self._battle_map_islands = []
             self._battle_capture_zones = []
@@ -540,6 +542,8 @@ class BattleBot:
         self.generic_center_route_active = False
         self.opening_autopilot_target = str(target or "地图中心")
         self.opening_autopilot_target_normalized = target_normalized
+        self.autopilot_retry_pending = False
+        self._autopilot_hud_samples.clear()
         self.last_movement_command = None
         self.last_movement_reason = (
             f"游戏自动航行已设定至{self.opening_autopilot_target}"
@@ -553,6 +557,15 @@ class BattleBot:
         self.generic_center_route_active = True
         self._last_movement_mode = None
         self.last_movement_reason = reason or "通用驾驶接管，驶向地图中央"
+
+    def request_autopilot_retry(self, reason: str = ""):
+        """Hold Q/E while the lifecycle retries the native map route."""
+        self.opening_autopilot_active = False
+        self.generic_center_route_active = False
+        self.autopilot_retry_pending = True
+        self.last_movement_command = None
+        self._last_movement_mode = "autopilot_retry"
+        self.last_movement_reason = reason or "原生自动航行失效，正在重新设置航点"
 
     def _apply_map_center_objective(self, analysis: BattleAnalysis):
         analysis.capture_point_bearing = analysis.map_center_bearing
@@ -1520,13 +1533,30 @@ class BattleBot:
             ):
                 self.feedback.reset()
                 self.movement_verified = False
-                self.enable_generic_center_route(
-                    "游戏自动航行已自然结束，通用驾驶按小地图向点位/中央接管"
+                arrived = bool(
+                    self.opening_autopilot_target_normalized is not None
+                    and analysis.minimap_player_normalized is not None
+                    and math.dist(
+                        self.opening_autopilot_target_normalized,
+                        analysis.minimap_player_normalized,
+                    )
+                    <= 0.085
                 )
-                self._apply_generic_objective(analysis)
-                logger.warning(
-                    "[SYSTEM] 自动航行已自然结束；本帧不发送任何驾驶指令，下一帧按小地图接管"
-                )
+                if arrived:
+                    self.enable_generic_center_route(
+                        "游戏自动航行已抵达敌方远端航点，通用驾驶按小地图接管"
+                    )
+                    self._apply_generic_objective(analysis)
+                    logger.info(
+                        "[SYSTEM] 自动航行已抵达航点；本帧不打舵，下一帧由小地图Q/E接管"
+                    )
+                else:
+                    self.request_autopilot_retry(
+                        "原生自动航行在抵达前失效，保持当前操舵并重试地图航点"
+                    )
+                    logger.warning(
+                        "[SYSTEM] 自动航行在抵达前失效；暂停Q/E，申请三次敌方偏移航点重试"
+                    )
                 return
             # Native autopilot is exclusive.  Enemy distance, island risk and
             # all other combat rules are observation-only until the game HUD
