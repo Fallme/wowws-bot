@@ -114,6 +114,11 @@ class SecondaryMovementController:
         self.secondary_inner_km = self._bounded(
             min(secondary_inner_km, self.secondary_target_km - 0.5), 3.0, 15.0
         )
+        # When the objective lies behind the current course, atan2 can jump
+        # between +pi and -pi on adjacent minimap frames.  Keep one turn side
+        # until the target is clearly ahead so Q/E cannot alternate into a
+        # broad rear-half circle.
+        self._objective_recovery_direction = 0
 
     @staticmethod
     def _bounded(value: float, minimum: float, maximum: float) -> float:
@@ -124,7 +129,7 @@ class SecondaryMovementController:
         return max(-limit, min(float(value), limit))
 
     def reset(self):
-        """The station-first controller is intentionally stateless."""
+        self._objective_recovery_direction = 0
 
     def _island_rudder(self, state: SecondaryMovementInput) -> float:
         rudder = state.island_avoidance_rudder
@@ -177,7 +182,38 @@ class SecondaryMovementController:
         inside_capture: bool,
     ) -> float:
         objective = self._objective_bearing(state)
-        enemy = self._forward_enemy_bearing(state) if pursue_enemy else None
+        objective_is_behind = bool(
+            objective is not None and abs(objective) >= 0.52
+        )
+        if objective_is_behind and not inside_capture:
+            if not self._objective_recovery_direction:
+                self._objective_recovery_direction = 1 if objective > 0 else -1
+            # A half-rudder correction cannot recover a battleship already
+            # steaming away from the objective.  Enemy markers are ignored
+            # until this fixed-side U-turn brings the target ahead again.
+            return 0.86 * self._objective_recovery_direction
+        if (
+            self._objective_recovery_direction
+            and not inside_capture
+            and objective is not None
+            and abs(objective) > 0.18
+        ):
+            return 0.76 * self._objective_recovery_direction
+        if objective is None or abs(objective) <= 0.18 or inside_capture:
+            self._objective_recovery_direction = 0
+
+        # Outside the objective, a red contact may bias the helm only when the
+        # fixed map objective is already in the forward cone.  This prevents a
+        # contact in the spawn half from pulling the ship farther backward.
+        enemy_allowed = bool(
+            pursue_enemy
+            and (
+                inside_capture
+                or objective is None
+                or abs(objective) <= 0.28
+            )
+        )
+        enemy = self._forward_enemy_bearing(state) if enemy_allowed else None
         if objective is None:
             bearing = enemy or 0.0
         elif enemy is None:
@@ -207,6 +243,23 @@ class SecondaryMovementController:
         if state.map_center_distance_km is not None:
             return f"地图中心约{state.map_center_distance_km:.1f}km"
         return "当前航向"
+
+    def _route_reason_prefix(self, state: SecondaryMovementInput) -> str:
+        objective = self._objective_bearing(state)
+        if (
+            not state.inside_capture_point
+            and objective is not None
+            and (
+                abs(objective) >= 0.52
+                or self._objective_recovery_direction
+            )
+        ):
+            return "检测到舰首背离中央点，锁定单侧硬舵回正"
+        return {
+            "departure": "离开出生点",
+            "transit": "沿预设航线驶向中央点",
+            "final_approach": "进入中央占领点",
+        }.get(state.route_phase, "驶向中央占领点")
 
     def plan(self, state: SecondaryMovementInput) -> MovementCommand:
         if state.elapsed < self.straight_opening_seconds:
@@ -264,11 +317,7 @@ class SecondaryMovementController:
                 inside_capture=False,
             )
             objective = self._objective_text(state)
-            phase_text = {
-                "departure": "离开出生点",
-                "transit": "沿预设航线驶向中央点",
-                "final_approach": "进入中央占领点",
-            }.get(state.route_phase, "驶向中央占领点")
+            phase_text = self._route_reason_prefix(state)
             return MovementCommand(
                 MovementMode.ROUTE_TRANSIT,
                 throttle=1.0,

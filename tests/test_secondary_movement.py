@@ -205,6 +205,43 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.throttle, 1.0)
         self.assertGreater(command.rudder, 0)
 
+    def test_rearward_objective_ignores_forward_contact_and_forces_uturn(self):
+        command = self.plan(
+            route_phase="transit",
+            route_arrived=False,
+            minimap_target_bearing=-0.10,
+            capture_point_bearing=0.90,
+        )
+
+        self.assertEqual(command.mode, MovementMode.ROUTE_TRANSIT)
+        self.assertEqual(command.throttle, 1.0)
+        self.assertGreater(command.rudder, 0.8)
+        self.assertIn("舰首背离中央点", command.reason)
+
+    def test_uturn_side_stays_fixed_across_pi_sign_flip(self):
+        first = self.plan(
+            route_phase="transit",
+            capture_point_bearing=0.98,
+        )
+        second = self.plan(
+            route_phase="transit",
+            capture_point_bearing=-0.98,
+        )
+
+        self.assertGreater(first.rudder, 0.8)
+        self.assertGreater(second.rudder, 0.7)
+
+    def test_enemy_bias_returns_only_after_objective_is_ahead(self):
+        self.plan(route_phase="transit", capture_point_bearing=0.90)
+        command = self.plan(
+            route_phase="transit",
+            capture_point_bearing=0.10,
+            minimap_target_bearing=-0.30,
+        )
+
+        self.assertLess(command.rudder, 0)
+        self.assertNotIn("舰首背离中央点", command.reason)
+
     def test_rear_enemy_never_causes_about_turn(self):
         command = self.plan(
             route_phase="transit",

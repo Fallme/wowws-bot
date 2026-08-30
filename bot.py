@@ -1650,6 +1650,7 @@ class BattleBot:
         )
         if compensated_rudder != command.rudder:
             command = replace(command, rudder=compensated_rudder)
+        previous_movement_reason = self.last_movement_reason
         self.last_movement_command = command
         self.last_movement_reason = command.reason
         if safety_override:
@@ -1702,7 +1703,11 @@ class BattleBot:
         self._movement_feedback_update(
             now, analysis.player_position, command.throttle
         )
-        if command.mode != self._last_movement_mode:
+        recovery_started = bool(
+            "舰首背离中央点" in command.reason
+            and "舰首背离中央点" not in previous_movement_reason
+        )
+        if command.mode != self._last_movement_mode or recovery_started:
             logger.info(
                 "[SYSTEM] 移动状态: %s | 推力=%.2f 舵角=%.2f | %s",
                 command.mode.value,
