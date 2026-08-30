@@ -24,16 +24,41 @@ class RunLimitsTests(unittest.TestCase):
         started_at = time.monotonic()
         completed = 0
 
-        completed = count_quick_battle_for_plan(completed, "quick_timeout")
+        completed = count_quick_battle_for_plan(
+            completed,
+            "quick_timeout",
+            closure_confirmed=True,
+        )
         self.assertEqual(completed, 1)
         self.assertFalse(limits.schedule_reached(completed, started_at))
 
-        completed = count_quick_battle_for_plan(completed, "quick_death")
+        completed = count_quick_battle_for_plan(
+            completed,
+            "quick_death",
+            closure_confirmed=True,
+        )
         self.assertEqual(completed, 2)
         self.assertTrue(limits.schedule_reached(completed, started_at))
 
     def test_non_quick_completion_signal_does_not_advance_quick_counter(self):
-        self.assertEqual(count_quick_battle_for_plan(3, "results"), 3)
+        self.assertEqual(
+            count_quick_battle_for_plan(
+                3,
+                "results",
+                closure_confirmed=True,
+            ),
+            3,
+        )
+
+    def test_quick_exit_signal_does_not_count_until_port_closure_is_confirmed(self):
+        self.assertEqual(
+            count_quick_battle_for_plan(
+                2,
+                "quick_timeout",
+                closure_confirmed=False,
+            ),
+            2,
+        )
 
     def test_stop_file_requests_shutdown(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -213,6 +213,24 @@ class ResultRewardReader:
                 kept[duplicate_index] = (token, piece)
         return sorted(kept, key=lambda item: cls._token_x(item[0]))
 
+    @staticmethod
+    def _leading_digit_group(text: str) -> str:
+        """Return one reward value without crossing a resource icon.
+
+        The result row can be returned by OCR as one token such as
+        ``217☆44☆``.  Spaces inside the leading value are thousands
+        separators (``1 143``), while the star/icon is a hard field boundary.
+        Removing every non-digit character used to turn that example into
+        ``21744`` and incorrectly add free XP to ship XP.
+        """
+        match = re.search(r"\d", str(text or ""))
+        if match is None:
+            return ""
+        leading = re.match(r"[\d\s]+", str(text)[match.start() :])
+        if leading is None:
+            return ""
+        return re.sub(r"\D", "", leading.group(0))
+
     def _read_number_once(
         self,
         crop,
@@ -222,7 +240,7 @@ class ResultRewardReader:
     ):
         tokens = sorted(self.backend.recognize(crop), key=self._token_x)
         numeric_tokens = [
-            (token, re.sub(r"\D", "", token.text))
+            (token, self._leading_digit_group(token.text))
             for token in tokens
         ]
         numeric_tokens = [item for item in numeric_tokens if item[1]]

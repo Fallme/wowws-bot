@@ -61,10 +61,20 @@ QUICK_BATTLE_COMPLETION_REASONS = frozenset(
 )
 
 
-def count_quick_battle_for_plan(completed_rounds: int, battle_finished) -> int:
-    """Advance plan progress for a confirmed quick-battle completion only."""
+def count_quick_battle_for_plan(
+    completed_rounds: int,
+    battle_finished,
+    *,
+    closure_confirmed: bool = False,
+) -> int:
+    """Advance quick-battle progress only after leaving the active match.
 
-    if battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
+    A five-minute/death signal requests an exit, but it is not itself proof
+    that Esc actually returned to port.  Counting before that confirmation can
+    count the same still-running battle again on the next lifecycle pass.
+    """
+
+    if closure_confirmed and battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
         return max(0, int(completed_rounds)) + 1
     return max(0, int(completed_rounds))
 
@@ -2256,17 +2266,9 @@ def run():
                 # settlement lifecycle, so its plan progress cannot depend on
                 # a results page.  Reaching this branch already requires a
                 # positively identified battle HUD and one of three independent
-                # completion signals: five-minute timeout, numeric HP=0, or a
-                # stable natural battle-end surface.  Count the round for run
-                # scheduling, but explicitly skip reward/history persistence.
-                completed_rounds = count_quick_battle_for_plan(
-                    completed_rounds,
-                    battle_finished,
-                )
-                battle_observed_in_run = False
                 reporter.update(
                     "returning",
-                    "快速战斗已计入计划局数，正在 Esc 返回港口；本局不统计收益",
+                    "快速战斗已触发退出，正在确认已离开本局；本局不统计收益",
                     current_round=current_round,
                     completed_rounds=completed_rounds,
                     rewards_status="skipped",
@@ -2278,8 +2280,46 @@ def run():
                 if escape is not None:
                     escape()
                     time.sleep(0.8)
-                return_to_port(bot, attempts=5)
+                closure_confirmed = return_to_port(bot, attempts=5)
                 port_configured = False
+                if not closure_confirmed:
+                    # The exit menu can fail to open or the battle can still
+                    # be ending.  Keep the current round active and let the
+                    # next scene pass resume/close this same battle.  Never
+                    # advance the plan merely because Esc was sent.
+                    logger.warning(
+                        "快速战斗尚未确认离开当前对局，本局不计数并重新判断场景"
+                    )
+                    reporter.update(
+                        "recovering",
+                        "尚未确认离开当前快速战斗，本局不计数；正在重新判断场景",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        rewards_status="skipped",
+                        rewards_round=0,
+                        last_rewards={},
+                    )
+                    continue
+                completed_rounds = count_quick_battle_for_plan(
+                    completed_rounds,
+                    battle_finished,
+                    closure_confirmed=True,
+                )
+                battle_observed_in_run = False
+                logger.info(
+                    "快速战斗已确认离开，本局计入计划进度: %s",
+                    completed_rounds,
+                )
+                reporter.update(
+                    "returning",
+                    "快速战斗已确认结束并计入计划局数；本局不统计收益",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status="skipped",
+                    rewards_round=0,
+                    last_rewards={},
+                    last_outcome="unknown",
+                )
                 if should_stop():
                     reporter.update(
                         "completed",

@@ -228,6 +228,33 @@ def test_overlapping_partial_ocr_hypothesis_does_not_prefix_value():
     assert rewards.free_xp == 198
 
 
+def test_star_icon_separates_ship_xp_from_green_free_xp_suffix():
+    class StarSeparatedBackend:
+        execution_provider = "CUDAExecutionProvider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("69 276⚓", 0.99, ((10, 0),))],
+                [OcrToken("217☆44☆", 0.98, ((10, 0),))],
+                [OcrToken("44☆", 0.99, ((10, 0),))],
+            )
+            result = values[self.calls]
+            self.calls += 1
+            return result
+
+    rewards = ResultRewardReader(StarSeparatedBackend()).read(
+        np.full((1600, 2560, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.recognized
+    assert rewards.credits == 69_276
+    assert rewards.ship_xp == 217
+    assert rewards.free_xp == 44
+
+
 def test_numeric_reward_ocr_retries_enhanced_crop_after_missing_original():
     from core.ocr import RapidOcrBackend
 
