@@ -70,6 +70,22 @@ class ControlStoreTests(unittest.TestCase):
                     quick_battle=True,
                 )
                 store.update_run_progress("run-quick", 3, 900)
+                self.assertIsNone(
+                    store.upsert_auto_rewards(
+                        "run-quick",
+                        1,
+                        {"credits": 999999, "ship_xp": 9999, "free_xp": 999},
+                    )
+                )
+                self.assertIsNone(
+                    store.upsert_battle_result(
+                        "run-quick",
+                        1,
+                        "victory",
+                        {"credits": 999999, "ship_xp": 9999, "free_xp": 999},
+                        rewards_recognized=True,
+                    )
+                )
                 quick_run = next(
                     item
                     for item in store.dashboard()["runs"]
@@ -78,6 +94,7 @@ class ControlStoreTests(unittest.TestCase):
                 self.assertTrue(quick_run["quick_battle"])
                 self.assertEqual(quick_run["completed_rounds"], 3)
                 self.assertEqual(quick_run["credits"], 0)
+                self.assertEqual(quick_run["victories"], 0)
             finally:
                 store.close()
 

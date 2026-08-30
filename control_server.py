@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -21,6 +22,8 @@ import yaml
 
 from core.calibration import CalibrationStore
 from web_workflow import WebCalibrationWorkflow, game_status
+
+logger = logging.getLogger("control")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "frontend"
@@ -426,6 +429,13 @@ class ControlStore:
         if not run_id or round_no <= 0 or not any(amounts):
             return None
         with self.lock, self.connection:
+            run = self.connection.execute(
+                "SELECT quick_battle FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run and bool(run["quick_battle"]):
+                logger.info("快速战斗不写入收益: run=%s round=%s", run_id, round_no)
+                return None
             existing = self.connection.execute(
                 """SELECT id FROM resource_entries
                    WHERE run_id = ? AND round_no = ? AND source = 'auto_result_ocr'
@@ -481,6 +491,13 @@ class ControlStore:
             max(0, int(values.get("free_xp", 0) or 0)),
         )
         with self.lock, self.connection:
+            run = self.connection.execute(
+                "SELECT quick_battle FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run and bool(run["quick_battle"]):
+                logger.info("快速战斗不写入胜负/收益历史: run=%s round=%s", run_id, round_no)
+                return None
             self.connection.execute(
                 """INSERT INTO battle_history
                    (run_id, round_no, outcome, credits, ship_xp, free_xp,
@@ -522,7 +539,9 @@ class ControlStore:
                     COALESCE(SUM(doubloons), 0) AS doubloons,
                     COALESCE(SUM(free_xp), 0) AS free_xp,
                     COALESCE(SUM(elite_xp), 0) AS elite_xp
-                    FROM resource_entries"""
+                    FROM resource_entries e
+                    JOIN runs r ON r.id = e.run_id
+                    WHERE COALESCE(r.quick_battle, 0) = 0"""
                 ).fetchone()
             )
             run_totals = dict(
@@ -538,14 +557,14 @@ class ControlStore:
                 dict(row)
                 for row in self.connection.execute(
                     """SELECT r.*,
-                    COALESCE(SUM(e.credits), 0) AS credits,
-                    COALESCE(SUM(e.ship_xp), 0) AS ship_xp,
-                    COALESCE(SUM(e.commander_xp), 0) AS commander_xp,
-                    COALESCE(SUM(e.coal), 0) AS coal,
-                    COALESCE(SUM(e.steel), 0) AS steel,
-                    COALESCE(SUM(e.doubloons), 0) AS doubloons,
-                    COALESCE(SUM(e.free_xp), 0) AS free_xp,
-                    COALESCE(SUM(e.elite_xp), 0) AS elite_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.credits ELSE 0 END), 0) AS credits,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.ship_xp ELSE 0 END), 0) AS ship_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.commander_xp ELSE 0 END), 0) AS commander_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.coal ELSE 0 END), 0) AS coal,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.steel ELSE 0 END), 0) AS steel,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.doubloons ELSE 0 END), 0) AS doubloons,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.free_xp ELSE 0 END), 0) AS free_xp,
+                    COALESCE(SUM(CASE WHEN r.quick_battle = 0 THEN e.elite_xp ELSE 0 END), 0) AS elite_xp,
                     (SELECT COUNT(*) FROM battle_history h
                      WHERE h.run_id = r.id AND h.outcome = 'victory') AS victories,
                     (SELECT COUNT(*) FROM battle_history h
