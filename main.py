@@ -34,9 +34,11 @@ from core.window import (
 )
 from port_navigator import (
     claim_daily_reward,
+    continue_quick_battle_after_death,
     enter_battle,
     ensure_selected_ship_commander,
     ensure_requested_mode,
+    force_quick_battle_return_to_port,
     handle_post_battle,
     in_battle_type_selector,
     is_battle_survey_page,
@@ -2173,7 +2175,9 @@ def run():
             battle_finished = False
             try:
                 battle_finished = (
-                    True
+                    "quick_ended"
+                    if result_ready and limits.quick_battle
+                    else True
                     if result_ready
                     else run_battle(
                         bot,
@@ -2235,7 +2239,9 @@ def run():
                     # The controller can fault during the transition out of a
                     # battle.  Preserve the result page for OCR; never click it
                     # away during recovery.
-                    battle_finished = True
+                    battle_finished = (
+                        "quick_ended" if limits.quick_battle else True
+                    )
                     battle_recovery_failures = 0
                     logger.info("恢复场景已是结算页，直接进入收益统计")
                 elif recovered_state == ScreenState.PORT:
@@ -2262,10 +2268,11 @@ def run():
                     battle_recovery_failures = 0
 
             if battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
-                # A quick battle deliberately leaves before the ordinary
-                # settlement lifecycle, so its plan progress cannot depend on
-                # a results page.  Reaching this branch already requires a
-                # positively identified battle HUD and one of three independent
+                # Quick mode has three explicit closure paths and never enters
+                # reward OCR: timeout -> two-step forced port exit; HP=0 ->
+                # death dialog's Continue Battle; natural result -> result-page
+                # Continue Battle. Count only once a path positively proves the
+                # old match is over.
                 reporter.update(
                     "returning",
                     "快速战斗已触发退出，正在确认已离开本局；本局不统计收益",
@@ -2277,16 +2284,44 @@ def run():
                     last_outcome="unknown",
                 )
                 escape = getattr(bot.gamepad, "escape", None)
-                if escape is not None:
-                    escape()
-                    time.sleep(0.8)
-                closure_confirmed = return_to_port(bot, attempts=5)
-                port_configured = False
+                backend = getattr(
+                    getattr(bot, "distance_reader", None), "backend", None
+                )
+                closure_scene = ScreenState.UNKNOWN
+                if battle_finished == "quick_timeout":
+                    closure_scene = force_quick_battle_return_to_port(
+                        bot.hwnd,
+                        vision=bot.vision,
+                        backend=backend,
+                        open_menu=escape,
+                        should_abort=lambda: operation_paused(bot),
+                    )
+                    # A match can naturally finish while the two-step exit is
+                    # being handled. Timeout semantics still require port.
+                    closure_confirmed = closure_scene == ScreenState.PORT
+                    if closure_scene == ScreenState.RESULTS:
+                        closure_confirmed = return_to_port(bot, attempts=5)
+                    port_configured = False
+                elif battle_finished == "quick_death":
+                    # Numeric HP=0 is itself definitive closure evidence. The
+                    # next action is selected only after the death dialog OCR.
+                    closure_confirmed = True
+                else:
+                    closure_scene = (
+                        ScreenState.RESULTS
+                        if result_ready
+                        else recover_current_scene(
+                            bot,
+                            attempts=24,
+                            stable_frames=2,
+                            poll_interval=0.25,
+                        )
+                    )
+                    closure_confirmed = closure_scene in {
+                        ScreenState.RESULTS,
+                        ScreenState.PORT,
+                    }
                 if not closure_confirmed:
-                    # The exit menu can fail to open or the battle can still
-                    # be ending.  Keep the current round active and let the
-                    # next scene pass resume/close this same battle.  Never
-                    # advance the plan merely because Esc was sent.
                     logger.warning(
                         "快速战斗尚未确认离开当前对局，本局不计数并重新判断场景"
                     )
@@ -2341,6 +2376,41 @@ def run():
                         manual_intervention_latched=False,
                     )
                     return 0
+
+                # Start the next match through the surface that actually
+                # closed this one. Any failure falls back to live scene
+                # recovery/port preparation without changing the count again.
+                queued = False
+                if battle_finished == "quick_death":
+                    queued = continue_quick_battle_after_death(
+                        bot.hwnd,
+                        vision=bot.vision,
+                        backend=backend,
+                        open_menu=escape,
+                        should_abort=lambda: operation_paused(bot),
+                    )
+                elif closure_scene == ScreenState.RESULTS:
+                    queued = queue_next_battle(
+                        bot.hwnd,
+                        vision=bot.vision,
+                        should_abort=lambda: operation_paused(bot),
+                    )
+                if queued:
+                    reporter.update(
+                        "requeueing",
+                        "快速战斗不统计收益，已点击继续战斗进入下一局",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        rewards_status="skipped",
+                    )
+                    if wait_for_battle(
+                        bot,
+                        should_stop=should_stop,
+                        require_new_round=True,
+                        loading_already_seen=True,
+                    ):
+                        continue
+                    logger.warning("快速续局已点击，但新一局 HUD 尚未确认；重新识别")
                 continue
             if not battle_finished:
                 if user_stop_requested():

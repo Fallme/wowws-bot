@@ -60,6 +60,24 @@ class ControlStoreTests(unittest.TestCase):
                 self.assertEqual(len(dashboard["history"]), 1)
                 self.assertEqual(dashboard["history"][0]["outcome"], "victory")
                 self.assertTrue(dashboard["history"][0]["rewards_recognized"])
+
+                store.create_run(
+                    "run-quick",
+                    "pommern",
+                    "cooperative",
+                    "rounds",
+                    5,
+                    quick_battle=True,
+                )
+                store.update_run_progress("run-quick", 3, 900)
+                quick_run = next(
+                    item
+                    for item in store.dashboard()["runs"]
+                    if item["id"] == "run-quick"
+                )
+                self.assertTrue(quick_run["quick_battle"])
+                self.assertEqual(quick_run["completed_rounds"], 3)
+                self.assertEqual(quick_run["credits"], 0)
             finally:
                 store.close()
 

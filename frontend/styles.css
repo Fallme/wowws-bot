@@ -45,3 +45,4 @@ html,body{height:100%;overflow:hidden}.app-shell{width:min(1640px,calc(100% - 32
 .live-workspace{align-items:stretch}.map-column{display:grid;grid-template-rows:minmax(0,1fr) auto;align-items:stretch}.map-column .route-visual{place-self:start center;width:min(100%,430px)}.telemetry-panel{display:flex;height:100%}.telemetry-panel .telemetry-grid{flex:1;height:100%;grid-auto-rows:minmax(0,1fr);align-content:stretch;margin:0}
 @media(max-width:1500px){.operation-banner{grid-template-columns:78px minmax(115px,auto) 1fr;gap:9px}.operation-banner strong{font-size:16px}.map-column .route-visual{width:min(100%,350px)}}
 @media(max-height:860px){.operation-banner{margin-bottom:7px;padding:6px 9px}.operation-banner strong{font-size:15px}.map-column .route-visual{width:min(100%,260px)}}
+.history-quick-note{color:#e2b657!important;font-weight:700;letter-spacing:.03em}

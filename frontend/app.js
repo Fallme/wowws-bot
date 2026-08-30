@@ -93,7 +93,9 @@ function renderTaskTotals(run){
   badge.textContent=run?(statusLabels[run.status]||run.status):"暂无任务";
   badge.className=`task-badge ${run?.status||"idle"}`;
   $("#taskNote").textContent=run
-    ? state.runId===run.id&&state.rewardsStatus==="unrecognized"
+    ? Boolean(Number(run.quick_battle))
+      ? `${state.config?.ships[run.ship]?.name||run.ship} · ${labels[run.mode]||run.mode}；快速战斗，局数正常记录，收益与胜负不统计。`
+      : state.runId===run.id&&state.rewardsStatus==="unrecognized"
       ? `第 ${state.rewardsRound||state.completed} 局结算已确认，但数字未可靠识别；本次未写入错误资源，已保留诊断截图。`
       : `${state.config?.ships[run.ship]?.name||run.ship} · ${labels[run.mode]||run.mode}；本组完成后保留，开始新任务时归零。`
     : "开始任务后从零累计，完成后保留；下一次开始时自动重置。";
@@ -106,10 +108,10 @@ function renderTaskHistory(current,runs){
   $("#taskHistory").replaceChildren(...(entries.length?entries.map(item=>{
     const row=document.createElement("article"),ship=state.config?.ships[item.ship]?.name||item.ship||"未知舰船";
     const started=Number(item.started_at||0)?new Date(Number(item.started_at)*1000).toLocaleDateString("zh-CN",{month:"2-digit",day:"2-digit"}):"—";
-    const rounds=Number(item.completed_rounds||0),wins=Number(item.victories||0),losses=Number(item.defeats||0);
+    const rounds=Number(item.completed_rounds||0),wins=Number(item.victories||0),losses=Number(item.defeats||0),quick=Boolean(Number(item.quick_battle));
     const credits=number(item.credits),shipXp=number(item.ship_xp),freeXp=number(item.free_xp);
     row.className=`history-row task ${item.status||"unknown"}`;
-    row.innerHTML=`<div><strong>${escapeHtml(ship)} · ${escapeHtml(labels[item.mode]||item.mode||"—")}</strong><small>${started} · ${rounds} 局 · 胜 ${wins} / 负 ${losses}</small><small class="history-rewards" aria-label="本组收益：银币 ${credits}，舰船经验 ${shipXp}，全局经验 ${freeXp}"><span class="history-credit">银币 <i>${credits}</i></span><span class="history-ship-xp">舰船经验 <i>${shipXp}</i></span><span class="history-free-xp">全局经验 <i>${freeXp}</i></span></small></div><b>${status[item.status]||"已记录"}</b>`;
+    row.innerHTML=`<div><strong>${escapeHtml(ship)} · ${escapeHtml(labels[item.mode]||item.mode||"—")}</strong><small>${started} · ${rounds} 局${quick?" · 快速战斗":` · 胜 ${wins} / 负 ${losses}`}</small>${quick?'<small class="history-quick-note">快速战斗 · 收益未统计</small>':`<small class="history-rewards" aria-label="本组收益：银币 ${credits}，舰船经验 ${shipXp}，全局经验 ${freeXp}"><span class="history-credit">银币 <i>${credits}</i></span><span class="history-ship-xp">舰船经验 <i>${shipXp}</i></span><span class="history-free-xp">全局经验 <i>${freeXp}</i></span></small>`}</div><b>${status[item.status]||"已记录"}</b>`;
     return row;
   }):[Object.assign(document.createElement("p"),{className:"history-empty",textContent:"完成过的自动作战任务会显示在这里。"})]));
 }

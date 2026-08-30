@@ -320,6 +320,11 @@ class ControlStore:
                     "ALTER TABLE runs ADD COLUMN duration_seconds "
                     "REAL NOT NULL DEFAULT 0"
                 )
+            if "quick_battle" not in run_columns:
+                self.connection.execute(
+                    "ALTER TABLE runs ADD COLUMN quick_battle "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             # Preserve useful history created before progress columns existed.
             self.connection.execute(
                 """UPDATE runs SET completed_rounds = COALESCE(
@@ -336,14 +341,32 @@ class ControlStore:
         with self.lock:
             self.connection.close()
 
-    def create_run(self, run_id, ship, mode, limit_type, limit_value):
+    def create_run(
+        self,
+        run_id,
+        ship,
+        mode,
+        limit_type,
+        limit_value,
+        *,
+        quick_battle=False,
+    ):
         with self.lock, self.connection:
             self.connection.execute(
                 """INSERT INTO runs
                    (id, ship, mode, limit_type, limit_value, status,
-                    started_at, ended_at, completed_rounds, duration_seconds)
-                   VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, 0, 0)""",
-                (run_id, ship, mode, limit_type, limit_value, time.time()),
+                    started_at, ended_at, completed_rounds, duration_seconds,
+                    quick_battle)
+                   VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, 0, 0, ?)""",
+                (
+                    run_id,
+                    ship,
+                    mode,
+                    limit_type,
+                    limit_value,
+                    time.time(),
+                    1 if quick_battle else 0,
+                ),
             )
 
     def update_run_progress(self, run_id, completed_rounds, duration_seconds):
@@ -358,6 +381,15 @@ class ControlStore:
                     max(0.0, float(duration_seconds or 0.0)),
                     run_id,
                 ),
+            )
+
+    def update_run_quick_battle(self, run_id, quick_battle):
+        if not run_id:
+            return
+        with self.lock, self.connection:
+            self.connection.execute(
+                "UPDATE runs SET quick_battle = ? WHERE id = ?",
+                (1 if quick_battle else 0, run_id),
             )
 
     def finish_run(self, run_id, status):
@@ -661,6 +693,7 @@ class RunnerManager:
                 mode,
                 limit_type,
                 limit_value,
+                quick_battle=quick_battle,
             )
             return {"run_id": run_id}
 
@@ -735,6 +768,11 @@ class RunnerManager:
         }
         for key, value in defaults.items():
             state.setdefault(key, value)
+        state_run_id = str(state.get("run_id") or run_id or "")
+        if state_run_id and bool(state.get("quick_battle", False)):
+            # Also repairs the most recent quick run created before the
+            # database gained its explicit quick_battle column.
+            self.store.update_run_quick_battle(state_run_id, True)
         paused_by_user = bool(running and PAUSE_PATH.exists())
         state["terminating"] = bool(running and STOP_PATH.exists())
         state["paused_by_user"] = paused_by_user

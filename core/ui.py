@@ -64,6 +64,11 @@ PORT_DIALOG_CLOSE = RelativeRegion(0.585, 0.650, 0.620, 0.690)
 NO_COMMANDER_CONFIRM_BUTTON = RelativeRegion(0.420, 0.535, 0.495, 0.615)
 LOADING_START_BUTTON = RelativeRegion(0.455, 0.945, 0.545, 0.995)
 ESCAPE_RESUME_BUTTON = RelativeRegion(0.445, 0.465, 0.555, 0.515)
+# Quick-battle early exit uses a two-step menu. These regions are fallbacks
+# only after OCR has positively identified the live-battle menu/confirmation.
+QUICK_EXIT_BATTLE_BUTTON = RelativeRegion(0.445, 0.385, 0.555, 0.435)
+QUICK_EXIT_CONFIRM_YES_BUTTON = RelativeRegion(0.425, 0.590, 0.500, 0.640)
+QUICK_DEATH_CONTINUE_BUTTON = RelativeRegion(0.540, 0.470, 0.610, 0.520)
 EXIT_CONTINUE_BUTTON = RelativeRegion(0.535, 0.455, 0.615, 0.510)
 # Result screen: the left teal button returns to port; the right orange button
 # immediately queues another battle.  The runner prefers the right button

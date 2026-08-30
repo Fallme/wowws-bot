@@ -21,6 +21,9 @@ from core.ui import (
     PORT_BATTLE_BUTTON,
     PORT_DIALOG_CLOSE,
     PORT_MODE_SELECTOR,
+    QUICK_DEATH_CONTINUE_BUTTON,
+    QUICK_EXIT_BATTLE_BUTTON,
+    QUICK_EXIT_CONFIRM_YES_BUTTON,
     RESULTS_REQUEUE_BUTTON,
     RESULTS_RETURN_TO_PORT_BUTTON,
     SELECTED_SHIP_NAME_TEMPLATES,
@@ -726,6 +729,65 @@ def _token_geometry(token):
     if not xs or not ys:
         return None
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _verified_action_point(image, backend, wanted, *, rejected=()):
+    """Locate a semantic action from OCR while excluding dangerous siblings."""
+    wanted = tuple(_normalize_ship_name(value) for value in wanted)
+    rejected = tuple(_normalize_ship_name(value) for value in rejected)
+    matches = []
+    for token in backend.recognize(image):
+        geometry = _token_geometry(token)
+        if token.confidence < 0.60 or geometry is None:
+            continue
+        text = _normalize_ship_name(token.text)
+        if not text or any(value and value in text for value in rejected):
+            continue
+        if not any(value and value in text for value in wanted):
+            continue
+        x1, y1, x2, y2 = geometry
+        matches.append(
+            (
+                float(token.confidence),
+                (int((x1 + x2) / 2), int((y1 + y2) / 2)),
+            )
+        )
+    return max(matches, default=(0.0, None), key=lambda item: item[0])[1]
+
+
+def quick_exit_menu_action_point(image, backend=None):
+    """Find ``离开战斗`` but never the port menu's ``退出游戏`` action."""
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        ("离开战斗", "退出战斗"),
+        rejected=("退出游戏", "关闭游戏", "回到战斗"),
+    )
+
+
+def quick_death_continue_action_point(image, backend=None):
+    """Find the orange ``继续战斗`` action on the sunk-ship dialog."""
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        ("继续战斗",),
+        rejected=("离开战斗",),
+    )
+
+
+def _is_early_exit_confirmation(image, backend):
+    texts = [
+        _normalize_ship_name(token.text)
+        for token in backend.recognize(image)
+        if token.confidence >= 0.55
+    ]
+    combined = "".join(texts)
+    return (
+        _normalize_ship_name("提前退出战斗") in combined
+        and _normalize_ship_name("离开战斗") in combined
+    )
 
 
 def daily_reward_claim_point(image, backend=None):
@@ -1530,6 +1592,121 @@ def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
                 return False
             retried = True
     logger.warning("点击继续战斗后界面未发生变化")
+    return False
+
+
+def force_quick_battle_return_to_port(
+    hwnd=None,
+    *,
+    vision=None,
+    backend=None,
+    open_menu=None,
+    should_abort=None,
+    attempts=60,
+):
+    """Execute Esc -> 离开战斗 -> 是 and confirm the battle was left."""
+    vision = vision or Vision()
+    backend = backend or RapidOcrBackend()
+    if _operation_paused(should_abort):
+        return ScreenState.UNKNOWN
+    image = _capture(hwnd)
+    initial = vision.classify_screen(image)
+    if initial in {ScreenState.PORT, ScreenState.RESULTS}:
+        return initial
+    if initial != ScreenState.BATTLE:
+        logger.warning("未确认战斗 HUD，不执行五分钟强制回港: %s", initial.value)
+        return initial
+    if open_menu is None:
+        return ScreenState.BATTLE
+    open_menu()
+    menu_retries = 0
+    exit_clicked = False
+    confirmation_clicked = False
+    for attempt in range(max(1, int(attempts))):
+        if _operation_paused(should_abort):
+            return ScreenState.UNKNOWN
+        time.sleep(0.25)
+        image = _capture(hwnd)
+        state = vision.classify_screen(image)
+        if state in {ScreenState.PORT, ScreenState.RESULTS}:
+            logger.info("快速战斗已确认离开: %s", state.value)
+            return state
+
+        exit_point = quick_exit_menu_action_point(image, backend)
+        if exit_point is not None and not exit_clicked:
+            logger.info("OCR 确认战斗菜单“离开战斗”，点击: local=%s", exit_point)
+            _click_local(hwnd, exit_point)
+            exit_clicked = True
+            continue
+
+        if _is_early_exit_confirmation(image, backend) and not confirmation_clicked:
+            # The page has two one-character buttons. OCR on a lone ``是`` is
+            # fragile, so its relative slot is authorized only by both dialog
+            # heading anchors being present.
+            logger.info("OCR 确认“提前退出战斗”二次页面，点击“是”")
+            _click_region(hwnd, image, QUICK_EXIT_CONFIRM_YES_BUTTON)
+            confirmation_clicked = True
+            continue
+
+        if state == ScreenState.BATTLE and attempt >= 8 and menu_retries < 2:
+            menu_retries += 1
+            logger.info("战斗菜单尚未出现，重试 Esc (%s/3)", menu_retries + 1)
+            open_menu()
+    logger.warning("五分钟强制退出未确认回港；保留当前局数并重新判断")
+    return ScreenState.UNKNOWN
+
+
+def continue_quick_battle_after_death(
+    hwnd=None,
+    *,
+    vision=None,
+    backend=None,
+    open_menu=None,
+    should_abort=None,
+    attempts=80,
+):
+    """After HP reaches zero, open the dialog and click ``继续战斗!``."""
+    vision = vision or Vision()
+    backend = backend or RapidOcrBackend()
+    if _operation_paused(should_abort):
+        return False
+    if open_menu is not None:
+        open_menu()
+    clicked = False
+    for _attempt in range(max(1, int(attempts))):
+        if _operation_paused(should_abort):
+            return False
+        time.sleep(0.25)
+        image = _capture(hwnd)
+        state = vision.classify_screen(image)
+        if state in {ScreenState.LOADING, ScreenState.BATTLE} and clicked:
+            logger.info("死亡后“继续战斗”已确认进入下一局流程")
+            return True
+        if state == ScreenState.PORT:
+            logger.info("死亡后已回港，交由港口流程开始下一局")
+            return False
+        point = quick_death_continue_action_point(image, backend)
+        if point is not None and not clicked:
+            logger.info("OCR 确认死亡页“继续战斗”，点击: local=%s", point)
+            _click_local(hwnd, point)
+            clicked = True
+            continue
+        # Authorize the relative fallback only after both death-dialog text
+        # anchors are present; never infer this action from button colour.
+        if not clicked:
+            normalized = "".join(
+                _normalize_ship_name(token.text)
+                for token in backend.recognize(image)
+                if token.confidence >= 0.55
+            )
+            if (
+                _normalize_ship_name("离开战斗") in normalized
+                and _normalize_ship_name("确认") in normalized
+            ):
+                logger.info("死亡确认页已识别，按相对槽位点击“继续战斗”")
+                _click_region(hwnd, image, QUICK_DEATH_CONTINUE_BUTTON)
+                clicked = True
+    logger.warning("死亡后未能确认“继续战斗”进入下一局")
     return False
 
 
