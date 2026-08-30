@@ -195,6 +195,27 @@ def ensure_bound_game_foreground(bot: BattleBot) -> bool:
     return ensure_game_window_foreground(bot.hwnd)
 
 
+def restore_game_foreground_after_pause(bot: BattleBot, source: str) -> bool:
+    """Bring the game back only after the pause gate is positively clear."""
+    if bot is None:
+        return True
+    # This first poll catches a key pressed at the exact end of the five-second
+    # quiet window. ensure_bound_game_foreground polls again immediately before
+    # the Windows focus call, closing the remaining race without stealing focus.
+    if operation_paused(bot):
+        logger.info("[USER] 暂停解除时检测到新的用户操作，刷新暂停时间，不切前台")
+        return False
+    logger.info("[SYSTEM] %s，尝试恢复《战舰世界》前台", source)
+    if ensure_bound_game_foreground(bot):
+        logger.info("[SYSTEM] 游戏前台已恢复，下一步重新识别当前场景")
+        return True
+    if operation_paused(bot):
+        logger.info("[USER] 恢复前台前出现新的用户操作，本次恢复已取消")
+    else:
+        logger.warning("自动暂停已解除，但本次恢复游戏前台失败；后续安全重试")
+    return False
+
+
 def ensure_capture_foreground(bot) -> bool:
     """Foreground real runtime bots before screen capture.
 
@@ -850,6 +871,7 @@ def run_battle(
         else None
     )
     non_battle_frames = 0
+    pause_observed = False
     while True:
         if should_stop and should_stop():
             logger.info("收到停止请求，终止当前控制")
@@ -874,11 +896,19 @@ def run_battle(
             mark_pause = getattr(bot, "mark_manual_pause", None)
             if mark_pause is not None:
                 mark_pause()
+            pause_observed = True
             if progress and now - last_progress >= 1.0:
                 progress(bot)
                 last_progress = now
             time.sleep(0.15)
             continue
+        if pause_observed:
+            if not restore_game_foreground_after_pause(
+                bot, "自动暂停已解除"
+            ):
+                time.sleep(0.15)
+                continue
+            pause_observed = False
         if (
             not paused
             and int(ctypes.windll.user32.GetForegroundWindow() or 0) != bot.hwnd
@@ -1611,6 +1641,14 @@ def wait_for_web_resume(
     )
     resume_source = "网页点击继续" if resumed_by_web else "5秒内无新的键盘输入"
     logger.info("[SYSTEM] %s，开始重新识别当前画面并接续原流程", resume_source)
+    reporter.update(
+        resume_state,
+        "暂停已解除，正在恢复游戏前台并判断当前状态",
+        paused_by_user=False,
+        manual_intervention_latched=False,
+    )
+    if bot is not None:
+        restore_game_foreground_after_pause(bot, resume_source)
     reporter.update(
         resume_state,
         "正在快速识别当前状态并继续原操作",

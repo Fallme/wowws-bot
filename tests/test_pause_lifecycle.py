@@ -9,6 +9,7 @@ from main import (
     GameWindowUnavailableWhilePaused,
     ensure_bound_game_foreground,
     refresh_game_window,
+    restore_game_foreground_after_pause,
     shutdown_bot,
     wait_for_web_resume,
 )
@@ -172,3 +173,22 @@ def test_foreground_retry_stops_if_keyboard_pause_arrives_mid_operation():
         activate.assert_not_called()
     finally:
         game_window.set_interaction_pause_guard(None)
+
+
+def test_pause_release_restores_foreground_only_after_gate_is_clear():
+    paused = [True, False, False]
+    bot = SimpleNamespace(
+        hwnd=1234,
+        gamepad=SimpleNamespace(),
+        intervention=SimpleNamespace(
+            poll=lambda _controller, _now: paused.pop(0)
+        ),
+        mark_manual_pause=lambda: None,
+    )
+
+    with patch("main.ensure_game_window_foreground", return_value=True) as focus:
+        assert not restore_game_foreground_after_pause(bot, "自动暂停已解除")
+        focus.assert_not_called()
+        assert restore_game_foreground_after_pause(bot, "自动暂停已解除")
+
+    focus.assert_called_once_with(1234)
