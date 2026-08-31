@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 import yaml
 
 from core.calibration import CalibrationStore
+from core.launcher import launcher_statuses, normalize_launch_client
 from web_workflow import WebCalibrationWorkflow, game_status
 
 logger = logging.getLogger("control")
@@ -649,6 +650,9 @@ class RunnerManager:
             limit_type = str(payload.get("limit_type", "continuous"))
             limit_value = float(payload.get("limit_value", 0))
             quick_battle = bool(payload.get("quick_battle", False))
+            launcher_client = normalize_launch_client(
+                payload.get("launcher_client", "steam")
+            )
             close_game_when_done = bool(
                 payload.get("close_game_when_done", False)
             )
@@ -689,6 +693,7 @@ class RunnerManager:
                     "WOWS_MAX_ROUNDS": str(int(limit_value)) if limit_type == "rounds" else "0",
                     "WOWS_DURATION_MINUTES": str(limit_value) if limit_type == "duration" else "0",
                     "WOWS_QUICK_BATTLE": "1" if quick_battle else "0",
+                    "WOWS_LAUNCHER_CLIENT": launcher_client,
                     "WOWS_CLOSE_GAME_WHEN_DONE": (
                         "1" if close_game_when_done else "0"
                     ),
@@ -1023,6 +1028,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     "custom_ship_presets": load_custom_ship_presets(),
                     "calibration": CalibrationStore().status().to_dict(),
                     "game": game_status(),
+                    "launchers": launcher_statuses(),
                 }
             )
             return

@@ -2066,7 +2066,13 @@ def run():
     reporter.update("starting", "正在搜索游戏窗口")
     window = wait_for_game_window(timeout=2)
     if window is None:
-        result = launch_game()
+        launcher_client = (
+            os.environ.get("WOWS_LAUNCHER_CLIENT", "steam").strip().lower()
+            or "steam"
+        )
+        launcher_name = "WG Game Center" if launcher_client == "wgc" else "Steam"
+        logger.info("游戏未运行，使用 %s 自动检索路径并启动", launcher_name)
+        result = launch_game(client=launcher_client)
         if not result.started:
             logger.error("无法自动启动游戏: %s", result.detail)
             reporter.update(
@@ -2076,7 +2082,7 @@ def run():
             )
             return 1
         logger.info("已请求自动启动游戏: %s (%s)", result.method, result.detail)
-        reporter.update("launching_game", "正在通过 Steam 启动战舰世界")
+        reporter.update("launching_game", f"正在通过 {launcher_name} 启动战舰世界")
         launch_timeout = float(os.environ.get("WOWS_GAME_LAUNCH_TIMEOUT", "300"))
         window = wait_for_game_window(timeout=launch_timeout)
     if window is None:

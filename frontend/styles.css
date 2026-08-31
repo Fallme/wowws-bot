@@ -50,3 +50,6 @@ html,body{height:100%;overflow:hidden}.app-shell{width:min(1640px,calc(100% - 32
 .reward-total.task-time{border-color:#386a70;background:linear-gradient(125deg,#65b9bf1b,#081318 66%)}
 .reward-total.task-time strong{color:#8ed5d8;font-size:22px}
 @media(max-width:800px){.task-reward-grid{grid-template-columns:1fr!important}}
+
+/* Client choice stays compact; the full detected path is available as a tooltip. */
+.launcher-control{margin-top:0!important}.launcher-choice{min-width:0;padding:7px 9px!important}.launcher-choice strong,.launcher-choice small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.launcher-choice small.detected{color:var(--green)}.launcher-choice small.missing{color:#a67a72}.launcher-choice:disabled{cursor:not-allowed;opacity:.55}
