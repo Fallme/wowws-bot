@@ -522,7 +522,6 @@ def test_resumed_battle_reasserts_full_speed_before_autopilot_setup():
 
     assert events == [
         "full_speed",
-        "reset",
         "autopilot",
         "center_route",
         "analyze",
@@ -578,7 +577,32 @@ def test_resumed_stalled_route_ignores_lingering_green_autopilot_hud():
 
     configure.assert_not_called()
     assert bot.native_autopilot_abandoned
-    assert events == ["resync", "reset", "center_route", "analyze"]
+    assert events == ["resync", "center_route", "analyze"]
+
+
+def test_wait_for_battle_prefers_positive_hud_over_false_port_state():
+    class ConflictingVision:
+        def __init__(self):
+            self.frames = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            self.frames += 1
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.PORT
+
+        @staticmethod
+        def _has_battle_hud(_image):
+            return True
+
+    vision = ConflictingVision()
+    bot = SimpleNamespace(hwnd=1, vision=vision)
+    with patch("main.time.sleep", return_value=None):
+        assert wait_for_battle(bot, timeout=2)
+
+    assert vision.frames == 2
 
 
 def test_fresh_battle_reasserts_full_speed_even_when_autopilot_succeeds():

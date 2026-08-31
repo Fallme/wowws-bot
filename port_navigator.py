@@ -1693,6 +1693,7 @@ def select_requested_ship(
     ocr_backend=None,
     custom_max_scrolls=18,
     should_abort=None,
+    require_port_action=False,
 ):
     """Select a built-in template ship or an exact custom ship OCR name."""
     ship_key = (ship_key or "").strip().lower()
@@ -1707,6 +1708,28 @@ def select_requested_ship(
     if vision.classify_screen(image) != ScreenState.PORT:
         logger.warning("当前不是港口，拒绝选择舰船")
         return False
+    if require_port_action:
+        # Scene colour/texture is not enough to authorize carousel input. A
+        # live battle at some UI scales can satisfy the broad port anchors.
+        # Reject any positive battle HUD, then require the exact rendered
+        # “加入战斗” text before the first ship scroll or click.
+        battle_detector = getattr(vision, "_has_battle_hud", None)
+        try:
+            battle_hud_visible = bool(
+                callable(battle_detector) and battle_detector(image)
+            )
+        except Exception:
+            logger.debug("选船前战斗 HUD 互锁检查失败", exc_info=True)
+            battle_hud_visible = False
+        if battle_hud_visible:
+            logger.warning("选船互锁：当前画面仍有战斗 HUD，禁止港口选船操作")
+            return False
+        if port_battle_action_point(
+            image,
+            ocr_backend or RapidOcrBackend(),
+        ) is None:
+            logger.warning("选船互锁：未识别到港口“加入战斗”文字，禁止滚动或点击舰船")
+            return False
     if is_custom:
         full_name = (custom_name or os.environ.get("WOWS_CUSTOM_SHIP_NAME", "")).strip()
         if not full_name:
@@ -1814,6 +1837,7 @@ def enter_battle(
             vision,
             ocr_backend=backend,
             should_abort=should_abort,
+            require_port_action=True,
         ):
             logger.warning("未能安全选择目标舰船")
             return False

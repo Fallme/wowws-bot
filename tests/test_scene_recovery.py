@@ -103,7 +103,7 @@ def test_battle_fault_waits_through_loading_and_resumes_battle():
     wait_for_battle.assert_called_once()
 
 
-def test_battle_fault_uses_global_return_to_port_after_unknown_retry_limit():
+def test_battle_fault_never_returns_to_port_before_confirmed_results():
     bot = SimpleNamespace(hwnd=1, vision=SimpleNamespace())
 
     with (
@@ -116,6 +116,44 @@ def test_battle_fault_uses_global_return_to_port_after_unknown_retry_limit():
     ):
         state = recover_after_battle_fault(bot, attempts=3)
 
-    assert state == ScreenState.PORT
+    assert state == ScreenState.UNKNOWN
     assert classify.call_count == 3
-    return_to_port.assert_called_once_with(bot, attempts=3)
+    return_to_port.assert_not_called()
+
+
+def test_active_round_rejects_stable_port_until_results_are_seen():
+    bot = make_bot([ScreenState.PORT, ScreenState.PORT, ScreenState.PORT])
+
+    with patch("main.time.sleep", return_value=None):
+        state = recover_current_scene(
+            bot,
+            attempts=3,
+            round_in_progress=True,
+        )
+
+    assert state == ScreenState.UNKNOWN
+
+
+def test_active_round_battle_hud_overrides_false_port_classification():
+    class ConflictingVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return object()
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.PORT
+
+        @staticmethod
+        def _has_battle_hud(_image):
+            return True
+
+    bot = SimpleNamespace(hwnd=1, vision=ConflictingVision())
+    with patch("main.time.sleep", return_value=None):
+        state = recover_current_scene(
+            bot,
+            attempts=2,
+            round_in_progress=True,
+        )
+
+    assert state == ScreenState.BATTLE

@@ -354,6 +354,7 @@ class BattleBot:
         self._opening_autopilot_attempted = False
         self._tactical_map_attempted_this_battle = False
         self._tactical_map_left_open = False
+        self._round_control_initialized = False
         self.generic_center_route_active = False
         self.movement_feedback_failures = 0
         self._last_movement_mode = None

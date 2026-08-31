@@ -310,6 +310,32 @@ def classify_runtime_screen(bot, image) -> ScreenState:
     return state
 
 
+def classify_battle_continuity_screen(bot, image) -> ScreenState:
+    """Give a positive live HUD priority while a match is being entered/resumed.
+
+    The generic classifier deliberately lets strong port controls win visual
+    conflicts. During an already committed match that ordering is unsafe: a
+    bright battle scene can imitate the port header and carousel for several
+    frames. The minimap plus independent HUD anchors are stronger evidence in
+    this phase, so only this phase-specific classifier may override PORT.
+    """
+    state = classify_runtime_screen(bot, image)
+    if state != ScreenState.PORT:
+        return state
+    detector = getattr(bot.vision, "_has_battle_hud", None)
+    if not callable(detector):
+        return state
+    try:
+        battle_hud_visible = bool(detector(image))
+    except Exception:
+        logger.debug("战斗连续性 HUD 复核失败", exc_info=True)
+        return state
+    if battle_hud_visible:
+        logger.info("战斗连续性复核：小地图与 HUD 锚点成立，覆盖本帧港口误判")
+        return ScreenState.BATTLE
+    return state
+
+
 def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
     """Wait through login/splash/loading until an actionable screen is visible."""
     deadline = time.monotonic() + max(1.0, float(timeout))
@@ -603,7 +629,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         except CaptureFault as error:
             logger.info("结算返回后的画面暂不可用，稍后重新识别: %s", error)
             return False
-        state = classify_runtime_screen(bot, image)
+        state = classify_battle_continuity_screen(bot, image)
 
     if state != ScreenState.PORT:
         logger.warning("当前界面为 %s，优先尝试恢复到港口", state.value)
@@ -642,7 +668,11 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
             bot.hwnd,
             ship_key,
             vision=bot.vision,
+            ocr_backend=getattr(
+                getattr(bot, "distance_reader", None), "backend", None
+            ),
             should_abort=port_action_paused,
+            require_port_action=True,
         ):
             logger.warning("未能安全选择目标舰船")
             return False
@@ -719,7 +749,7 @@ def wait_for_battle(
             if not refresh_game_window(bot):
                 time.sleep(0.5)
             continue
-        state = classify_runtime_screen(bot, image)
+        state = classify_battle_continuity_screen(bot, image)
         if state != last_state:
             logger.info(
                 "等待战斗识别: %s | 截图=%s",
@@ -911,16 +941,22 @@ def run_battle(
     setattr(bot, "_opening_autopilot_preconfigured", False)
     setattr(bot, "_opening_autopilot_attempted", False)
     setattr(bot, "_opening_motion_prestarted", False)
-    try:
-        bot.reset(
-            preserve_movement=(
-                resume_existing or preconfigured_autopilot or prestarted_motion
-            ),
-            preserve_static_map=(resume_existing or preconfigured_autopilot),
-        )
-    except TypeError:
-        # Compatibility for small test doubles and third-party adapters.
-        bot.reset()
+    if resume_existing:
+        # A focus/capture pause is not a round boundary. Full reset() starts a
+        # new event stream and clears battle timers, consumable cooldowns,
+        # tracking filters and route state. Preserve all of that until a
+        # settlement page positively closes this match.
+        logger.info("接续同一局战斗：保留局内计时、地图、航线与消耗品状态")
+    else:
+        try:
+            bot.reset(
+                preserve_movement=(preconfigured_autopilot or prestarted_motion),
+                preserve_static_map=preconfigured_autopilot,
+            )
+        except TypeError:
+            # Compatibility for small test doubles and third-party adapters.
+            bot.reset()
+        setattr(bot, "_round_control_initialized", True)
     if abandoned_native_route:
         # ``reset(preserve_movement=True)`` rebuilds vision/route state during
         # same-battle recovery. Preserve the decision to ignore a stale green
@@ -1006,8 +1042,13 @@ def run_battle(
         bot.last_movement_reason = "自动航行设置失败，通用驾驶向地图中央接管"
         logger.warning("战术地图自动航行设置失败，通用驾驶向地图中央接管")
     last_progress = 0.0
+    quick_started_at = (
+        float(getattr(bot, "battle_start_time", time.monotonic()))
+        if resume_existing
+        else time.monotonic()
+    )
     quick_deadline = (
-        time.monotonic() + max(30.0, float(quick_seconds))
+        quick_started_at + max(30.0, float(quick_seconds))
         if quick_battle
         else None
     )
@@ -1776,6 +1817,7 @@ def recover_current_scene(
     attempts: int = 6,
     stable_frames: int = 2,
     poll_interval: float = 0.25,
+    round_in_progress: bool = False,
 ) -> ScreenState:
     """Observe the current page until one scene is stable on multiple frames.
 
@@ -1803,7 +1845,11 @@ def recover_current_scene(
             continue
         try:
             image = bot.vision.grab(bot.hwnd, allow_stale=True)
-            state = classify_runtime_screen(bot, image)
+            state = (
+                classify_battle_continuity_screen(bot, image)
+                if round_in_progress
+                else classify_runtime_screen(bot, image)
+            )
         except CaptureFault as error:
             logger.info(
                 "恢复检查暂时无法取得画面 (%s/%s): %s",
@@ -1814,6 +1860,20 @@ def recover_current_scene(
             state = ScreenState.UNKNOWN
             if not operation_paused(bot):
                 refresh_game_window(bot)
+
+        if round_in_progress and state in {
+            ScreenState.PORT,
+            ScreenState.DAILY_REWARD,
+        }:
+            # A port-looking frame cannot close an active round. The game may
+            # have transitioned or the bright battle HUD may have fooled the
+            # broad port detector, but neither authorizes carousel clicks.
+            # Only a confirmed settlement page clears the round lock.
+            logger.warning(
+                "本局尚未确认结算，忽略 %s 判定并禁止进入港口/选船流程",
+                state.value,
+            )
+            state = ScreenState.UNKNOWN
 
         if state == ScreenState.UNKNOWN:
             previous_state = ScreenState.UNKNOWN
@@ -1857,7 +1917,7 @@ def recover_after_battle_fault(
     for attempt in range(1, retry_count + 1):
         if should_stop and should_stop():
             return ScreenState.UNKNOWN
-        last_state = recover_current_scene(bot)
+        last_state = recover_current_scene(bot, round_in_progress=True)
         logger.info(
             "战斗故障后场景恢复 (%s/%s): %s",
             attempt,
@@ -1867,7 +1927,6 @@ def recover_after_battle_fault(
         if last_state in {
             ScreenState.BATTLE,
             ScreenState.RESULTS,
-            ScreenState.PORT,
             ScreenState.ESCAPE_MENU,
             ScreenState.EXIT_CONFIRMATION,
         }:
@@ -1892,9 +1951,7 @@ def recover_after_battle_fault(
     # login/disconnect prompt cannot spin forever or receive blind clicks.
     if last_state == ScreenState.LOADING:
         return last_state
-    logger.warning("场景连续未知，执行全局 Esc 回港恢复")
-    if return_to_port(bot, attempts=3):
-        return ScreenState.PORT
+    logger.warning("本局尚未确认结算，场景连续未知；保持识别且不执行回港/选船操作")
     return ScreenState.UNKNOWN
 
 
@@ -2205,7 +2262,10 @@ def run():
     port_configured = False
     preparation_failures = 0
     battle_recovery_failures = 0
-    battle_observed_in_run = False
+    # Once matchmaking/loading/battle has been committed, PORT is not allowed
+    # to start selection again until settlement positively closes this round.
+    round_in_progress = False
+    round_entry_pending = False
     plan_completed = False
 
     def should_stop():
@@ -2221,7 +2281,8 @@ def run():
                 break
             if lifecycle_resume_gate.resumed:
                 logger.info(
-                    "[SYSTEM] 已回到生命周期入口；开始按当前画面重新选择流程"
+                    "[SYSTEM] 已回到生命周期入口；重新判定当前画面，"
+                    "未确认结算则继续同一局"
                 )
             if not refresh_game_window(bot):
                 reporter.update(
@@ -2233,10 +2294,15 @@ def run():
                 time.sleep(1.0)
                 continue
             current_round = completed_rounds + 1
-            logger.info("=== 第 %s 局 ===", current_round)
+            round_locked = round_in_progress or round_entry_pending
+            logger.info(
+                "=== 第 %s 局%s ===",
+                current_round,
+                "（接续）" if round_locked else "",
+            )
             reporter.update(
                 "preparing",
-                "正在准备下一局",
+                "正在恢复当前战斗" if round_locked else "正在准备下一局",
                 current_round=current_round,
                 completed_rounds=completed_rounds,
             )
@@ -2249,21 +2315,43 @@ def run():
                 attempts=5,
                 stable_frames=2,
                 poll_interval=0.2,
+                round_in_progress=round_locked,
             )
             prepared = False
             resuming_this_battle = False
             result_ready = False
             if current_scene == ScreenState.BATTLE:
+                if round_entry_pending:
+                    round_entry_pending = False
+                    round_in_progress = True
                 prepared = True
-                resuming_this_battle = True
-                logger.info("当前已在战斗中：跳过选船，直接配置自动航行并接管")
+                resuming_this_battle = bool(
+                    getattr(bot, "_round_control_initialized", False)
+                )
+                logger.info(
+                    "当前已在战斗中：跳过选船，%s",
+                    "接续本局控制" if resuming_this_battle else "建立本局控制",
+                )
             elif current_scene == ScreenState.LOADING:
-                logger.info("当前处于加载中：等待 HUD 后进入战斗控制")
+                if round_entry_pending:
+                    round_entry_pending = False
+                    round_in_progress = True
+                resuming_this_battle = bool(
+                    getattr(bot, "_round_control_initialized", False)
+                )
+                logger.info(
+                    "当前处于加载中：%s",
+                    "等待同一局 HUD 恢复" if resuming_this_battle else "等待本局 HUD 出现",
+                )
+                # Loading after a committed join is already inside this round.
+                # Lock before waiting so a pause during the transition cannot
+                # fall back into carousel selection.
+                round_in_progress = True
                 prepared = wait_for_battle(
                     bot,
                     should_stop=should_stop,
-                    require_new_round=True,
-                    loading_already_seen=True,
+                    require_new_round=not resuming_this_battle,
+                    loading_already_seen=not resuming_this_battle,
                 )
             elif current_scene == ScreenState.DAILY_REWARD:
                 logger.info("当前处于每日奖励页：领取后回港并重新开始准备")
@@ -2291,8 +2379,9 @@ def run():
                 preparation_failures = 0
                 continue
             elif current_scene == ScreenState.RESULTS:
-                if not battle_observed_in_run:
-                    logger.info("启动时发现上次任务遗留的结算页：不计入本组，返回港口")
+                if not round_in_progress:
+                    round_entry_pending = False
+                    logger.info("当前结算页不属于已进入的新战斗：不重复计数，返回港口")
                     return_to_port(bot, attempts=3)
                     port_configured = False
                     continue
@@ -2315,16 +2404,29 @@ def run():
                     battle_queued = False
                 if battle_queued and configured_this_attempt:
                     port_configured = True
+                if battle_queued:
+                    # From this moment until a confirmed settlement, any PORT
+                    # classification is treated as unsafe. This specifically
+                    # covers a user pause during wait_for_battle().
+                    round_entry_pending = True
                 prepared = battle_queued and wait_for_battle(
                     bot,
                     should_stop=should_stop,
                     require_new_round=True,
                     loading_already_seen=True,
                 )
+                if prepared:
+                    round_entry_pending = False
+                    round_in_progress = True
             else:
-                logger.warning("当前场景仍未知，按全局规则尝试 Esc 返回港口")
-                return_to_port(bot, attempts=3)
-                port_configured = False
+                if round_in_progress or round_entry_pending:
+                    logger.warning(
+                        "本局尚未确认结算且当前场景未知；保持识别，禁止回港和选船"
+                    )
+                else:
+                    logger.warning("当前场景仍未知，按全局规则尝试 Esc 返回港口")
+                    return_to_port(bot, attempts=3)
+                    port_configured = False
             if not prepared:
                 if should_stop():
                     break
@@ -2348,12 +2450,19 @@ def run():
                     # Resume is always live-state based.  Do not continue from
                     # a half-finished carousel/mode-selector operation.
                     continue
-                recovered_state = recover_current_scene(bot)
+                recovered_state = recover_current_scene(
+                    bot,
+                    round_in_progress=(round_in_progress or round_entry_pending),
+                )
                 if recovered_state == ScreenState.BATTLE:
+                    round_entry_pending = False
+                    round_in_progress = True
                     logger.info("准备恢复确认已在战斗中，下一循环直接接管")
                     preparation_failures = 0
                     continue
                 if recovered_state == ScreenState.LOADING:
+                    round_entry_pending = False
+                    round_in_progress = True
                     logger.info("准备恢复确认正在加载，继续等待战斗 HUD")
                     preparation_failures = 0
                     reporter.update(
@@ -2367,8 +2476,12 @@ def run():
                             bot,
                             timeout=45.0,
                             should_stop=should_stop,
-                            require_new_round=True,
-                            loading_already_seen=True,
+                            require_new_round=not bool(
+                                getattr(bot, "_round_control_initialized", False)
+                            ),
+                            loading_already_seen=not bool(
+                                getattr(bot, "_round_control_initialized", False)
+                            ),
                         ):
                             logger.info("加载恢复已确认 HUD，下一循环直接进入战斗")
                             continue
@@ -2414,7 +2527,8 @@ def run():
             preparation_failures = 0
             port_configured = True
             if not result_ready:
-                battle_observed_in_run = True
+                round_in_progress = True
+                round_entry_pending = False
                 reporter.update(
                     "battle",
                     "战斗已开始，等待闭环反馈",
@@ -2776,7 +2890,9 @@ def run():
                     battle_finished,
                     closure_confirmed=True,
                 )
-                battle_observed_in_run = False
+                round_in_progress = False
+                round_entry_pending = False
+                setattr(bot, "_round_control_initialized", False)
                 logger.info(
                     "快速战斗已确认离开，本局计入计划进度: %s",
                     completed_rounds,
@@ -2826,6 +2942,7 @@ def run():
                         should_abort=lambda: operation_paused(bot),
                     )
                 if queued:
+                    round_entry_pending = True
                     reporter.update(
                         "requeueing",
                         "快速战斗不统计收益，已点击继续战斗进入下一局",
@@ -2839,6 +2956,8 @@ def run():
                         require_new_round=True,
                         loading_already_seen=True,
                     ):
+                        round_entry_pending = False
+                        round_in_progress = True
                         continue
                     logger.warning("快速续局已点击，但新一局 HUD 尚未确认；重新识别")
                 continue
@@ -2936,7 +3055,9 @@ def run():
                     last_outcome=rewards.outcome,
                 )
             completed_rounds += 1
-            battle_observed_in_run = False
+            round_in_progress = False
+            round_entry_pending = False
+            setattr(bot, "_round_control_initialized", False)
             if should_stop():
                 plan_completed = not user_stop_requested()
                 reporter.update(
@@ -2995,12 +3116,15 @@ def run():
                 backend=reward_reader.backend,
                 should_abort=lambda: operation_paused(bot),
             ):
+                round_entry_pending = True
                 if wait_for_battle(
                     bot,
                     should_stop=should_stop,
                     require_new_round=True,
                     loading_already_seen=True,
                 ):
+                    round_entry_pending = False
+                    round_in_progress = True
                     continue
                 if should_stop():
                     break
@@ -3013,18 +3137,20 @@ def run():
                     error="requeue_battle_not_confirmed",
                     safety_state="armed",
                 )
-                recovered_state = recover_current_scene(bot)
+                recovered_state = recover_current_scene(
+                    bot,
+                    round_in_progress=True,
+                )
                 if recovered_state == ScreenState.BATTLE:
+                    round_entry_pending = False
+                    round_in_progress = True
                     logger.info("下一局 HUD 已确认，下一循环重新确认场景后接管")
                 elif recovered_state == ScreenState.RESULTS:
+                    round_entry_pending = False
                     return_to_port(bot, attempts=2)
                     port_configured = False
-                elif recovered_state == ScreenState.PORT:
-                    port_configured = False
                 elif recovered_state == ScreenState.UNKNOWN:
-                    logger.warning("下一局场景仍未知，按全局规则 Esc 返回港口")
-                    return_to_port(bot, attempts=3)
-                    port_configured = False
+                    logger.warning("下一局场景仍未知；保持入局锁，禁止选船并继续识别")
                 continue
             logger.warning("无法直接继续战斗，开始执行已验证的回港兜底")
             returned_to_port = return_to_port(bot, attempts=6)

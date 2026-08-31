@@ -293,6 +293,37 @@ class PortSelectionTests(unittest.TestCase):
                     custom_max_scrolls=0,
                 )
 
+    def test_strict_ship_selection_rejects_false_port_with_battle_hud(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+
+        class ConflictingVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+            @staticmethod
+            def _has_battle_hud(_image):
+                return True
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator._scroll_ship_carousel_down") as scroll,
+            patch("port_navigator._click_local") as click,
+        ):
+            selected = self.select_requested_ship(
+                1,
+                "pommern",
+                ConflictingVision(),
+                ocr_backend=self.backend(),
+                require_port_action=True,
+            )
+
+        self.assertFalse(selected)
+        scroll.assert_not_called()
+        click.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
