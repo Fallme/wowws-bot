@@ -61,10 +61,9 @@
             <p id="limitHint">完整结束 5 局后返回港口并停止</p>
           </div>
           <label class="quick-battle-toggle"><input id="quickBattle" type="checkbox" /><span><b>快速战斗</b><small>单局最多 5 分钟；计入计划局数，不统计收益或胜负</small></span></label>
+          <label class="quick-battle-toggle"><input id="closeGameWhenDone" type="checkbox" /><span><b>完成后关闭游戏</b><small>仅整组目标完成后关闭《战舰世界》；暂停、终止或异常不会关闭</small></span></label>
           <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
-          <div class="human-alert" id="interventionCard" hidden><strong>需要人工检查</strong><p id="interventionMessage"></p><button id="retryBtn">问题处理后重试</button></div>
-          <div class="human-alert manual-hold" id="manualResumeCard" hidden><strong id="manualResumeTitle">用户介入暂停</strong><p id="manualResumeMessage">系统已停止截图、切窗和全部游戏指令。</p><button id="manualResumeBtn">继续自动操作</button></div>
-          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动作战</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止作战</button></div>
+          <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动战斗</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止任务</button></div>
           <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
         </article>
 
@@ -114,12 +113,13 @@
             <div class="reward-total credits"><small>银币</small><strong id="creditsTotal">0</strong><span>本组累计</span></div>
             <div class="reward-total ship-xp"><small>经验</small><strong id="shipXpTotal">0</strong><span>本组累计</span></div>
             <div class="reward-total free-xp"><small>全局经验</small><strong id="freeXpTotal">0</strong><span>本组累计</span></div>
+            <div class="reward-total task-time"><small>累计用时</small><strong id="taskDuration">00:00:00</strong><span>本组实际运行时间</span></div>
           </div>
           <div class="task-history-heading"><strong>自动作战历史</strong><span id="historySummary">暂无历史任务</span></div>
           <div class="task-history" id="taskHistory"><p class="history-empty">完成过的自动作战任务会显示在这里。</p></div>
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260829_2" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260830_1" defer></script>
   </body>
 </html>

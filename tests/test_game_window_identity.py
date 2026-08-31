@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+import main
 from core import window
 
 
@@ -93,3 +96,22 @@ def test_custom_regional_process_name_can_be_added(monkeypatch):
     )
 
     assert window.is_game_window(404)
+
+
+def test_completion_close_posts_wm_close_only_to_verified_game(monkeypatch):
+    messages = []
+    monkeypatch.setattr(main, "is_game_window", lambda hwnd: hwnd == 202)
+    monkeypatch.setattr(
+        main.ctypes,
+        "windll",
+        SimpleNamespace(
+            user32=SimpleNamespace(
+                PostMessageW=lambda *args: messages.append(args) or 1
+            )
+        ),
+    )
+
+    assert main.close_game_window_after_plan(202)
+    assert messages == [(202, 0x0010, 0, 0)]
+    assert not main.close_game_window_after_plan(101)
+    assert messages == [(202, 0x0010, 0, 0)]

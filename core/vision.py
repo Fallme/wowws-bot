@@ -112,7 +112,21 @@ class Vision:
             & (hsv[:, :, 1] > 80)
             & (hsv[:, :, 2] > 90)
         )
-        return float(np.mean(green)) >= 0.008
+        green_pixels = int(np.count_nonzero(green))
+        # A pure ratio silently fails on a 4K framebuffer when the user keeps
+        # the game UI compact: the label retains roughly the same pixel size
+        # while this relative ROI quadruples. Combine the ratio with a capped
+        # scale-aware pixel floor; the tight ROI still excludes the HP bar and
+        # minimap's many green elements.
+        framebuffer_scale = min(width / 2560.0, height / 1600.0)
+        minimum_pixels = max(
+            24,
+            int(round(120 * min(max(framebuffer_scale, 0.35), 1.0) ** 2)),
+        )
+        return bool(
+            float(np.mean(green)) >= 0.008
+            or green_pixels >= minimum_pixels
+        )
 
     @staticmethod
     def detect_rudder_indicator(image) -> str:
@@ -231,10 +245,11 @@ class Vision:
         endpoints = [
             item
             for item in raw_candidates
-            if scale * 0.055 <= item[1].radius <= scale * 0.112
+            if scale * 0.064 <= item[1].radius <= scale * 0.112
             and (
                 player is None
-                or math.dist(item[1].center, player) > scale * 0.050
+                or math.dist(item[1].center, player)
+                > max(scale * 0.12, item[1].radius * 1.15)
             )
         ]
         best_formation = None
@@ -242,7 +257,11 @@ class Vision:
             for right_rank, right in endpoints[left_index + 1 :]:
                 first, third = left, right
                 separation = math.dist(first.center, third.center)
-                if not scale * 0.28 <= separation <= scale * 0.70:
+                # Partial arcs from the player's concentric range rings can
+                # be fitted as three nearby circles.  Real multi-cap layouts
+                # span a substantial part of the minimap; reject the compact
+                # fake formation before assigning A/B/C labels.
+                if not scale * 0.36 <= separation <= scale * 0.74:
                     continue
                 if abs(first.radius - third.radius) > scale * 0.025:
                     continue
@@ -326,6 +345,13 @@ class Vision:
                 ):
                     distinct.append((rank, zone))
             if len(distinct) >= 2:
+                formation_span = max(
+                    math.dist(first[1].center, second[1].center)
+                    for index, first in enumerate(distinct)
+                    for second in distinct[index + 1 :]
+                )
+                if formation_span < scale * 0.36:
+                    continue
                 uniform_groups.append(
                     (
                         sum(rank for rank, _zone in distinct[:4])
@@ -352,15 +378,23 @@ class Vision:
         # become an autopilot destination.
         candidates = []
         for _rank, zone in raw_candidates:
-            if not scale * 0.055 <= zone.radius <= scale * 0.112:
+            if not scale * 0.064 <= zone.radius <= scale * 0.112:
                 continue
             if player is not None:
                 player_offset = math.dist(zone.center, player)
-                if player_offset <= scale * 0.055:
+                if player_offset <= max(scale * 0.12, zone.radius * 1.15):
                     continue
                 if player_offset <= zone.radius * 0.72:
                     continue
             candidates.append(zone)
+        if len(candidates) >= 2:
+            candidate_span = max(
+                math.dist(first.center, second.center)
+                for index, first in enumerate(candidates)
+                for second in candidates[index + 1 :]
+            )
+            if candidate_span < scale * 0.36:
+                return []
         return candidates
 
     def find_nearest_capture_zone(self, minimap, player):
@@ -574,13 +608,16 @@ class Vision:
         if len(points) < 3:
             return None
         if len(points) == 3:
-            # The live minimap arrow is a broad triangular pointer.  Its base
-            # is the longest edge, so the opposite vertex is the bow heading.
+            # The live minimap arrow is a long, narrow triangular pointer.
+            # Its short edge is the stern/base and the opposite vertex is the
+            # bow.  Treating a long sloping side as the base flips the heading
+            # toward a stern corner by roughly 150-180 degrees (confirmed on
+            # the saved 2K battle frames).
             opposite_edges = []
             for index, point in enumerate(points):
                 other = np.delete(points, index, axis=0)
                 opposite_edges.append((np.linalg.norm(other[0] - other[1]), point))
-            return max(opposite_edges, key=lambda candidate: candidate[0])[1]
+            return min(opposite_edges, key=lambda candidate: candidate[0])[1]
         best = None
         for index, point in enumerate(points):
             previous = points[index - 1] - point
@@ -816,10 +853,17 @@ class Vision:
             np.abs(hue - ocean_hue),
             180.0 - np.abs(hue - ocean_hue),
         )
-        terrain = (
+        colored_terrain = (
             (hue_delta > 16)
             & (saturation > 22)
             & (value > 28)
+        ).astype(np.uint8) * 255
+        # Snow maps encode most coastlines as bright, low-saturation shapes.
+        # The old hue-only mask therefore produced no terrain at all.  Keep a
+        # second neutral layer and filter its thin grid/range components below.
+        neutral_terrain = (
+            (saturation <= 145)
+            & (value >= 125)
         ).astype(np.uint8) * 255
         # Red/green team marks, capture circles and smoke overlays are not
         # coastlines.  Remove them before connected-component extraction.
@@ -827,23 +871,70 @@ class Vision:
             (((hue >= 35) & (hue <= 95)) | (hue <= 8) | (hue >= 168))
             & (saturation > 70)
         )
-        terrain[ui_overlay] = 0
-        for zone in self.find_capture_zones(minimap):
-            yy, xx = np.indices(terrain.shape)
-            terrain[
+        colored_terrain[ui_overlay] = 0
+        neutral_terrain[ui_overlay] = 0
+        player_pose = self.find_player_pose_on_minimap(minimap)
+        player = None if player_pose is None else player_pose.position
+        zone_mask = np.zeros((height, width), dtype=bool)
+        yy, xx = np.indices((height, width))
+        for zone in self.find_capture_zones(minimap, player=player):
+            zone_mask |= (
                 (xx - zone.center[0]) ** 2 + (yy - zone.center[1]) ** 2
                 <= (zone.radius * 1.12) ** 2
-            ] = 0
-        terrain = cv2.morphologyEx(
-            terrain, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+            )
+        colored_terrain[zone_mask] = 0
+        neutral_terrain[zone_mask] = 0
+        if player is not None:
+            player_mask = (
+                (xx - player[0]) ** 2 + (yy - player[1]) ** 2
+                <= (scale * 0.045) ** 2
+            )
+            colored_terrain[player_mask] = 0
+            neutral_terrain[player_mask] = 0
+
+        minimum_pixels = max(70, int(scale * scale * 0.00018))
+        minimum_extent = max(8, int(scale * 0.014))
+
+        def retained_components(source, *, neutral=False):
+            source = cv2.morphologyEx(
+                source, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+            )
+            source = cv2.morphologyEx(
+                source, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+            )
+            count, component_labels, component_stats, _ = (
+                cv2.connectedComponentsWithStats(source, connectivity=8)
+            )
+            kept = np.zeros_like(source)
+            for component_label in range(1, count):
+                x, y, component_width, component_height, pixels = (
+                    component_stats[component_label]
+                )
+                bounding_area = max(component_width * component_height, 1)
+                density = pixels / bounding_area
+                if pixels < minimum_pixels or density < 0.15:
+                    continue
+                if max(component_width, component_height) < minimum_extent:
+                    continue
+                if (
+                    component_width > scale * (0.48 if neutral else 0.52)
+                    or component_height > scale * (0.48 if neutral else 0.52)
+                    or bounding_area > scale * scale * (0.20 if neutral else 0.22)
+                ):
+                    continue
+                kept[component_labels == component_label] = 255
+            return kept
+
+        terrain = cv2.bitwise_or(
+            retained_components(colored_terrain),
+            retained_components(neutral_terrain, neutral=True),
         )
-        terrain = cv2.morphologyEx(
-            terrain, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
-        )
+        # Reapply capture removal after the two masks are combined so circle
+        # fragments cannot reconnect through a nearby snowy island.
+        terrain[zone_mask] = 0
         labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
             terrain, connectivity=8
         )
-        minimum_pixels = max(70, int(scale * scale * 0.00018))
         candidates = []
         for label in range(1, labels_count):
             x, y, component_width, component_height, pixels = stats[label]
@@ -852,6 +943,13 @@ class Vision:
             if pixels < minimum_pixels or density < 0.15:
                 continue
             if max(component_width, component_height) < max(8, int(scale * 0.014)):
+                continue
+            if (
+                x <= scale * 0.008
+                or y <= scale * 0.008
+                or x + component_width >= width - scale * 0.008
+                or y + component_height >= height - scale * 0.008
+            ):
                 continue
             if (
                 component_width > scale * 0.52
@@ -879,11 +977,17 @@ class Vision:
                 ]
                 for point in simplified[:12]
             ]
-            candidates.append((int(pixels), points))
+            candidates.append(
+                (
+                    int(pixels),
+                    points,
+                    round(float(pixels) / max(width * height, 1), 6),
+                )
+            )
         candidates.sort(key=lambda item: item[0], reverse=True)
         return [
-            {"points": points}
-            for _, points in candidates[: max(0, int(maximum_shapes))]
+            {"points": points, "area": area}
+            for _, points, area in candidates[: max(0, int(maximum_shapes))]
         ]
 
     @staticmethod
@@ -1177,6 +1281,196 @@ class Vision:
             x2,
             y2,
         )
+        return None
+
+    @staticmethod
+    def find_tactical_map(image):
+        """Rectify the M-key tactical grid into normalized map coordinates.
+
+        The tactical grid is a slightly perspective-projected trapezoid and is
+        shifted left to leave room for the instruction panel.  A centred crop
+        therefore moves map objects by several percent.  Detect its repeated
+        horizontal/vertical grid lines and warp the four outer corners to a
+        square.  The old centred crop remains a safe fallback for themes where
+        the faint grid cannot be recovered.
+        """
+        if image is None or image.size == 0:
+            return None
+        height, width = image.shape[:2]
+        map_size = int(round(min(float(width), float(height)) * 0.81))
+        if map_size <= 0:
+            return None
+        left = max(0, int(round((width - map_size) / 2.0)))
+        top = max(0, int(round((height - map_size) / 2.0)))
+        right = min(width, left + map_size)
+        bottom = min(height, top + map_size)
+        fallback = image[top:bottom, left:right]
+
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 30, 90)
+            horizontal_lines = cv2.HoughLinesP(
+                edges,
+                1,
+                np.pi / 360,
+                threshold=max(80, int(width * 0.055)),
+                minLineLength=max(120, int(width * 0.24)),
+                maxLineGap=max(12, int(height * 0.035)),
+            )
+            horizontal_positions = []
+            if horizontal_lines is not None:
+                for raw_x1, raw_y1, raw_x2, raw_y2 in horizontal_lines.reshape(
+                    -1,
+                    4,
+                ):
+                    x1, y1, x2, y2 = map(
+                        int,
+                        (raw_x1, raw_y1, raw_x2, raw_y2),
+                    )
+                    if x2 < x1:
+                        x1, x2, y1, y2 = x2, x1, y2, y1
+                    line_y = (y1 + y2) / 2.0
+                    if (
+                        abs(y2 - y1) <= max(4, int(height * 0.005))
+                        and x2 - x1 >= width * 0.24
+                        and x1 < width * 0.55
+                        and width * 0.60 < x2 < width * 0.82
+                        and height * 0.035 < line_y < height * 0.92
+                    ):
+                        horizontal_positions.append(line_y)
+
+            horizontal_clusters = []
+            for line_y in sorted(horizontal_positions):
+                if (
+                    not horizontal_clusters
+                    or line_y - float(np.mean(horizontal_clusters[-1]))
+                    > height * 0.010
+                ):
+                    horizontal_clusters.append([line_y])
+                else:
+                    horizontal_clusters[-1].append(line_y)
+            grid_rows = [
+                float(np.median(cluster)) for cluster in horizontal_clusters
+            ]
+            if len(grid_rows) >= 7:
+                grid_top = min(grid_rows)
+                grid_bottom = max(grid_rows)
+                grid_height = grid_bottom - grid_top
+            else:
+                grid_top = grid_bottom = grid_height = 0.0
+
+            if height * 0.64 <= grid_height <= height * 0.89:
+                vertical_lines = cv2.HoughLinesP(
+                    edges,
+                    1,
+                    np.pi / 720,
+                    threshold=max(70, int(height * 0.055)),
+                    minLineLength=max(120, int(height * 0.22)),
+                    maxLineGap=max(12, int(height * 0.040)),
+                )
+                grid_mid = (grid_top + grid_bottom) / 2.0
+                vertical_models = []
+                if vertical_lines is not None:
+                    for raw_x1, raw_y1, raw_x2, raw_y2 in vertical_lines.reshape(
+                        -1,
+                        4,
+                    ):
+                        x1, y1, x2, y2 = map(
+                            int,
+                            (raw_x1, raw_y1, raw_x2, raw_y2),
+                        )
+                        delta_x = x2 - x1
+                        delta_y = y2 - y1
+                        if (
+                            abs(delta_y) < height * 0.22
+                            or abs(delta_x) > abs(delta_y) * 0.12
+                        ):
+                            continue
+                        lower_y, upper_y = min(y1, y2), max(y1, y2)
+                        if (
+                            lower_y > grid_mid - height * 0.07
+                            or upper_y < grid_mid + height * 0.07
+                        ):
+                            continue
+                        slope = delta_x / delta_y
+                        intercept = x1 - slope * y1
+                        middle_x = slope * grid_mid + intercept
+                        if not width * 0.20 < middle_x < width * 0.80:
+                            continue
+                        vertical_models.append(
+                            (
+                                middle_x,
+                                slope * grid_top + intercept,
+                                slope * grid_bottom + intercept,
+                            )
+                        )
+
+                vertical_clusters = []
+                for model in sorted(vertical_models):
+                    if (
+                        not vertical_clusters
+                        or model[0]
+                        - float(
+                            np.mean(
+                                [item[0] for item in vertical_clusters[-1]]
+                            )
+                        )
+                        > width * 0.012
+                    ):
+                        vertical_clusters.append([model])
+                    else:
+                        vertical_clusters[-1].append(model)
+                grid_columns = [
+                    tuple(
+                        float(np.median([item[index] for item in cluster]))
+                        for index in range(3)
+                    )
+                    for cluster in vertical_clusters
+                ]
+                if len(grid_columns) >= 6:
+                    left_column = grid_columns[0]
+                    right_column = grid_columns[-1]
+                    top_width = right_column[1] - left_column[1]
+                    bottom_width = right_column[2] - left_column[2]
+                    if (
+                        grid_height * 0.72 <= top_width <= grid_height * 1.08
+                        and grid_height * 0.72
+                        <= bottom_width
+                        <= grid_height * 1.08
+                    ):
+                        source = np.float32(
+                            [
+                                [left_column[1], grid_top],
+                                [right_column[1], grid_top],
+                                [left_column[2], grid_bottom],
+                                [right_column[2], grid_bottom],
+                            ]
+                        )
+                        output_size = max(1, int(round(grid_height)))
+                        destination = np.float32(
+                            [
+                                [0, 0],
+                                [output_size - 1, 0],
+                                [0, output_size - 1],
+                                [output_size - 1, output_size - 1],
+                            ]
+                        )
+                        transform = cv2.getPerspectiveTransform(
+                            source,
+                            destination,
+                        )
+                        rectified = cv2.warpPerspective(
+                            image,
+                            transform,
+                            (output_size, output_size),
+                        )
+                        if rectified.size > 0 and rectified.std() > 8:
+                            return rectified
+        except cv2.error:
+            logger.debug("Tactical grid rectification failed", exc_info=True)
+
+        if fallback.size > 0 and fallback.std() > 8:
+            return fallback
         return None
 
     @staticmethod
@@ -1509,6 +1803,44 @@ class Vision:
             and sum(bool(value) for value in port_votes.values()) == 0
             and not self._has_battle_hud(image)
         )
+
+    def _has_loading_start_action(self, image) -> bool:
+        """Confirm the solid ``开始战斗`` action on the pre-battle roster.
+
+        The roster artwork is textured enough to satisfy the deliberately
+        tolerant battle-HUD anchors, while its countdown page has no minimap
+        player marker.  A large horizontal green component in this tight
+        bottom-centre ROI is stronger evidence than those generic anchors.
+        Live consumable icons can add green pixels to the same ROI, but they
+        remain small/square rather than one wide action bar.
+        """
+        if image is None or image.size == 0:
+            return False
+        start_button = self._crop_region(image, LOADING_START_BUTTON)
+        if start_button.size == 0:
+            return False
+        hsv = cv2.cvtColor(start_button, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(
+            hsv,
+            np.array([35, 45, 45]),
+            np.array([85, 255, 255]),
+        )
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            green,
+            connectivity=8,
+        )
+        height, width = green.shape[:2]
+        pixels = max(width * height, 1)
+        for label in range(1, count):
+            _x, _y, component_width, component_height, area = stats[label]
+            if (
+                area / pixels >= 0.16
+                and component_width >= width * 0.55
+                and component_height >= height * 0.20
+                and component_width / max(component_height, 1) >= 2.0
+            ):
+                return True
+        return False
 
     @staticmethod
     def _is_login_splash(image):
@@ -1995,7 +2327,10 @@ class Vision:
         # exit-confirmation button.  Positive startup evidence must win before
         # modal colour checks, while normal loading still remains below the
         # explicit escape-menu rules.
-        if loading_seen and self._is_login_splash(image):
+        if loading_seen and (
+            self._is_login_splash(image)
+            or self._has_loading_start_action(image)
+        ):
             return ScreenState.LOADING
         # A live HUD takes priority over the broad blue/teal modal colour
         # candidates below. On low-contrast ocean maps the sea can fill the

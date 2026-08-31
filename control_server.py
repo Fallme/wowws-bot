@@ -649,6 +649,9 @@ class RunnerManager:
             limit_type = str(payload.get("limit_type", "continuous"))
             limit_value = float(payload.get("limit_value", 0))
             quick_battle = bool(payload.get("quick_battle", False))
+            close_game_when_done = bool(
+                payload.get("close_game_when_done", False)
+            )
             ships = load_ships()
             custom_ship_name = ""
             custom_secondary_range = 0.0
@@ -686,6 +689,9 @@ class RunnerManager:
                     "WOWS_MAX_ROUNDS": str(int(limit_value)) if limit_type == "rounds" else "0",
                     "WOWS_DURATION_MINUTES": str(limit_value) if limit_type == "duration" else "0",
                     "WOWS_QUICK_BATTLE": "1" if quick_battle else "0",
+                    "WOWS_CLOSE_GAME_WHEN_DONE": (
+                        "1" if close_game_when_done else "0"
+                    ),
                     "PYTHONUNBUFFERED": "1",
                     "PYTHONUTF8": "1",
                 }
@@ -776,6 +782,7 @@ class RunnerManager:
             "minimap_contacts": [],
             "capture_zones": [],
             "minimap_islands": [],
+            "other_consumables_ready": False,
             "navigation_source": "unknown",
             "stop_after_current": False,
             "manual_intervention_latched": False,

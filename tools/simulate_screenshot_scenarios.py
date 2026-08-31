@@ -243,6 +243,11 @@ def _battle_replay(image, vision, backend, movement):
 
 def replay_image(path, vision, backend, reward_reader, movement, expected=None):
     started = time.perf_counter()
+    # Curated screenshots are independent scenarios (and may even come from
+    # different battles).  Do not leak the previous image's fixed-side U-turn
+    # commitment into the next report. Runtime battle control deliberately
+    # keeps that state; this offline tool reports the decision for this frame.
+    movement.reset()
     image = cv2.imread(str(path))
     if image is None:
         return {"path": str(path), "error": "image_read_failed", "passed": False}

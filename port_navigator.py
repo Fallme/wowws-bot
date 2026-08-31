@@ -13,6 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from core.frame_guard import CaptureFault
 from core.ui import (
     BATTLE_TYPE_COOPERATIVE_CARD,
     BATTLE_TYPE_SEARCH_AREA,
@@ -21,7 +22,6 @@ from core.ui import (
     PORT_BATTLE_BUTTON,
     PORT_DIALOG_CLOSE,
     PORT_MODE_SELECTOR,
-    QUICK_DEATH_CONTINUE_BUTTON,
     QUICK_EXIT_BATTLE_BUTTON,
     QUICK_EXIT_CONFIRM_YES_BUTTON,
     RESULTS_REQUEUE_BUTTON,
@@ -67,6 +67,20 @@ ASYMMETRIC_PURPLE_UPPER = np.array([170, 255, 255])
 _WINDOW_CAPTURE = ScreenCapture()
 _LAST_SELECTED_CARD_POINT = None
 
+# Text search areas are deliberately wider than the old click rectangles. OCR
+# returns the rendered glyph box, so these regions only limit false positives;
+# the eventual click is always the centre of the recognized text itself.
+PORT_BATTLE_TEXT_AREA = RelativeRegion(0.38, 0.0, 0.62, 0.11)
+PORT_MODE_TEXT_AREA = RelativeRegion(0.51, 0.0, 0.72, 0.11)
+RESULTS_RETURN_TEXT_AREA = RelativeRegion(0.25, 0.78, 0.70, 1.0)
+RESULTS_REQUEUE_TEXT_AREA = RelativeRegion(0.58, 0.78, 1.0, 1.0)
+QUICK_EXIT_CONFIRM_ACTION_AREA = RelativeRegion(0.34, 0.52, 0.59, 0.70)
+
+# Resolution and in-game UI scale are independent. The first term follows the
+# framebuffer width; these factors cover the common compact/normal/large UI
+# settings without maintaining one template set per monitor.
+UI_TEMPLATE_SCALE_FACTORS = (0.72, 0.84, 0.94, 1.0, 1.08, 1.20, 1.35)
+
 
 class ShipSelectionError(RuntimeError):
     """Raised when a requested custom ship cannot be found and verified."""
@@ -104,7 +118,7 @@ def _capture(hwnd=None):
         raise RuntimeError("拒绝桌面截图：港口识别与 OCR 必须绑定游戏窗口")
     image = _WINDOW_CAPTURE.capture_window(hwnd)
     if image is None:
-        raise RuntimeError(
+        raise CaptureFault(
             f"游戏窗口截取失败: {_WINDOW_CAPTURE.last_error or 'unknown'}"
         )
     return image
@@ -193,11 +207,15 @@ def find_battle_button(hwnd=None, image=None):
     )
 
 
-def click_battle(hwnd=None, image=None):
+def click_battle(hwnd=None, image=None, backend=None):
     image = image if image is not None else _capture(hwnd)
-    position = find_battle_button(hwnd, image)
+    position = (
+        port_battle_action_point(image, backend)
+        if backend is not None
+        else find_battle_button(hwnd, image)
+    )
     if position is None:
-        logger.warning("未找到蓝色或橙色“加入战斗”按钮")
+        logger.warning("未识别到“加入战斗”文字按钮")
         return False
     logger.info("定位“加入战斗”: local=%s", position)
     clicked = _click_local(hwnd, position)
@@ -625,7 +643,20 @@ def ensure_requested_mode(
             if vision.classify_screen(image) != ScreenState.PORT:
                 logger.warning("当前不是港口或模式选择页，本轮不执行模式点击")
                 return False
-            if not _click_region(hwnd, image, PORT_MODE_SELECTOR):
+            mode_point = (
+                port_mode_selector_action_point(image, backend)
+                if backend is not None
+                else None
+            )
+            if backend is not None and mode_point is None:
+                logger.warning("港口页 OCR 未定位到当前战斗模式入口")
+                return False
+            clicked = (
+                _click_local(hwnd, mode_point)
+                if mode_point is not None
+                else _click_region(hwnd, image, PORT_MODE_SELECTOR)
+            )
+            if not clicked:
                 continue
             time.sleep(1.0)
             image = _capture(hwnd)
@@ -731,28 +762,229 @@ def _token_geometry(token):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _verified_action_point(image, backend, wanted, *, rejected=()):
-    """Locate a semantic action from OCR while excluding dangerous siblings."""
+def _ocr_line_candidates(tokens, minimum_confidence=0.60):
+    """Yield individual and adjacent OCR tokens as semantic text boxes.
+
+    OCR engines may return ``加入战斗`` as one token at 2K and as ``加入`` +
+    ``战斗`` at 1080p or a different UI scale. Joining only nearby tokens on
+    the same baseline handles both cases without joining separate buttons.
+    """
+    entries = []
+    for token in tokens or ():
+        geometry = _token_geometry(token)
+        confidence = float(getattr(token, "confidence", 0.0))
+        text = _normalize_ship_name(getattr(token, "text", ""))
+        if confidence < minimum_confidence or geometry is None or not text:
+            continue
+        x1, y1, x2, y2 = (float(value) for value in geometry)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        entries.append(
+            {
+                "text": text,
+                "confidence": confidence,
+                "box": (x1, y1, x2, y2),
+                "center_y": (y1 + y2) / 2.0,
+                "height": y2 - y1,
+            }
+        )
+
+    lines = []
+    for entry in sorted(
+        entries,
+        key=lambda item: (item["center_y"], item["box"][0]),
+    ):
+        compatible = None
+        compatible_distance = None
+        for line in lines:
+            distance = abs(entry["center_y"] - line["center_y"])
+            tolerance = max(entry["height"], line["height"]) * 0.65
+            if distance <= tolerance and (
+                compatible_distance is None or distance < compatible_distance
+            ):
+                compatible = line
+                compatible_distance = distance
+        if compatible is None:
+            lines.append(
+                {
+                    "tokens": [entry],
+                    "center_y": entry["center_y"],
+                    "height": entry["height"],
+                }
+            )
+        else:
+            compatible["tokens"].append(entry)
+            count = len(compatible["tokens"])
+            compatible["center_y"] = (
+                compatible["center_y"] * (count - 1) + entry["center_y"]
+            ) / count
+            compatible["height"] = max(compatible["height"], entry["height"])
+
+    candidates = []
+    for line in lines:
+        ordered = sorted(line["tokens"], key=lambda item: item["box"][0])
+        for start in range(len(ordered)):
+            group = []
+            for end in range(start, min(len(ordered), start + 4)):
+                current = ordered[end]
+                if group:
+                    previous = group[-1]
+                    gap = current["box"][0] - previous["box"][2]
+                    max_gap = max(current["height"], previous["height"]) * 2.0
+                    if gap > max_gap:
+                        break
+                group.append(current)
+                candidates.append(
+                    {
+                        "text": "".join(item["text"] for item in group),
+                        "confidence": min(item["confidence"] for item in group),
+                        "box": (
+                            min(item["box"][0] for item in group),
+                            min(item["box"][1] for item in group),
+                            max(item["box"][2] for item in group),
+                            max(item["box"][3] for item in group),
+                        ),
+                    }
+                )
+    return candidates
+
+
+def _verified_action_point(
+    image,
+    backend,
+    wanted,
+    *,
+    rejected=(),
+    region=None,
+    minimum_confidence=0.60,
+    retry_scales=(1.0, 1.45),
+    exact=False,
+):
+    """Locate semantic text and map its OCR box back to framebuffer pixels."""
+    if (
+        image is None
+        or not hasattr(image, "size")
+        or image.size == 0
+        or backend is None
+    ):
+        return None
     wanted = tuple(_normalize_ship_name(value) for value in wanted)
     rejected = tuple(_normalize_ship_name(value) for value in rejected)
-    matches = []
-    for token in backend.recognize(image):
-        geometry = _token_geometry(token)
-        if token.confidence < 0.60 or geometry is None:
-            continue
-        text = _normalize_ship_name(token.text)
-        if not text or any(value and value in text for value in rejected):
-            continue
-        if not any(value and value in text for value in wanted):
-            continue
-        x1, y1, x2, y2 = geometry
-        matches.append(
-            (
-                float(token.confidence),
-                (int((x1 + x2) / 2), int((y1 + y2) / 2)),
+    height, width = image.shape[:2]
+    if region is None:
+        left, top, right, bottom = 0, 0, width, height
+    else:
+        left, top, right, bottom = region.pixels(width, height)
+    crop = image[top:bottom, left:right]
+    if crop.size == 0:
+        return None
+
+    for scale in retry_scales:
+        scale = max(0.1, float(scale))
+        sample = crop
+        if abs(scale - 1.0) > 1e-3:
+            sample = cv2.resize(
+                crop,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA,
             )
-        )
-    return max(matches, default=(0.0, None), key=lambda item: item[0])[1]
+        try:
+            candidates = _ocr_line_candidates(
+                backend.recognize(sample),
+                minimum_confidence=minimum_confidence,
+            )
+        except Exception:
+            logger.exception("界面动作 OCR 失败: scale=%.2f", scale)
+            continue
+        matches = []
+        for candidate in candidates:
+            text = candidate["text"]
+            if any(value and value in text for value in rejected):
+                continue
+            matched_values = [
+                value
+                for value in wanted
+                if value and (text == value if exact else value in text)
+            ]
+            if not matched_values:
+                continue
+            x1, y1, x2, y2 = candidate["box"]
+            exact_bonus = (
+                0.20 if any(text == value for value in matched_values) else 0.0
+            )
+            length_bonus = min(len(text), 12) * 0.001
+            matches.append(
+                (
+                    candidate["confidence"] + exact_bonus + length_bonus,
+                    (
+                        left + int(round((x1 + x2) / (2.0 * scale))),
+                        top + int(round((y1 + y2) / (2.0 * scale))),
+                    ),
+                )
+            )
+        if matches:
+            return max(matches, key=lambda item: item[0])[1]
+    return None
+
+
+def port_battle_action_point(image, backend=None):
+    """Locate the rendered ``加入战斗`` label at any resolution/UI scale."""
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        ("加入战斗",),
+        rejected=("继续战斗", "离开战斗"),
+        region=PORT_BATTLE_TEXT_AREA,
+    )
+
+
+def port_mode_selector_action_point(image, backend=None):
+    """Locate the current battle-mode label in the port header."""
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        (
+            "联合作战",
+            "非对称战斗",
+            "非对称作战",
+            "随机战",
+            "随机战斗",
+            "排位战",
+            "排位战斗",
+            "标准战斗",
+            "行动",
+            "对决",
+        ),
+        rejected=("加入战斗",),
+        region=PORT_MODE_TEXT_AREA,
+        minimum_confidence=0.55,
+    )
+
+
+def results_requeue_action_point(image, backend=None):
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        ("继续战斗", "下一场战斗", "续战斗"),
+        rejected=("返回港口", "回到港口", "港口"),
+        region=RESULTS_REQUEUE_TEXT_AREA,
+    )
+
+
+def results_return_to_port_action_point(image, backend=None):
+    backend = backend or RapidOcrBackend()
+    return _verified_action_point(
+        image,
+        backend,
+        ("返回港口", "回到港口", "港口"),
+        rejected=("继续战斗", "续战斗"),
+        region=RESULTS_RETURN_TEXT_AREA,
+    )
 
 
 def quick_exit_menu_action_point(image, backend=None):
@@ -766,27 +998,37 @@ def quick_exit_menu_action_point(image, backend=None):
     )
 
 
-def quick_death_continue_action_point(image, backend=None):
-    """Find the orange ``继续战斗`` action on the sunk-ship dialog."""
-    backend = backend or RapidOcrBackend()
-    return _verified_action_point(
-        image,
-        backend,
-        ("继续战斗",),
-        rejected=("离开战斗",),
-    )
-
-
 def _is_early_exit_confirmation(image, backend):
+    try:
+        tokens = list(backend.recognize(image) or ())
+    except Exception:
+        logger.warning("提前退出确认页 OCR 失败；拒绝点击确认按钮", exc_info=True)
+        return False
     texts = [
         _normalize_ship_name(token.text)
-        for token in backend.recognize(image)
-        if token.confidence >= 0.55
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.55
     ]
     combined = "".join(texts)
     return (
         _normalize_ship_name("提前退出战斗") in combined
         and _normalize_ship_name("离开战斗") in combined
+    )
+
+
+def quick_exit_confirmation_yes_action_point(image, backend=None):
+    """Locate the exact ``是`` only on a verified early-exit dialog."""
+    backend = backend or RapidOcrBackend()
+    if not _is_early_exit_confirmation(image, backend):
+        return None
+    return _verified_action_point(
+        image,
+        backend,
+        ("是",),
+        rejected=("否",),
+        region=QUICK_EXIT_CONFIRM_ACTION_AREA,
+        minimum_confidence=0.50,
+        exact=True,
     )
 
 
@@ -800,7 +1042,11 @@ def daily_reward_claim_point(image, backend=None):
     if image is None or not hasattr(image, "size") or image.size == 0:
         return None
     backend = backend or RapidOcrBackend()
-    tokens = list(backend.recognize(image) or ())
+    try:
+        tokens = list(backend.recognize(image) or ())
+    except Exception:
+        logger.warning("每日奖励 OCR 失败；本轮不点击领取", exc_info=True)
+        return None
     normalized = [
         (_normalize_ship_name(token.text), token)
         for token in tokens
@@ -907,8 +1153,13 @@ def _ocr_name_matches(
     wanted = _normalize_ship_name(full_name)
     if not wanted:
         return []
+    try:
+        tokens = list(backend.recognize(image) or ())
+    except Exception:
+        logger.warning("舰船名称 OCR 失败；本轮拒绝确认选船", exc_info=True)
+        return []
     items = []
-    for token in backend.recognize(image):
+    for token in tokens:
         geometry = _token_geometry(token)
         if token.confidence < minimum_confidence or geometry is None:
             continue
@@ -1032,7 +1283,12 @@ def is_selected_ship_without_commander(image, backend=None):
         int(width * 0.79) : width,
     ]
     wanted = _normalize_ship_name("没有指挥官")
-    for token in backend.recognize(panel):
+    try:
+        tokens = list(backend.recognize(panel) or ())
+    except Exception:
+        logger.warning("指挥官状态 OCR 失败；无法证明舰船可安全入队", exc_info=True)
+        return None
+    for token in tokens:
         text = _normalize_ship_name(token.text)
         if token.confidence >= 0.72 and wanted in text:
             logger.info(
@@ -1048,8 +1304,13 @@ def _find_recall_commander_action(image, backend):
     height = image.shape[0]
     search_top = int(height * 0.58)
     wanted = _normalize_ship_name("召回指挥官")
+    try:
+        tokens = list(backend.recognize(image[search_top:, :]) or ())
+    except Exception:
+        logger.warning("召回指挥官菜单 OCR 失败；本轮不点击", exc_info=True)
+        return None
     matches = []
-    for token in backend.recognize(image[search_top:, :]):
+    for token in tokens:
         geometry = _token_geometry(token)
         if token.confidence < 0.72 or geometry is None:
             continue
@@ -1102,14 +1363,20 @@ def ensure_selected_ship_commander(
                 custom_name if ship_key == CUSTOM_SHIP_KEY else ship_key,
             )
             return False
-        if not is_selected_ship_without_commander(image, backend):
+        commander_missing = is_selected_ship_without_commander(image, backend)
+        if commander_missing is None:
+            return False
+        if not commander_missing:
             return True
         action = _find_recall_commander_action(image, backend)
         if action is not None:
             logger.info("检测到已打开的召回菜单，直接点击已识别文字: local=%s", action)
             if _click_local(hwnd, action):
                 time.sleep(1.2)
-                if not is_selected_ship_without_commander(_capture(hwnd), backend):
+                commander_missing = is_selected_ship_without_commander(
+                    _capture(hwnd), backend
+                )
+                if commander_missing is False:
                     logger.info("指挥官召回复核通过")
                     return True
             continue
@@ -1146,7 +1413,10 @@ def ensure_selected_ship_commander(
         time.sleep(1.2)
         if _operation_paused(should_abort):
             return False
-        if not is_selected_ship_without_commander(_capture(hwnd), backend):
+        commander_missing = is_selected_ship_without_commander(
+            _capture(hwnd), backend
+        )
+        if commander_missing is False:
             logger.info("指挥官召回复核通过")
             return True
         logger.warning("召回指挥官后右上角仍显示无指挥官")
@@ -1165,24 +1435,42 @@ def find_ship_card(image, ship_key, minimum_score=0.55):
     height, width = image.shape[:2]
     search_top = int(height * 0.735)
     search = image[search_top:height, :]
-    target_scale = width / SHIP_REFERENCE_SIZE[0]
-    template = cv2.resize(
-        template,
-        None,
-        fx=target_scale,
-        fy=target_scale,
-        interpolation=cv2.INTER_AREA if target_scale < 1 else cv2.INTER_CUBIC,
-    )
     search_mask = _gold_name_mask(search)
-    template_mask = _tighten_mask(_gold_name_mask(template))
-    if template_mask.size == 0 or np.count_nonzero(template_mask) < 20:
+    framebuffer_scale = width / SHIP_REFERENCE_SIZE[0]
+    best = None
+    for ui_factor in UI_TEMPLATE_SCALE_FACTORS:
+        scale = framebuffer_scale * ui_factor
+        scaled = cv2.resize(
+            template,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+        )
+        template_mask = _tighten_mask(_gold_name_mask(scaled))
+        if template_mask.size == 0 or np.count_nonzero(template_mask) < 12:
+            continue
+        if (
+            search_mask.shape[0] < template_mask.shape[0]
+            or search_mask.shape[1] < template_mask.shape[1]
+        ):
+            continue
+        result = cv2.matchTemplate(
+            search_mask,
+            template_mask,
+            cv2.TM_CCOEFF_NORMED,
+        )
+        _, score, _, location = cv2.minMaxLoc(result)
+        candidate = (float(score), location, template_mask.shape)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
         return None
-    result = cv2.matchTemplate(search_mask, template_mask, cv2.TM_CCOEFF_NORMED)
-    _, score, _, location = cv2.minMaxLoc(result)
+    score, location, template_shape = best
     if score < minimum_score:
         logger.warning("舰船卡片 %s 匹配置信度不足: %.3f", ship_key, score)
         return None
-    template_height, template_width = template_mask.shape
+    template_height, template_width = template_shape
     x = location[0] + template_width // 2
     name_y = search_top + location[1] + template_height // 2
     # Click the card body above its name, avoiding adjacent card borders.
@@ -1194,37 +1482,39 @@ def selected_ship_scores(image):
     """Score supported ship names in the port's upper-right detail panel."""
     height, width = image.shape[:2]
     search = image[
-        int(height * 0.055) : int(height * 0.16),
-        int(width * 0.82) : width,
+        int(height * 0.025) : int(height * 0.22),
+        int(width * 0.72) : width,
     ]
     search_mask = _gold_name_mask(search)
-    scale = width / SHIP_REFERENCE_SIZE[0]
+    framebuffer_scale = width / SHIP_REFERENCE_SIZE[0]
     scores = {}
     for ship_key in SUPPORTED_SHIPS:
         template = _load_selected_ship_name_template(ship_key)
         if template is None or template.size == 0:
             scores[ship_key] = 0.0
             continue
-        if scale != 1.0:
-            template = cv2.resize(
+        best_score = 0.0
+        for ui_factor in UI_TEMPLATE_SCALE_FACTORS:
+            scale = framebuffer_scale * ui_factor
+            scaled = cv2.resize(
                 template,
                 None,
                 fx=scale,
                 fy=scale,
                 interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
             )
-        if (
-            search_mask.shape[0] < template.shape[0]
-            or search_mask.shape[1] < template.shape[1]
-        ):
-            scores[ship_key] = 0.0
-            continue
-        result = cv2.matchTemplate(
-            search_mask,
-            template,
-            cv2.TM_CCOEFF_NORMED,
-        )
-        scores[ship_key] = float(cv2.minMaxLoc(result)[1])
+            if (
+                search_mask.shape[0] < scaled.shape[0]
+                or search_mask.shape[1] < scaled.shape[1]
+            ):
+                continue
+            result = cv2.matchTemplate(
+                search_mask,
+                scaled,
+                cv2.TM_CCOEFF_NORMED,
+            )
+            best_score = max(best_score, float(cv2.minMaxLoc(result)[1]))
+        scores[ship_key] = best_score
     return scores
 
 
@@ -1500,7 +1790,12 @@ def click_center(hwnd=None):
 
 
 def enter_battle(
-    hwnd=None, *, vision=None, configure_port=True, should_abort=None
+    hwnd=None,
+    *,
+    vision=None,
+    configure_port=True,
+    backend=None,
+    should_abort=None,
 ):
     """Click ``加入战斗`` once, then verify or conservatively await transition."""
     vision = vision or Vision()
@@ -1517,6 +1812,7 @@ def enter_battle(
             hwnd,
             os.environ.get("WOWS_SHIP", "pommern"),
             vision,
+            ocr_backend=backend,
             should_abort=should_abort,
         ):
             logger.warning("未能安全选择目标舰船")
@@ -1526,6 +1822,7 @@ def enter_battle(
             hwnd,
             os.environ.get("WOWS_MODE", "asymmetric"),
             vision,
+            backend=backend,
             should_abort=should_abort,
         ):
             logger.warning("未能安全选择目标战斗模式")
@@ -1534,7 +1831,7 @@ def enter_battle(
     if _operation_paused(should_abort):
         return False
     image = _capture(hwnd)
-    if not click_battle(hwnd, image):
+    if not click_battle(hwnd, image, backend=backend):
         return False
     return _observe_battle_entry(
         hwnd,
@@ -1543,7 +1840,7 @@ def enter_battle(
     )
 
 
-def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
+def queue_next_battle(hwnd=None, *, vision=None, backend=None, should_abort=None):
     """Queue the next battle from a positively identified result screen.
 
     The orange button is used only after the complete result-screen colour
@@ -1554,7 +1851,11 @@ def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
     if _operation_paused(should_abort):
         logger.info("[USER] 结算续局已暂停，不点击“继续战斗”")
         return False
-    image = _capture(hwnd)
+    try:
+        image = _capture(hwnd)
+    except CaptureFault as error:
+        logger.info("结算续局画面暂不可用，保留页面并稍后重试: %s", error)
+        return False
     state = vision.classify_screen(image)
     if state != ScreenState.RESULTS:
         logger.warning("当前界面为 %s，不点击“继续战斗”", state.value)
@@ -1562,8 +1863,21 @@ def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
     if _operation_paused(should_abort):
         logger.info("[USER] 点击续局前检测到介入，保留结算页")
         return False
-    logger.info("结算界面已确认，点击“继续战斗”自动进入下一局")
-    if not _click_region(hwnd, image, RESULTS_REQUEUE_BUTTON):
+    action_point = (
+        results_requeue_action_point(image, backend)
+        if backend is not None
+        else None
+    )
+    if backend is not None and action_point is None:
+        logger.warning("结算页 OCR 未定位到“继续战斗”，拒绝按旧坐标点击")
+        return False
+    logger.info("结算界面已确认，点击“继续战斗”自动进入下一局: %s", action_point)
+    clicked = (
+        _click_local(hwnd, action_point)
+        if action_point is not None
+        else _click_region(hwnd, image, RESULTS_REQUEUE_BUTTON)
+    )
+    if not clicked:
         return False
     # Verify that the click actually left the result page.  Some result pages
     # are still animating when the button first appears, so retry once instead
@@ -1574,7 +1888,11 @@ def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
             logger.info("[USER] 等待下一局期间暂停，不再派发续局动作")
             return False
         time.sleep(0.25)
-        confirmation = _capture(hwnd)
+        try:
+            confirmation = _capture(hwnd)
+        except CaptureFault as error:
+            logger.info("续局确认画面暂不可用，保留流程并稍后重识别: %s", error)
+            return False
         state = vision.classify_screen(confirmation)
         if state in {ScreenState.LOADING, ScreenState.BATTLE}:
             return True
@@ -1588,7 +1906,19 @@ def queue_next_battle(hwnd=None, *, vision=None, should_abort=None):
             return False
         if state == ScreenState.RESULTS and attempt >= 7 and not retried:
             logger.info("继续战斗按钮未生效，重新点击一次")
-            if not _click_region(hwnd, confirmation, RESULTS_REQUEUE_BUTTON):
+            retry_point = (
+                results_requeue_action_point(confirmation, backend)
+                if backend is not None
+                else None
+            )
+            if backend is not None and retry_point is None:
+                return False
+            retry_clicked = (
+                _click_local(hwnd, retry_point)
+                if retry_point is not None
+                else _click_region(hwnd, confirmation, RESULTS_REQUEUE_BUTTON)
+            )
+            if not retry_clicked:
                 return False
             retried = True
     logger.warning("点击继续战斗后界面未发生变化")
@@ -1609,12 +1939,16 @@ def force_quick_battle_return_to_port(
     backend = backend or RapidOcrBackend()
     if _operation_paused(should_abort):
         return ScreenState.UNKNOWN
-    image = _capture(hwnd)
+    try:
+        image = _capture(hwnd)
+    except CaptureFault as error:
+        logger.info("快速回港画面暂不可用，暂不发送离场操作: %s", error)
+        return ScreenState.UNKNOWN
     initial = vision.classify_screen(image)
     if initial in {ScreenState.PORT, ScreenState.RESULTS}:
         return initial
     if initial != ScreenState.BATTLE:
-        logger.warning("未确认战斗 HUD，不执行五分钟强制回港: %s", initial.value)
+        logger.warning("未确认战斗 HUD，不执行快速战斗强制回港: %s", initial.value)
         return initial
     if open_menu is None:
         return ScreenState.BATTLE
@@ -1626,7 +1960,11 @@ def force_quick_battle_return_to_port(
         if _operation_paused(should_abort):
             return ScreenState.UNKNOWN
         time.sleep(0.25)
-        image = _capture(hwnd)
+        try:
+            image = _capture(hwnd)
+        except CaptureFault as error:
+            logger.info("快速回港确认画面暂不可用，稍后重识别: %s", error)
+            return ScreenState.UNKNOWN
         state = vision.classify_screen(image)
         if state in {ScreenState.PORT, ScreenState.RESULTS}:
             logger.info("快速战斗已确认离开: %s", state.value)
@@ -1639,12 +1977,27 @@ def force_quick_battle_return_to_port(
             exit_clicked = True
             continue
 
-        if _is_early_exit_confirmation(image, backend) and not confirmation_clicked:
-            # The page has two one-character buttons. OCR on a lone ``是`` is
-            # fragile, so its relative slot is authorized only by both dialog
-            # heading anchors being present.
-            logger.info("OCR 确认“提前退出战斗”二次页面，点击“是”")
-            _click_region(hwnd, image, QUICK_EXIT_CONFIRM_YES_BUTTON)
+        confirmation_seen = (
+            not confirmation_clicked
+            and _is_early_exit_confirmation(image, backend)
+        )
+        if confirmation_seen:
+            yes_point = _verified_action_point(
+                image,
+                backend,
+                ("是",),
+                rejected=("否",),
+                region=QUICK_EXIT_CONFIRM_ACTION_AREA,
+                minimum_confidence=0.50,
+                exact=True,
+            )
+            # Exact single-character OCR is preferred. The old relative slot
+            # remains a guarded fallback only after both dialog headings exist.
+            logger.info("OCR 确认“提前退出战斗”二次页面，点击“是”: %s", yes_point)
+            if yes_point is not None:
+                _click_local(hwnd, yes_point)
+            else:
+                _click_region(hwnd, image, QUICK_EXIT_CONFIRM_YES_BUTTON)
             confirmation_clicked = True
             continue
 
@@ -1652,76 +2005,34 @@ def force_quick_battle_return_to_port(
             menu_retries += 1
             logger.info("战斗菜单尚未出现，重试 Esc (%s/3)", menu_retries + 1)
             open_menu()
-    logger.warning("五分钟强制退出未确认回港；保留当前局数并重新判断")
+    logger.warning("快速战斗强制退出未确认回港；保留当前局数并重新判断")
     return ScreenState.UNKNOWN
 
 
-def continue_quick_battle_after_death(
+def handle_post_battle(
     hwnd=None,
     *,
     vision=None,
     backend=None,
-    open_menu=None,
+    max_steps=6,
     should_abort=None,
-    attempts=80,
 ):
-    """After HP reaches zero, open the dialog and click ``继续战斗!``."""
-    vision = vision or Vision()
-    backend = backend or RapidOcrBackend()
-    if _operation_paused(should_abort):
-        return False
-    if open_menu is not None:
-        open_menu()
-    clicked = False
-    for _attempt in range(max(1, int(attempts))):
-        if _operation_paused(should_abort):
-            return False
-        time.sleep(0.25)
-        image = _capture(hwnd)
-        state = vision.classify_screen(image)
-        if state in {ScreenState.LOADING, ScreenState.BATTLE} and clicked:
-            logger.info("死亡后“继续战斗”已确认进入下一局流程")
-            return True
-        if state == ScreenState.PORT:
-            logger.info("死亡后已回港，交由港口流程开始下一局")
-            return False
-        point = quick_death_continue_action_point(image, backend)
-        if point is not None and not clicked:
-            logger.info("OCR 确认死亡页“继续战斗”，点击: local=%s", point)
-            _click_local(hwnd, point)
-            clicked = True
-            continue
-        # Authorize the relative fallback only after both death-dialog text
-        # anchors are present; never infer this action from button colour.
-        if not clicked:
-            normalized = "".join(
-                _normalize_ship_name(token.text)
-                for token in backend.recognize(image)
-                if token.confidence >= 0.55
-            )
-            if (
-                _normalize_ship_name("离开战斗") in normalized
-                and _normalize_ship_name("确认") in normalized
-            ):
-                logger.info("死亡确认页已识别，按相对槽位点击“继续战斗”")
-                _click_region(hwnd, image, QUICK_DEATH_CONTINUE_BUTTON)
-                clicked = True
-    logger.warning("死亡后未能确认“继续战斗”进入下一局")
-    return False
-
-
-def handle_post_battle(hwnd=None, *, vision=None, max_steps=4, should_abort=None):
     """Advance result screens without blind center clicks.
 
     Escape menus are treated as active-battle states: the bot resumes the
     battle once, then reports ``False`` instead of clicking an exit choice.
     """
     vision = vision or Vision()
+    return_requested = False
     for _ in range(max_steps):
         if _operation_paused(should_abort):
             logger.info("[USER] 结算导航暂停，不切窗口、不点击")
             return False
-        image = _capture(hwnd)
+        try:
+            image = _capture(hwnd)
+        except CaptureFault as error:
+            logger.info("结算导航画面暂不可用，保留当前页面: %s", error)
+            return False
         state = vision.classify_screen(image)
         logger.info("结算导航识别: %s", state.value)
         if state == ScreenState.PORT:
@@ -1732,7 +2043,39 @@ def handle_post_battle(hwnd=None, *, vision=None, max_steps=4, should_abort=None
         if state == ScreenState.RESULTS:
             if _operation_paused(should_abort):
                 return False
-            _click_region(hwnd, image, RESULTS_RETURN_TO_PORT_BUTTON)
+            if return_requested:
+                logger.info("已派发回港点击，结算页仍在过渡；等待而不重复点击")
+                time.sleep(1)
+                continue
+            action_point = (
+                results_return_to_port_action_point(image, backend)
+                if backend is not None
+                else None
+            )
+            if backend is not None and action_point is None:
+                # RESULTS itself requires both the teal return button and the
+                # orange requeue button in their independent relative areas.
+                # That positive visual signature makes the resolution-scaled
+                # return region a safe fallback when OCR misses the glyphs.
+                logger.warning(
+                    "结算页 OCR 未定位到“回到港口”；已由双按钮色彩确认，"
+                    "使用相对按钮区域兜底"
+                )
+            if action_point is not None:
+                clicked = _click_local(hwnd, action_point)
+            else:
+                clicked = _click_region(
+                    hwnd,
+                    image,
+                    RESULTS_RETURN_TO_PORT_BUTTON,
+                )
+            if not clicked:
+                if _operation_paused(should_abort):
+                    return False
+                logger.warning("结算页“回到港口”点击未派发，保留页面重试")
+                time.sleep(0.5)
+                continue
+            return_requested = True
             time.sleep(2)
             continue
         if state == ScreenState.EXIT_CONFIRMATION:
@@ -1747,6 +2090,10 @@ def handle_post_battle(hwnd=None, *, vision=None, max_steps=4, should_abort=None
             _click_region(hwnd, image, ESCAPE_RESUME_BUTTON)
             logger.warning("检测到战斗菜单，已返回游戏")
             return False
+        if return_requested:
+            logger.info("回港点击后的过渡页面尚未识别，继续等待港口")
+            time.sleep(1)
+            continue
         logger.warning("未知界面，不执行猜测性点击")
         return False
     return False

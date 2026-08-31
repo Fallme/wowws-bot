@@ -175,6 +175,31 @@ def test_selected_ship_no_commander_is_read_only_from_detail_panel():
     )
 
 
+def test_commander_ocr_failure_is_unknown_and_blocks_matchmaking():
+    class BrokenBackend:
+        @staticmethod
+        def recognize(_image):
+            raise RuntimeError("OCR unavailable")
+
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    assert port_navigator.is_selected_ship_without_commander(
+        frame, BrokenBackend()
+    ) is None
+
+    with (
+        patch("port_navigator._capture", return_value=frame),
+        patch("port_navigator.is_requested_ship_selected", return_value=True),
+        patch("port_navigator._right_click_local") as right_click,
+        patch("port_navigator._click_local") as click,
+    ):
+        assert not port_navigator.ensure_selected_ship_commander(
+            7, "pommern", backend=BrokenBackend()
+        )
+
+    right_click.assert_not_called()
+    click.assert_not_called()
+
+
 def test_no_commander_recall_requires_card_and_menu_text_before_click():
     frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
     with (

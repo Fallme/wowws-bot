@@ -74,12 +74,25 @@ class GamepadController:
         self._update_left_stick("rudder_center")
 
     def set_movement(self, throttle: float, rudder: float):
-        self._left_y = max(-1.0, min(float(throttle), 1.0))
+        # Keep the optional legacy backend under the same forward-only safety
+        # contract as the native keyboard controller.
+        self._left_y = max(0.0, min(float(throttle), 1.0))
         self._left_x = max(-1.0, min(float(rudder), 1.0))
         self._update_left_stick("movement")
 
     def full_speed(self):
         self.set_movement(1.0, self._left_x)
+
+    def reassert_full_speed(self):
+        self.full_speed()
+
+    def resynchronize_forward_controls(self):
+        self._left_x = 0.0
+        self._left_y = 1.0
+        self._update_left_stick("forward_controls_resynchronized")
+
+    def takeover_from_autopilot(self):
+        self.resynchronize_forward_controls()
 
     def fire(self):
         self.device.right_trigger(value=255)

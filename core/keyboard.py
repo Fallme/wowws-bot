@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 from dataclasses import dataclass
+import logging
 import time
 
 
@@ -34,8 +35,11 @@ VK = {
     "t": 0x54,
     "r": 0x52,
     "u": 0x55,
+    "y": 0x59,
     "esc": 0x1B,
 }
+
+logger = logging.getLogger("input")
 
 ULONG_PTR = ctypes.wintypes.WPARAM
 
@@ -132,6 +136,8 @@ class KeyboardController:
         self._rudder_notch = 0
         self.last_dispatch: KeyboardDispatch | None = None
         self.dispatch_count = 0
+        self._automation_observer = None
+        self._last_observed_injected_tick_ms: int | None = None
 
     @staticmethod
     def _clamp(value: float) -> float:
@@ -142,8 +148,12 @@ class KeyboardController:
         value = cls._clamp(throttle)
         if abs(value) < 0.10:
             return 0
+        # Battle automation is forward-only.  A visual navigation fault must
+        # never be able to request reverse telegraph through this controller.
+        if value < 0:
+            return 0
         magnitude = max(1, min(cls.MAX_NOTCH, round(abs(value) * cls.MAX_NOTCH)))
-        return magnitude if value > 0 else -magnitude
+        return magnitude
 
     def _record(self, action: str, throttle: float, rudder: float):
         self.dispatch_count += 1
@@ -155,18 +165,44 @@ class KeyboardController:
             throttle_notch=self._throttle_notch,
             rudder_notch=self._rudder_notch,
         )
+        injected_tick = self.last_injected_tick_ms
+        if (
+            injected_tick is not None
+            and injected_tick != self._last_observed_injected_tick_ms
+        ):
+            self._last_observed_injected_tick_ms = injected_tick
+            observer = self._automation_observer
+            if observer is not None:
+                try:
+                    observer(self)
+                except Exception:
+                    # The input has already been dispatched. Telemetry cleanup
+                    # must never turn that accepted command into a retry/fault.
+                    logger.exception("自动输入监听回执失败；保留已派发的游戏指令")
+
+    def set_automation_observer(self, observer=None):
+        """Observe completed native input so it cannot become user activity."""
+        self._automation_observer = observer
 
     def _ensure_target_focus(self):
         if self._focus_guard is not None and not self._focus_guard():
             raise RuntimeError("游戏窗口不在前台，拒绝发送键盘操作")
 
     def _set_throttle_notch(self, target: int):
-        target = max(-self.MAX_NOTCH, min(int(target), self.MAX_NOTCH))
+        target = max(0, min(int(target), self.MAX_NOTCH))
         delta = target - self._throttle_notch
-        key = "w" if delta > 0 else "s"
-        for _ in range(abs(delta)):
-            self.device.tap(key)
-        self._throttle_notch = target
+        if delta:
+            # The native telegraph can be changed by game autopilot or manual
+            # takeover while our cache is frozen. This applies to both cached
+            # upshifts and downshifts: four W taps from an actual FULL-reverse
+            # state only reach STOP. Eight W taps first establish FULL ahead
+            # from every possible state, then bounded S taps select a
+            # non-negative target notch.
+            for _ in range(self.MAX_NOTCH * 2):
+                self.device.tap("w")
+            for _ in range(self.MAX_NOTCH - target):
+                self.device.tap("s")
+            self._throttle_notch = target
 
     def _set_rudder(self, rudder: float):
         value = self._clamp(rudder)
@@ -211,7 +247,8 @@ class KeyboardController:
         """
         self._ensure_target_focus()
         self.device.key_up("s")
-        for _ in range(self.MAX_NOTCH):
+        # From FULL reverse to FULL ahead spans eight telegraph steps.
+        for _ in range(self.MAX_NOTCH * 2):
             self.device.tap("w")
         self._throttle_notch = self.MAX_NOTCH
         self._record("full_speed_reassert", 1.0, 0.0)
@@ -225,11 +262,24 @@ class KeyboardController:
             self._rudder_notch / self.MAX_RUDDER_NOTCH,
         )
 
-    def takeover_from_autopilot(self):
-        """Cancel game autopilot and resynchronize local notch caches."""
-        self._throttle_notch = 0
+    def resynchronize_forward_controls(self):
+        """Cancel external steering and establish FULL-ahead plus neutral rudder."""
+        self._ensure_target_focus()
+        self.device.key_up("q")
+        self.device.key_up("e")
+        # Four Q taps reach hard-left from any real rudder state; two E taps
+        # then land exactly at neutral. This repairs cache drift left by native
+        # autopilot or a manual keyboard takeover without guessing direction.
+        for _ in range(self.MAX_RUDDER_NOTCH * 2):
+            self.device.tap("q")
+        for _ in range(self.MAX_RUDDER_NOTCH):
+            self.device.tap("e")
         self._rudder_notch = 0
         self.reassert_full_speed()
+
+    def takeover_from_autopilot(self):
+        """Backward-compatible alias for deterministic control hand-off."""
+        self.resynchronize_forward_controls()
 
     def fire(self):
         self._ensure_target_focus()
@@ -269,6 +319,48 @@ class KeyboardController:
         self.device.tap("t")
         self._record("repair_party", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
+    def use_consumable_cycle(self):
+        """Try every common consumable slot once for ship-agnostic recovery.
+
+        Consumable assignments vary by ship (for example Naples uses T for
+        smoke rather than Repair Party).  The health-threshold workflow uses
+        this bounded cycle so it does not need to infer each ship's dynamic
+        loadout from icons.  The caller owns the cooldown and 20% HP gating.
+        """
+        self._ensure_target_focus()
+        for key in ("r", "t", "u", "y"):
+            try:
+                self.device.tap(key)
+            except (KeyError, OSError, ValueError) as error:
+                # One unavailable/unsupported slot must not abort an entire
+                # multi-battle run. Continue probing the remaining slots and
+                # leave an auditable warning in the live console.
+                logger.warning("消耗品按键 %s 派发失败，继续尝试下一槽位: %s", key, error)
+        self._record(
+            "consumable_cycle",
+            self._throttle_notch / self.MAX_NOTCH,
+            0.0,
+        )
+
+    def use_other_consumables(self):
+        """Try non-damage-control consumables without touching the R slot.
+
+        R has its own fire/flood trigger and cooldown.  Keeping T/U/Y in a
+        separate bounded cycle prevents ordinary HP loss from wasting damage
+        control before a fire or flooding event is actually visible.
+        """
+        self._ensure_target_focus()
+        for key in ("t", "u", "y"):
+            try:
+                self.device.tap(key)
+            except (KeyError, OSError, ValueError) as error:
+                logger.warning("其他消耗品按键 %s 派发失败，继续尝试下一槽位: %s", key, error)
+        self._record(
+            "other_consumables",
+            self._throttle_notch / self.MAX_NOTCH,
+            0.0,
+        )
+
     @property
     def last_injected_tick_ms(self):
         return getattr(self.device, "last_injected_tick_ms", None)
@@ -288,10 +380,24 @@ class KeyboardController:
             marker()
 
     def stop(self):
-        """Release rudder and set the engine telegraph back to STOP."""
+        """Deterministically establish STOP and neutral rudder from any state."""
         self._ensure_target_focus()
-        self._set_rudder(0.0)
-        self._set_throttle_notch(0)
+        # Cached notches can be stale after native autopilot or manual input.
+        # Saturate each real game control to one endpoint, then step back to
+        # neutral. This is bounded and correct for every engine/rudder state.
+        self.device.key_up("q")
+        self.device.key_up("e")
+        for _ in range(self.MAX_RUDDER_NOTCH * 2):
+            self.device.tap("q")
+        for _ in range(self.MAX_RUDDER_NOTCH):
+            self.device.tap("e")
+        self._rudder_notch = 0
+        self.device.key_up("s")
+        for _ in range(self.MAX_NOTCH * 2):
+            self.device.tap("w")
+        for _ in range(self.MAX_NOTCH):
+            self.device.tap("s")
+        self._throttle_notch = 0
         # Release all movement keys even if an earlier injection was interrupted.
         for key in ("a", "d", "q", "e", "w", "s"):
             self.device.key_up(key)

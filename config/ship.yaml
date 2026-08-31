@@ -27,7 +27,7 @@ pommern:
     speed: 30           # 最高航速节
 
   strategy:
-    # 真实公里距离由敌舰标签 OCR 提供；以下为波美拉尼亚实距状态带。
+    # 航向与敌距由小地图白色舰首箭头、红点及 5km 网格计算。
     preferred_side: 1                 # 1=right orbit, -1=left orbit
     opening_seconds: 55
     disengage_health: 0.28              # 兼容字段；站点逻辑不再因低血量主动掉头
@@ -47,12 +47,19 @@ pommern:
     too_close_distance: 0.07         # 兼容旧事件回放
     island_warning_distance: 0.120   # 战列舰舵效慢，约提前 8km 建立绕岛转向
     island_emergency_distance: 0.060 # 近岛立即硬舵，但仍保持向前脱离
-    island_turn_commit_seconds: 8.0  # Q/E 下发后保留转向，等待实际舵效出现
+    island_turn_commit_seconds: 3.8  # 单次绕岛转向上限；新帧必须重新确认
     rudder_minimum_hold_seconds: 4.0 # 普通航向修正避免左右指令反复抵消
-    capture_throttle: 0.36           # 进入中央占领点后约 1/2 航速留点
-    enemy_steering_weight: 0.28      # 圈外敌人仅占航向修正的 28%
+    capture_throttle: 0.72           # 进入中央占领点后约 3/4 航速继续搜索
+    enemy_steering_weight: 0.84      # 前方红点优先，中央点仅作弱防漂移约束
     center_steering_gain: 1.35       # 中央点航向控制增益
     straight_opening_seconds: 4.0    # 先建立短航迹，随后立即转向中央点
+    stuck_seconds: 18.0              # 小地图位置完全不变时的兜底判定
+    stuck_low_speed_seconds: 8.0     # 已给前进指令但持续低速则判定触岸
+    stuck_low_speed_knots: 1.5       # 允许轻微漂移，避免0.4-0.6节永不触发
+    autopilot_stall_speed_knots: 1.5 # 绿色自动航行存在但低于此速度也视为卡住
+    stuck_escape_turn_seconds: 8.0   # 全速单侧硬舵脱离岸线，不倒船
+    stuck_forward_seconds: 6.0       # 反舵扶正并继续向前驶离
+    stuck_cooldown_seconds: 12.0     # 首次失败后允许换边再次脱困
     opening_autopilot_minimum_seconds: 35.0 # 开局至少保留游戏自动航行，避免出生点红色误报取消
     enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
     manual_intervention_pause_seconds: 5.0
@@ -64,10 +71,11 @@ pommern:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
-    heal_threshold: 0.50            # 兼容旧配置；实际按每损失20%血量分档触发
-    heal_loss_step: 0.20
-    heal_cooldown_seconds: 80
-    heal_max_uses: 3
+    heal_threshold: 0.50            # 兼容旧配置
+    heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
+    heal_cooldown_seconds: 30       # 兼容旧字段
+    other_consumable_cooldown_seconds: 30
+    heal_max_uses: 3                # 兼容旧配置
     torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
     torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
     main_gun_shoot_threshold: 0.8    # 准心偏移容差
@@ -112,12 +120,19 @@ napoli:
     too_close_distance: 0.07
     island_warning_distance: 0.120
     island_emergency_distance: 0.060
-    island_turn_commit_seconds: 8.0
+    island_turn_commit_seconds: 3.8
     rudder_minimum_hold_seconds: 4.0
-    capture_throttle: 0.36
-    enemy_steering_weight: 0.28
+    capture_throttle: 0.72
+    enemy_steering_weight: 0.84
     center_steering_gain: 1.35
     straight_opening_seconds: 4.0
+    stuck_seconds: 16.0
+    stuck_low_speed_seconds: 7.0
+    stuck_low_speed_knots: 1.5
+    autopilot_stall_speed_knots: 1.5
+    stuck_escape_turn_seconds: 7.0
+    stuck_forward_seconds: 5.0
+    stuck_cooldown_seconds: 12.0
     opening_autopilot_minimum_seconds: 35.0
     enable_minimap_torpedo_evasion: true
     manual_intervention_pause_seconds: 5.0
@@ -129,10 +144,11 @@ napoli:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
-    heal_threshold: 0.55            # 兼容旧配置；实际按每损失20%血量分档触发
-    heal_loss_step: 0.20
-    heal_cooldown_seconds: 80
-    heal_max_uses: 3
+    heal_threshold: 0.55            # 兼容旧配置
+    heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
+    heal_cooldown_seconds: 30       # 兼容旧字段
+    other_consumable_cooldown_seconds: 30
+    heal_max_uses: 3                # 兼容旧配置
     auto_smoke: true
     main_gun_shoot_threshold: 0.8
     torpedo_avoid_distance: 3000

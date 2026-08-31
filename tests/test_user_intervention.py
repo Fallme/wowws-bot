@@ -1,6 +1,17 @@
 from types import SimpleNamespace
 
-from core.intervention import UserInterventionMonitor
+from core.intervention import UserInterventionMonitor, _keyboard_activity
+
+
+def test_keyboard_activity_ignores_held_high_bit_without_new_transition(monkeypatch):
+    class User32:
+        @staticmethod
+        def GetAsyncKeyState(_virtual_key):
+            return 0x8000
+
+    monkeypatch.setattr("core.intervention.ctypes.windll.user32", User32())
+
+    assert not _keyboard_activity()
 
 
 def test_foreground_user_input_pauses_for_configured_window():
@@ -179,6 +190,30 @@ def test_short_user_input_resumes_automatically_after_five_seconds():
     assert not monitor.latched
 
 
+def test_automation_ack_drains_old_key_before_later_mouse_movement():
+    current = [1000]
+    keyboard_transitions = iter([False, True, False])
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        input_tick_reader=lambda: current[0],
+        keyboard_activity_reader=lambda: next(keyboard_transitions),
+        foreground_reader=lambda: 7,
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=1100)
+    monitor.reset()
+
+    # A known automated M press leaves one keyboard transition pending.
+    current[0] = 1100
+    monitor.acknowledge_automation(controller)
+
+    # The subsequent cursor warp changes LASTINPUTINFO but is mouse-only and
+    # must not inherit the old M transition or pause the task.
+    current[0] = 1400
+    assert not monitor.poll(controller, now=10)
+    assert not monitor.latched
+
+
 def test_switching_away_from_game_pauses_before_focus_can_be_stolen_back():
     current_tick = [100]
     foreground = [7]
@@ -199,6 +234,58 @@ def test_switching_away_from_game_pauses_before_focus_can_be_stolen_back():
     assert monitor.pause_until == 15.1
     assert monitor.poll(controller, now=15.0)
     assert not monitor.poll(controller, now=15.2)
+
+
+def test_mouse_activity_after_switching_away_extends_pause_and_eventually_latches():
+    current_tick = [100]
+    foreground = [7]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        latch_seconds=20,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: False,
+        foreground_reader=lambda: foreground[0],
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    foreground[0] = 99
+    assert monitor.poll(controller, now=10)
+    assert monitor.last_trigger == "window_switch"
+
+    # Mouse use never starts a pause, but once the user has switched away it
+    # counts as continued background activity and prevents focus theft.
+    for now in (14.0, 18.0, 22.0, 26.0, 30.0):
+        current_tick[0] += 10
+        assert monitor.poll(controller, now=now)
+    assert monitor.latched
+    assert monitor.last_trigger == "background_activity"
+    assert monitor.poll(controller, now=40)
+
+
+def test_mouse_activity_inside_game_still_does_not_extend_expired_keyboard_pause():
+    current_tick = [100]
+    foreground = [7]
+    keyboard = [False]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        latch_seconds=20,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: keyboard[0],
+        foreground_reader=lambda: foreground[0],
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    keyboard[0] = True
+    current_tick[0] = 110
+    assert monitor.poll(controller, now=10)
+    keyboard[0] = False
+    current_tick[0] = 120
+    assert not monitor.poll(controller, now=15.1)
+    assert not monitor.latched
 
 
 def test_initial_non_game_foreground_does_not_block_startup_focus():

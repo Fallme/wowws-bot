@@ -3,7 +3,6 @@ import numpy as np
 from core.ocr import OcrToken
 from port_navigator import (
     _is_early_exit_confirmation,
-    quick_death_continue_action_point,
     quick_exit_menu_action_point,
 )
 
@@ -22,6 +21,12 @@ class StaticBackend:
 
     def recognize(self, _image):
         return list(self.tokens)
+
+
+class BrokenBackend:
+    @staticmethod
+    def recognize(_image):
+        raise RuntimeError("OCR unavailable")
 
 
 def test_quick_exit_finds_leave_battle_and_rejects_exit_game():
@@ -62,16 +67,7 @@ def test_early_exit_second_page_requires_both_text_anchors():
     assert not _is_early_exit_confirmation(image, missing_heading)
 
 
-def test_death_dialog_targets_continue_battle_not_yes_or_no():
+def test_early_exit_ocr_failure_never_authorizes_confirmation_click():
     image = np.zeros((1494, 2560, 3), dtype=np.uint8)
-    backend = StaticBackend(
-        [
-            token("确认", 1240, 580, 1320, 630),
-            token("离开战斗?", 1190, 650, 1370, 700),
-            token("是", 1070, 710, 1110, 755),
-            token("否", 1260, 710, 1310, 755),
-            token("继续战斗!", 1400, 710, 1530, 755),
-        ]
-    )
 
-    assert quick_death_continue_action_point(image, backend) == (1465, 732)
+    assert not _is_early_exit_confirmation(image, BrokenBackend())

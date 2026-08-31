@@ -73,8 +73,84 @@ def test_live_player_pose_exposes_a_normalized_heading(live_frame):
     pose = vision.find_player_pose_on_minimap(minimap)
     assert pose is not None
     assert np.hypot(*pose.heading) == pytest.approx(1.0)
-    # The ship in this fixture is sailing broadly toward the right side.
-    assert pose.heading[0] > 0.5
+    # The white bow arrow and its heading line point toward the lower-left.
+    assert pose.heading[0] < -0.5
+    assert pose.heading[1] > 0.5
+
+
+def test_tactical_map_crop_matches_native_autopilot_grid_geometry():
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    expected_size = 810
+    left = (1600 - expected_size) // 2
+    top = (1000 - expected_size) // 2
+    grid = np.zeros((expected_size, expected_size, 3), dtype=np.uint8)
+    grid[:, ::2] = 220
+    frame[top : top + expected_size, left : left + expected_size] = grid
+
+    tactical_map = Vision.find_tactical_map(frame)
+
+    assert tactical_map is not None
+    assert tactical_map.shape == (expected_size, expected_size, 3)
+    assert np.array_equal(tactical_map, grid)
+
+
+def test_real_tactical_grid_rectifies_capture_points_to_minimap_coordinates():
+    path = (
+        Path("training_assets")
+        / "user_captures"
+        / "codex-clipboard-68c91356-07a4-4753-a25a-0824b8b62c6f.png"
+    )
+    frame = cv2.imread(str(path))
+    assert frame is not None
+    vision = Vision(screen_capture=object())
+
+    tactical_map = vision.find_tactical_map(frame)
+    minimap = vision.find_minimap(frame)
+
+    assert tactical_map is not None
+    assert minimap is not None
+    assert 1240 <= tactical_map.shape[0] <= 1340
+    assert tactical_map.shape[0] == tactical_map.shape[1]
+    tactical_zones = vision.find_capture_zones(tactical_map)
+    minimap_zones = vision.find_capture_zones(minimap)
+    assert [zone.label for zone in tactical_zones] == ["A", "B", "C"]
+    assert [zone.label for zone in minimap_zones] == ["A", "B", "C"]
+    for tactical_zone, minimap_zone in zip(tactical_zones, minimap_zones):
+        tactical_position = (
+            tactical_zone.center[0] / tactical_map.shape[1],
+            tactical_zone.center[1] / tactical_map.shape[0],
+        )
+        minimap_position = (
+            minimap_zone.center[0] / minimap.shape[1],
+            minimap_zone.center[1] / minimap.shape[0],
+        )
+        assert tactical_position[0] == pytest.approx(
+            minimap_position[0],
+            abs=0.025,
+        )
+        assert tactical_position[1] == pytest.approx(
+            minimap_position[1],
+            abs=0.025,
+        )
+    # The translucent M plane is poor terrain evidence; the concurrently
+    # visible small minimap retains the complete, high-contrast island layer.
+    assert len(vision.find_minimap_island_outlines(minimap)) >= 15
+
+
+@pytest.mark.parametrize(
+    ("points", "expected"),
+    [
+        ([[602, 60], [610, 77], [616, 60]], (610, 77)),
+        ([[616, 83], [616, 98], [634, 91]], (634, 91)),
+        ([[657, 60], [642, 73], [655, 79]], (657, 60)),
+        ([[210, 86], [203, 104], [217, 104]], (210, 86)),
+    ],
+)
+def test_player_arrow_tip_is_opposite_its_short_stern_edge(points, expected):
+    """Regression polygons sampled from live 2K minimap arrows."""
+    tip = Vision._arrow_tip(np.asarray(points, dtype=np.float64))
+
+    assert tuple(tip) == expected
 
 
 def test_player_arrow_near_minimap_edge_is_still_detected():
@@ -92,6 +168,7 @@ def test_player_arrow_near_minimap_edge_is_still_detected():
     assert pose is not None
     assert pose.position[0] == pytest.approx(center[0], abs=3)
     assert pose.position[1] == pytest.approx(303, abs=4)
+    assert pose.heading[1] < -0.8
 
 
 def test_minimap_grid_converts_one_cell_to_five_kilometres():
@@ -252,12 +329,13 @@ def test_player_range_ring_beats_dense_yellow_clutter():
     assert pose.position[1] == pytest.approx(player[1], abs=3)
 
 
-def test_live_island_signal_is_not_an_immediate_collision(live_frame):
+def test_live_island_signal_detects_terrain_in_the_corrected_bow_direction(live_frame):
     vision = Vision()
     minimap = vision.find_minimap(live_frame)
     pose = vision.find_player_pose_on_minimap(minimap)
     risk = vision.find_island_risk(minimap, pose)
-    assert risk is None or risk.distance > 0.10
+    assert risk is not None
+    assert risk.distance < 0.10
 
 
 def test_island_detector_selects_the_clearer_turn_side():
@@ -290,6 +368,38 @@ def test_connected_grid_and_range_rings_are_not_islands():
     pose = PlayerPose(position=(160, 190), heading=(0.0, -1.0))
 
     assert Vision().find_island_risk(minimap, pose) is None
+
+
+def test_snow_islands_produce_browser_outlines_while_grid_lines_are_filtered():
+    minimap = np.full((420, 420, 3), (72, 48, 30), dtype=np.uint8)
+    for coordinate in range(0, 421, 42):
+        cv2.line(minimap, (coordinate, 0), (coordinate, 419), (105, 82, 63), 1)
+        cv2.line(minimap, (0, coordinate), (419, coordinate), (105, 82, 63), 1)
+    cv2.fillConvexPoly(
+        minimap,
+        np.array([[70, 90], [125, 65], [155, 108], [112, 145], [62, 132]], dtype=np.int32),
+        (238, 232, 222),
+    )
+    cv2.fillConvexPoly(
+        minimap,
+        np.array([[265, 245], [330, 230], [357, 278], [312, 327], [252, 300]], dtype=np.int32),
+        (245, 240, 232),
+    )
+
+    outlines = Vision().find_minimap_island_outlines(minimap)
+
+    assert len(outlines) == 2
+    assert all(len(item["points"]) >= 3 for item in outlines)
+    assert all(item["area"] > 0.005 for item in outlines)
+
+
+def test_compact_range_ring_fits_are_not_promoted_to_capture_points():
+    minimap = np.full((650, 691, 3), (60, 45, 35), dtype=np.uint8)
+    player = (609, 69)
+    for center in ((559, 86), (554, 180), (548, 274)):
+        cv2.circle(minimap, center, 37, (220, 220, 220), 2)
+
+    assert Vision().find_capture_zones(minimap, player) == []
 
 
 def test_autopilot_hud_indicator_requires_green_enabled_text():

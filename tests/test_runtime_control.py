@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from main import count_quick_battle_for_plan
@@ -76,6 +77,16 @@ class RunLimitsTests(unittest.TestCase):
             pause.write_text("pause", encoding="utf-8")
             self.assertTrue(limits.pause_requested())
             self.assertFalse(limits.stop_requested())
+
+    def test_close_game_option_is_read_from_environment(self):
+        with patch.dict(
+            "runtime_control.os.environ",
+            {"WOWS_CLOSE_GAME_WHEN_DONE": "1"},
+            clear=True,
+        ):
+            limits = RunLimits.from_env()
+
+        self.assertTrue(limits.close_game_when_done)
 
     def test_reporter_persists_status_atomically(self):
         with tempfile.TemporaryDirectory() as directory:

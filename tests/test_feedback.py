@@ -28,7 +28,10 @@ def test_missing_player_position_trips_safety_fault():
         monitor.update(3.1, None, 1.0)
 
 
-def test_reverse_movement_is_also_verified():
+def test_reverse_request_is_not_treated_as_supported_movement():
     monitor = MovementFeedbackMonitor(timeout_seconds=10, movement_pixels=4)
-    assert monitor.update(0, (100, 100), -0.7).pending
-    assert monitor.update(2, (95, 100), -0.7).verified
+    feedback = monitor.update(0, (100, 100), -0.7)
+
+    assert not feedback.pending
+    assert not feedback.verified
+    assert feedback.reason == "throttle_below_check_threshold"

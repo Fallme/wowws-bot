@@ -1,6 +1,6 @@
 import pytest
 
-from core.tracking import ConsecutivePointFilter, CourseHeadingFilter
+from core.tracking import ArrowHeadingFilter, ConsecutivePointFilter, CourseHeadingFilter
 
 
 def test_first_detection_is_not_immediately_confirmed():
@@ -18,6 +18,20 @@ def test_large_jump_requires_reconfirmation():
     tracker = ConsecutivePointFilter(match_radius=10)
     tracker.update([(100, 100)])
     assert tracker.update([(150, 150)]) == []
+
+
+def test_arrow_heading_uses_visible_vector_without_position_history():
+    tracker = ArrowHeadingFilter(blend=1.0)
+
+    assert tracker.update((3, -4)) == pytest.approx((0.6, -0.8))
+
+
+def test_arrow_heading_rejects_one_frame_stern_flip():
+    tracker = ArrowHeadingFilter(blend=1.0)
+    forward = tracker.update((0, -1))
+
+    assert tracker.update((0, 1)) == forward
+    assert tracker.update((0, 1))[1] > 0.99
 
 
 def test_course_heading_uses_real_position_displacement():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import logging
 import os
 from pathlib import Path
 import time
@@ -14,6 +15,7 @@ import time
 # player keypress for nearly half a second: doing so made manual intervention
 # occasionally miss its first key and let the bot steal focus back.
 AUTOMATION_TICK_TOLERANCE_MS = 120
+logger = logging.getLogger("intervention")
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -44,7 +46,11 @@ def _keyboard_activity() -> bool:
     """
     user32 = ctypes.windll.user32
     for virtual_key in range(0x08, 0xFF):
-        if int(user32.GetAsyncKeyState(virtual_key)) & 0x8001:
+        # Bit 0 means the key transitioned since our previous query. Bit 15
+        # only means that it is currently down. Treating bit 15 as activity
+        # made a held/stale key look new whenever an automated cursor move
+        # changed GetLastInputInfo, so the bot cancelled its own UI click.
+        if int(user32.GetAsyncKeyState(virtual_key)) & 0x0001:
             return True
     return False
 
@@ -95,6 +101,7 @@ class UserInterventionMonitor:
         self.web_paused = False
         self.resumed_from_web = False
         self._last_foreground: int | None = None
+        self.last_trigger = ""
 
     def reset(self):
         self._last_seen_tick = self._input_tick_reader()
@@ -106,6 +113,7 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = False
+        self.last_trigger = ""
 
     def _consume_web_resume(self) -> bool:
         if self.resume_path is None or not self.resume_path.exists():
@@ -121,13 +129,14 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = True
+        self.last_trigger = "web_resume"
         # The Continue button is normally clicked from the browser.  Seed the
         # foreground baseline there so that this intentional Web action does
         # not immediately look like a fresh switch away from the game.
         self._last_foreground = self._foreground_reader()
         return True
 
-    def _note_user_intervention(self, now: float) -> None:
+    def _note_user_intervention(self, now: float, *, trigger: str) -> None:
         """Extend the quiet-period pause for one verified user action."""
         if (
             self.intervention_started_at is None
@@ -135,15 +144,51 @@ class UserInterventionMonitor:
             or now - self.last_user_input_at > self.pause_seconds
         ):
             self.intervention_started_at = now
+        self.last_trigger = trigger
         self.last_user_input_at = now
         self.pause_until = now + self.pause_seconds
+        was_latched = self.latched
         if now - self.intervention_started_at >= self.latch_seconds:
             self.latched = True
+        if self.latched and not was_latched:
+            logger.warning(
+                "[USER] 连续操作达到 %.0f 秒，已锁定暂停；仅网页“继续”可恢复",
+                self.latch_seconds,
+            )
 
     @staticmethod
     def _automation_tick(controller) -> int | None:
         value = getattr(controller, "last_injected_tick_ms", None)
         return None if value is None else int(value)
+
+    def acknowledge_automation(self, controller=None) -> None:
+        """Consume state left by a known automation keyboard dispatch.
+
+        ``GetAsyncKeyState`` keeps a transition bit until somebody reads it.
+        A tactical-map M press followed by an automated cursor move therefore
+        used to look like one late *human* keyboard event: LASTINPUTINFO pointed
+        at the newer mouse move while the old M transition was still pending.
+        Explicitly acknowledging our key dispatch drains that transition and
+        establishes a new baseline.  Real keyboard input after this call and
+        foreground switches are still observed normally; mouse-only activity
+        never enters the pause state.
+        """
+        current_tick = self._input_tick_reader()
+        injected_tick = self._automation_tick(controller)
+        # Do not drain a real key that happened after the bot dispatch. The
+        # controller observer calls this immediately, so a wider distance is
+        # evidence that LASTINPUTINFO now belongs to another input source.
+        if (
+            injected_tick is not None
+            and _tick_distance(current_tick, injected_tick)
+            > AUTOMATION_TICK_TOLERANCE_MS
+        ):
+            return
+        self._last_seen_tick = current_tick
+        self._keyboard_activity_reader()
+        current_foreground = self._foreground_reader()
+        if current_foreground:
+            self._last_foreground = current_foreground
 
     def poll(self, controller, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -167,7 +212,13 @@ class UserInterventionMonitor:
             previous_foreground == self.hwnd
             and current_foreground not in (0, self.hwnd)
         ):
-            self._note_user_intervention(now)
+            logger.info(
+                "[USER] 检测到切屏: 游戏窗口=%s，当前前台=%s；至少静默 %.0f 秒前不切回游戏",
+                self.hwnd,
+                current_foreground,
+                self.pause_seconds,
+            )
+            self._note_user_intervention(now, trigger="window_switch")
         current_tick = self._input_tick_reader()
         previous_tick = self._last_seen_tick
         self._last_seen_tick = current_tick
@@ -179,9 +230,20 @@ class UserInterventionMonitor:
                 self.intervention_started_at = None
                 self.last_user_input_at = None
             return now < self.pause_until
-        # A changed LASTINPUTINFO tick with no keyboard transition is mouse
-        # activity.  It must never pause automation, including Web-panel clicks.
+        # Mouse activity never starts a pause by itself.  Once the user has
+        # switched away or pressed a key, however, mouse activity in that other
+        # application extends the same quiet window.  Otherwise the game steals
+        # focus back after five seconds while the user is still actively using
+        # the browser with the mouse.
         if not self._keyboard_activity_reader():
+            if (
+                self.intervention_started_at is not None
+                and current_foreground not in (0, self.hwnd)
+            ):
+                self._note_user_intervention(
+                    now,
+                    trigger="background_activity",
+                )
             return self.latched or now < self.pause_until
 
         injected_tick = self._automation_tick(controller)
@@ -191,7 +253,7 @@ class UserInterventionMonitor:
             <= AUTOMATION_TICK_TOLERANCE_MS
         )
         if not is_automation:
-            self._note_user_intervention(now)
+            self._note_user_intervention(now, trigger="keyboard")
         return self.latched or now < self.pause_until
 
     @property

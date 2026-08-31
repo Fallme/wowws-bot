@@ -4,11 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
+import numpy as np
 import pytest
 
 from bot import BattleAnalysis, BattleBot, select_forward_navigation_enemy
 from core.ocr import DistanceObservation, Rect
-from core.vision import Vision
+from core.vision import CaptureZone, PlayerPose, Vision
 from core.feedback import SafetyFault
 from core.ui import ScreenState
 
@@ -82,9 +83,17 @@ class SurvivalGamepad(DamageControlGamepad):
     def __init__(self):
         super().__init__()
         self.heal_uses = 0
+        self.consumable_cycle_uses = 0
+        self.other_consumable_uses = 0
 
     def heal(self):
         self.heal_uses += 1
+
+    def use_consumable_cycle(self):
+        self.consumable_cycle_uses += 1
+
+    def use_other_consumables(self):
+        self.other_consumable_uses += 1
 
 
 class FixtureDistanceReader:
@@ -188,7 +197,214 @@ def test_reset_clears_pending_battle_end_confirmation():
     assert not bot.analyze().ended
 
 
-def test_live_analysis_produces_heading_distance_and_island_clearance():
+def test_reset_preserving_engine_still_clears_previous_battle_navigation_state():
+    gamepad = RecordingGamepad()
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=object(),
+        gamepad=gamepad,
+        distance_reader=FixtureDistanceReader(),
+    )
+    bot._battle_map_islands = [(10, 20)]
+    bot._battle_capture_zones = [("A", 30, 40)]
+    bot._island_layer_candidates.append(((10, 20),))
+    bot._zone_layer_candidates.append((("A", 30, 40),))
+    bot.opening_autopilot_active = True
+    bot.opening_autopilot_target = "上一局航点"
+    bot.opening_autopilot_target_normalized = (0.8, 0.2)
+    bot._tactical_map_left_open = True
+    bot.generic_center_route_active = True
+
+    bot.reset(preserve_movement=True)
+
+    assert gamepad.movements == []
+    assert bot._battle_map_islands == []
+    assert bot._battle_capture_zones == []
+    assert list(bot._island_layer_candidates) == []
+    assert list(bot._zone_layer_candidates) == []
+    assert not bot.opening_autopilot_active
+    assert bot.opening_autopilot_target == ""
+    assert bot.opening_autopilot_target_normalized is None
+    assert not bot._tactical_map_left_open
+    assert not bot.generic_center_route_active
+
+
+def test_reset_preserves_normalized_static_map_for_same_battle_resume():
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+    islands = [
+        {
+            "points": [(0.1, 0.2), (0.2, 0.2), (0.2, 0.3)],
+            "area": 0.005,
+        }
+    ]
+    layout = [
+        {
+            "label": "A",
+            "state": "neutral",
+            "position": (0.25, 0.5),
+            "radius": 0.1,
+        }
+    ]
+    bot._battle_map_islands = islands
+    bot._battle_capture_zone_layout = layout
+    bot._battle_capture_zones = [
+        CaptureZone(center=(50, 100), radius=20, label="A", state="neutral")
+    ]
+    bot._static_map_source = "tactical_map"
+
+    bot.reset(preserve_movement=True, preserve_static_map=True)
+
+    assert bot._battle_map_islands == islands
+    assert bot._battle_capture_zone_layout == layout
+    assert bot._battle_capture_zones == []
+    assert bot._static_map_source == "tactical_map"
+    rematerialized = bot._capture_zones_for_shape((300, 400, 3))
+    assert rematerialized == [
+        CaptureZone(center=(100, 150), radius=30, label="A", state="neutral")
+    ]
+
+
+def test_tactical_map_static_layers_lock_after_three_frames_and_stop_updating():
+    class TacticalStaticVision:
+        def __init__(self):
+            self.island_calls = 0
+            self.zone_calls = 0
+
+        @staticmethod
+        def find_tactical_map(image):
+            return image
+
+        @staticmethod
+        def find_player_pose_on_minimap(_image):
+            return PlayerPose(position=(200, 300), heading=(0.0, -1.0))
+
+        def find_minimap_island_outlines(self, _image):
+            self.island_calls += 1
+            return [
+                {
+                    "points": [
+                        (0.10, 0.20),
+                        (0.25, 0.20),
+                        (0.25, 0.35),
+                        (0.10, 0.35),
+                    ],
+                    "area": 0.0225,
+                }
+            ]
+
+        def find_capture_zones(self, _image, *, player=None):
+            assert player == (200, 300)
+            self.zone_calls += 1
+            return [
+                CaptureZone(
+                    center=(100, 200),
+                    radius=40,
+                    label="A",
+                    state="neutral",
+                )
+            ]
+
+    vision = TacticalStaticVision()
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=vision,
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+    tactical_frame = np.full((400, 400, 3), 100, dtype=np.uint8)
+
+    assert not bot.capture_tactical_map_static_layer(tactical_frame, begin=True)
+    assert not bot.capture_tactical_map_static_layer(tactical_frame)
+    assert bot.capture_tactical_map_static_layer(tactical_frame)
+    assert bot._static_map_source == "tactical_map"
+    assert len(bot._battle_map_islands) == 1
+    assert bot._capture_zones_for_shape((200, 300, 3)) == [
+        CaptureZone(center=(75, 100), radius=20, label="A", state="neutral")
+    ]
+
+    # Once both layers are locked, later calls cannot re-run or mutate static
+    # recognition. Player/heading/enemy detection remains in analyze().
+    assert bot.capture_tactical_map_static_layer(tactical_frame)
+    assert vision.island_calls == 3
+    assert vision.zone_calls == 3
+
+
+def test_locked_static_map_keeps_player_and_enemy_layers_live_each_frame():
+    image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
+
+    class DynamicLayerVision(FixtureVision):
+        def __init__(self, frame):
+            super().__init__(frame)
+            self.dynamic_calls = 0
+            self.pose_calls = 0
+
+        def analyze_minimap(self, _minimap):
+            self.dynamic_calls += 1
+            return [(100 + self.dynamic_calls * 4, 80)], False
+
+        def find_player_pose_on_minimap(self, _minimap):
+            self.pose_calls += 1
+            return PlayerPose(
+                position=(120 + self.pose_calls * 3, 160),
+                heading=(1.0, 0.0),
+            )
+
+        @staticmethod
+        def find_minimap_island_outlines(_minimap):
+            raise AssertionError("静态山体锁定后不得重新识别")
+
+        @staticmethod
+        def find_capture_zones(_minimap, player=None):
+            raise AssertionError("静态点位锁定后不得重新识别")
+
+    vision = DynamicLayerVision(image)
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=vision,
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+    bot._battle_map_islands = [
+        {
+            "points": [(0.70, 0.70), (0.75, 0.70), (0.75, 0.75)],
+            "area": 0.00125,
+        }
+    ]
+    bot._battle_capture_zone_layout = [
+        {
+            "label": "A",
+            "state": "neutral",
+            "position": (0.5, 0.5),
+            "radius": 0.08,
+        }
+    ]
+    bot._static_map_source = "tactical_map"
+
+    first = bot.analyze()
+    second = bot.analyze()
+
+    assert vision.dynamic_calls == 2
+    assert vision.pose_calls == 2
+    assert first.player_position == (123, 160)
+    assert second.player_position == (126, 160)
+    assert first.minimap_enemy_count == 0
+    assert second.minimap_enemy_count == 1
+    assert second.capture_zones[0]["position"] == pytest.approx(
+        [0.5, 0.5],
+        abs=0.002,
+    )
+
+
+def test_live_analysis_produces_heading_distance_and_island_risk():
     image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
     gamepad = RecordingGamepad()
     bot = BattleBot(
@@ -212,7 +428,10 @@ def test_live_analysis_produces_heading_distance_and_island_clearance():
     assert analysis.minimap_target_bearing is not None
     assert analysis.capture_point_distance_km is not None
     assert analysis.map_center_distance_km is not None
-    assert analysis.island_distance is None or analysis.island_distance > 0.10
+    # The corrected bow vector points toward the lower-left island in this
+    # captured frame, so the terrain detector must report an immediate risk.
+    assert analysis.island_distance is not None
+    assert analysis.island_distance < 0.10
     assert analysis.target_distance_km == 23.7
     assert len(analysis.capture_zones) == 3
     assert analysis.capture_zones[0]["state"] == "hostile"
@@ -329,9 +548,7 @@ def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
         {
             "strategy": {
                 "damage_control_cooldown_seconds": 80,
-                "heal_cooldown_seconds": 80,
-                "heal_loss_step": 0.20,
-                "heal_max_uses": 3,
+                "other_consumable_cooldown_seconds": 30,
             }
         },
         vision=object(),
@@ -357,19 +574,18 @@ def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
     bot._execute_rules(analysis, now)
 
     assert gamepad.damage_control_uses == 1
-    assert gamepad.heal_uses == 1
+    assert gamepad.other_consumable_uses == 1
+    assert gamepad.consumable_cycle_uses == 0
     assert gamepad.movements == []
 
 
-def test_heal_uses_numeric_health_at_each_twenty_percent_loss_band():
+def test_other_consumables_retry_every_thirty_seconds_while_health_is_missing():
     gamepad = SurvivalGamepad()
     bot = BattleBot(
         1,
         {
             "strategy": {
-                "heal_cooldown_seconds": 80,
-                "heal_loss_step": 0.20,
-                "heal_max_uses": 3,
+                "other_consumable_cooldown_seconds": 30,
             }
         },
         vision=object(),
@@ -388,14 +604,16 @@ def test_heal_uses_numeric_health_at_each_twenty_percent_loss_band():
             health_recognized=True,
         )
 
-    assert bot._execute_survival_consumables(analysis_at(0.79), now)
-    assert gamepad.heal_uses == 1
-    assert bot._execute_survival_consumables(analysis_at(0.70), now + 100)
-    assert gamepad.heal_uses == 1
-    assert bot._execute_survival_consumables(analysis_at(0.59), now + 200)
-    assert gamepad.heal_uses == 2
-    assert bot._execute_survival_consumables(analysis_at(0.39), now + 300)
-    assert gamepad.heal_uses == 3
+    assert bot._execute_survival_consumables(analysis_at(1.0), now)
+    assert gamepad.other_consumable_uses == 0
+    assert bot._execute_survival_consumables(analysis_at(0.99), now + 1)
+    assert gamepad.other_consumable_uses == 1
+    assert bot._execute_survival_consumables(analysis_at(0.70), now + 30)
+    assert gamepad.other_consumable_uses == 1
+    assert bot._execute_survival_consumables(analysis_at(0.70), now + 31)
+    assert gamepad.other_consumable_uses == 2
+    assert bot._execute_survival_consumables(analysis_at(0.39), now + 61)
+    assert gamepad.other_consumable_uses == 3
 
 
 def test_emergency_island_command_never_reverses_from_vision_alone():
@@ -487,6 +705,49 @@ def test_island_manoeuvre_rejects_ambiguous_turn_side():
     assert bot._stable_island_risk() is None
 
 
+def test_low_speed_collision_escalates_island_avoidance_to_full_power_escape():
+    gamepad = RecordingGamepad()
+    bot = BattleBot(
+        1,
+        {
+            "strategy": {
+                "straight_opening_seconds": 2,
+                "stuck_seconds": 30,
+                "stuck_stationary_pixels": 2,
+                "stuck_low_speed_seconds": 8,
+                "stuck_low_speed_knots": 1.5,
+                "stuck_escape_turn_seconds": 8,
+            }
+        },
+        vision=object(),
+        gamepad=gamepad,
+        distance_reader=FixtureDistanceReader(),
+    )
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.battle_start_time = 0.0
+
+    for second in range(9):
+        analysis = BattleAnalysis(
+            image=None,
+            width=2560,
+            height=1494,
+            in_battle=True,
+            player_position=(100 + second, 200),
+            speed_knots=0.6,
+            map_center_bearing=-0.2,
+            map_center_distance_km=12.0,
+            capture_point_bearing=-0.2,
+            capture_point_distance_km=12.0,
+            island_distance=0.03,
+            island_avoidance_rudder=-1.0,
+        )
+        bot._execute_rules(analysis, 100.0 + second)
+
+    assert gamepad.movements[-1] == (1.0, -1)
+    assert bot.last_movement_reason == "舰船位置长时间未变化，执行自动脱困"
+    assert bot._last_movement_mode == "recovery:forward_escape_turn"
+
+
 def test_movement_feedback_retries_before_requesting_human_intervention():
     class RetryGamepad(RecordingGamepad):
         def __init__(self):
@@ -553,6 +814,78 @@ def test_missing_minimap_pose_keeps_safe_course_without_ending_battle():
     assert gamepad.reassertions == 5
 
 
+def test_native_autopilot_crawling_speed_requests_route_retry_after_six_seconds():
+    bot = BattleBot(
+        1,
+        {"strategy": {"autopilot_zero_speed_retry_seconds": 6.0}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+    )
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.enable_opening_autopilot("地图中心敌方远端")
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        in_battle=True,
+        autopilot_enabled=True,
+        speed_knots=0.6,
+        player_position=(100, 100),
+    )
+
+    bot._execute_rules(analysis, 100.0)
+    assert not bot.autopilot_retry_pending
+
+    bot._execute_rules(analysis, 106.1)
+
+    assert bot.autopilot_retry_pending
+    assert not bot.opening_autopilot_active
+    assert bot.native_autopilot_abandoned
+    assert "持续低速" in bot.last_movement_reason
+
+    # The game's green label can linger after native control is abandoned.
+    # It must not re-lock Q/E on the next frame.
+    bot._execute_rules(analysis, 106.5)
+    assert not bot.opening_autopilot_active
+    assert bot.autopilot_retry_pending
+
+
+def test_native_autopilot_stalled_position_requests_route_retry_immediately():
+    class StalledFeedback:
+        @staticmethod
+        def update(_now, _position, _throttle):
+            raise SafetyFault("已发送航行指令，但未观察到舰船位置变化")
+
+        @staticmethod
+        def reset():
+            pass
+
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+    )
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.feedback = StalledFeedback()
+    bot.enable_opening_autopilot("地图中心敌方远端")
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        in_battle=True,
+        autopilot_enabled=True,
+        speed_knots=12.0,
+        player_position=(100, 100),
+    )
+
+    bot._execute_rules(analysis, 100.0)
+
+    assert bot.autopilot_retry_pending
+    assert not bot.opening_autopilot_active
+    assert "位移闭环" in bot.last_movement_reason
+
+
 def test_battle_feedback_accepts_slow_battleship_minimap_progress():
     bot = BattleBot(
         1,
@@ -614,7 +947,7 @@ def test_lost_native_autopilot_requests_retry_before_generic_qe_route():
 
     # The route disappeared before a confirmed arrival. Q/E remains blocked
     # while the lifecycle receives a request to retry the tactical-map route.
-    assert gamepad.takeovers == 0
+    assert gamepad.takeovers == 1
     assert gamepad.movements == []
     assert not bot.opening_autopilot_active
     assert bot.autopilot_retry_pending

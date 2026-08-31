@@ -27,6 +27,11 @@ class StaticBackend:
         return list(self.tokens)
 
 
+class BrokenBackend:
+    def recognize(self, _image):
+        raise RuntimeError("OCR unavailable")
+
+
 def test_daily_reward_requires_heading_and_returns_claim_text_center():
     image = np.zeros((1000, 1600, 3), dtype=np.uint8)
     backend = StaticBackend(
@@ -48,6 +53,12 @@ def test_daily_reward_requires_heading_and_returns_claim_text_center():
         ]
     )
     assert daily_reward_claim_point(image, obtained_overlay) is None
+
+
+def test_daily_reward_ocr_failure_fails_closed_without_click_target():
+    image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+    assert daily_reward_claim_point(image, BrokenBackend()) is None
 
 
 def test_daily_reward_ignores_explanation_and_selects_collect_button():

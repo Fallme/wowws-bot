@@ -27,6 +27,68 @@ class ConsecutivePointFilter:
         return [(round(point[0]), round(point[1])) for point in confirmed]
 
 
+class ArrowHeadingFilter:
+    """Smooth the live white-arrow vector without deriving heading from travel.
+
+    The arrow contour can briefly expose its stern as the sharpest vertex when
+    range rings, labels or an island overlap it.  A single large reversal is
+    therefore held for one confirmation frame.  Ordinary turns are accepted
+    immediately and blended on the unit circle, so the reported vector always
+    remains the visible bow direction rather than a lagging displacement path.
+    """
+
+    def __init__(self, *, blend=0.72, reversal_dot=-0.15):
+        self.blend = max(0.5, min(float(blend), 1.0))
+        self.reversal_dot = max(-0.95, min(float(reversal_dot), 0.25))
+        self.heading = None
+        self._pending = None
+
+    def reset(self):
+        self.heading = None
+        self._pending = None
+
+    @staticmethod
+    def _normalized(vector):
+        if vector is None or len(vector) < 2:
+            return None
+        x, y = float(vector[0]), float(vector[1])
+        magnitude = math.hypot(x, y)
+        if not math.isfinite(magnitude) or magnitude <= 1e-6:
+            return None
+        return (x / magnitude, y / magnitude)
+
+    def update(self, vector):
+        raw = self._normalized(vector)
+        if raw is None:
+            return self.heading
+        if self.heading is None:
+            self.heading = raw
+            return self.heading
+
+        dot = self.heading[0] * raw[0] + self.heading[1] * raw[1]
+        if dot < self.reversal_dot:
+            pending = self._pending
+            if pending is None or pending[0] * raw[0] + pending[1] * raw[1] < 0.82:
+                self._pending = raw
+                return self.heading
+            # The same opposite bow direction persisted in two independent
+            # captures.  Treat it as a completed hard turn, not contour noise.
+            self.heading = self._normalized((pending[0] + raw[0], pending[1] + raw[1]))
+            self._pending = None
+            return self.heading
+
+        self._pending = None
+        old_weight = 1.0 - self.blend
+        blended = (
+            self.heading[0] * old_weight + raw[0] * self.blend,
+            self.heading[1] * old_weight + raw[1] * self.blend,
+        )
+        normalized = self._normalized(blended)
+        if normalized is not None:
+            self.heading = normalized
+        return self.heading
+
+
 class CourseHeadingFilter:
     """Estimate the ship's real heading from minimap position history.
 

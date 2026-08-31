@@ -85,6 +85,33 @@ class GamepadControllerTests(unittest.TestCase):
             device.calls,
         )
 
+    def test_negative_throttle_is_clamped_to_stop(self):
+        module = load_controller_module(lambda: FakeGamepad())
+        device = FakeGamepad()
+        controller = module.GamepadController(device, pulse_seconds=0)
+
+        controller.set_movement(-1.0, 0.4)
+
+        self.assertIn(
+            ("left_joystick", {"x_value": int(0.4 * 32767), "y_value": 0}),
+            device.calls,
+        )
+        self.assertEqual(controller.last_dispatch.throttle, 0.0)
+
+    def test_control_handoff_establishes_full_forward_and_neutral_rudder(self):
+        module = load_controller_module(lambda: FakeGamepad())
+        device = FakeGamepad()
+        controller = module.GamepadController(device, pulse_seconds=0)
+        controller.set_movement(0.5, -1.0)
+
+        controller.resynchronize_forward_controls()
+
+        self.assertIn(
+            ("left_joystick", {"x_value": 0, "y_value": 32767}),
+            device.calls,
+        )
+        self.assertEqual(controller.last_dispatch.action, "forward_controls_resynchronized")
+
 
 if __name__ == "__main__":
     unittest.main()

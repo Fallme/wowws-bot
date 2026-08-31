@@ -39,7 +39,10 @@ class MovementFeedbackMonitor:
 
     def update(self, now: float, position, intended_throttle: float) -> MovementFeedback:
         now = float(now)
-        if abs(intended_throttle) < 0.55:
+        # The automation contract is forward-only. Negative input is treated
+        # as no verifiable movement request rather than normalizing reverse as
+        # a supported operating mode.
+        if intended_throttle < 0.55:
             return MovementFeedback(self.verified, False, 0.0, "throttle_below_check_threshold")
         if self.started_at is None:
             self.started_at = now

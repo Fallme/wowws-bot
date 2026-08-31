@@ -20,7 +20,6 @@ class MovementMode(str, Enum):
     APPROACH = "approach"
     BRAWL = "hold_range"
     CAPTURE = "hold_capture"
-    REVERSE_RANGE = "reverse_range"
     SEPARATE = "separate"
     AVOID_ISLAND = "avoid_island"
     DISENGAGE = "disengage"
@@ -79,8 +78,8 @@ class SecondaryMovementController:
         ideal_inner_km: float = 7.0,
         too_close_km: float = 4.5,
         brawl_map_distance: float | None = None,
-        capture_throttle: float = 0.36,
-        enemy_steering_weight: float = 0.28,
+        capture_throttle: float = 0.72,
+        enemy_steering_weight: float = 0.84,
         center_steering_gain: float = 1.35,
         straight_opening_seconds: float = 12.0,
         secondary_target_km: float = 10.0,
@@ -98,9 +97,9 @@ class SecondaryMovementController:
         self.island_emergency_distance = self._bounded(
             island_emergency_distance, 0.012, self.island_warning_distance
         )
-        self.capture_throttle = self._bounded(capture_throttle, 0.20, 0.60)
+        self.capture_throttle = self._bounded(capture_throttle, 0.50, 0.85)
         self.enemy_steering_weight = self._bounded(
-            enemy_steering_weight, 0.0, 0.45
+            enemy_steering_weight, 0.55, 0.90
         )
         self.center_steering_gain = self._bounded(
             center_steering_gain, 0.6, 2.0
@@ -226,7 +225,10 @@ class SecondaryMovementController:
             # pursue.  The objective remains only as a guardrail against map
             # edge drift; the old 68% blend left secondary ships circling in
             # the rear half of the map instead of closing for damage.
-            enemy_weight = 0.90 if inside_capture else 0.84
+            enemy_weight = min(
+                0.90,
+                self.enemy_steering_weight + (0.06 if inside_capture else 0.0),
+            )
             bearing = objective * (1.0 - enemy_weight) + enemy * enemy_weight
         if abs(bearing) < 0.05:
             return 0.0
@@ -377,7 +379,7 @@ class SecondaryMovementController:
 
         return MovementCommand(
             MovementMode.CAPTURE,
-            throttle=0.72,
+            throttle=self.capture_throttle,
             rudder=rudder,
             reason="已到达中央点，敌距未确认，保持推进搜索前方红点",
         )

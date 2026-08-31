@@ -75,7 +75,55 @@ def test_transient_window_check_failure_resets_after_handle_recovers():
         )
 
     assert resumed
+    assert resumed.resumed
     assert reporter.updates[-1][0] == "preparing"
+
+
+def test_clear_pause_gate_does_not_request_scene_recovery():
+    reporter = RecordingReporter()
+    bot = SimpleNamespace(hwnd=1234, gamepad=SimpleNamespace())
+
+    resumed = wait_for_web_resume(
+        PausedLimits([False]),
+        reporter,
+        bot,
+    )
+
+    assert resumed
+    assert not resumed.resumed
+    assert reporter.updates == []
+
+
+def test_new_activity_during_focus_restore_keeps_pause_gate_closed():
+    reporter = RecordingReporter()
+    pause_values = [False, False, False]
+    polls = iter([True, False, False])
+    intervention = SimpleNamespace(
+        poll=lambda _controller, _now=None: next(polls),
+        latched=False,
+        last_trigger="window_switch",
+        resumed_from_web=False,
+    )
+    bot = SimpleNamespace(
+        hwnd=1234,
+        gamepad=SimpleNamespace(),
+        intervention=intervention,
+    )
+
+    with (
+        patch("main.restore_game_foreground_after_pause", side_effect=[False, True]) as restore,
+        patch("main.time.sleep", return_value=None),
+    ):
+        resumed = wait_for_web_resume(
+            PausedLimits(pause_values),
+            reporter,
+            bot,
+        )
+
+    assert resumed
+    assert resumed.resumed
+    assert restore.call_count == 2
+    assert any("继续等待5秒静默" in message for _state, message, _values in reporter.updates)
 
 
 def test_shutdown_with_stale_handle_closes_resources_without_game_input():

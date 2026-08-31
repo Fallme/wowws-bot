@@ -126,3 +126,22 @@ def test_reward_consensus_accepts_columns_confirmed_on_different_frames():
         "ship_xp": 1_143,
         "free_xp": 136,
     }
+
+
+def test_reward_ocr_failure_does_not_abort_confirmed_result_lifecycle():
+    class BrokenReader:
+        backend = SimpleNamespace(execution_provider="CPUExecutionProvider")
+
+        @staticmethod
+        def read(_image):
+            raise RuntimeError("OCR provider unavailable")
+
+    confirmed, rewards, state = collect_battle_rewards(
+        make_bot([ScreenState.RESULTS, ScreenState.RESULTS]),
+        BrokenReader(),
+        attempts=2,
+    )
+
+    assert confirmed
+    assert not rewards.recognized
+    assert state == ScreenState.RESULTS

@@ -24,6 +24,7 @@ class RunLimits:
     stop_file: Path | None = None
     pause_file: Path | None = None
     quick_battle: bool = False
+    close_game_when_done: bool = False
 
     @classmethod
     def from_env(cls) -> "RunLimits":
@@ -33,6 +34,9 @@ class RunLimits:
         stop = os.environ.get("WOWS_STOP_FILE", "").strip()
         pause = os.environ.get("WOWS_PAUSE_FILE", "").strip()
         quick = os.environ.get("WOWS_QUICK_BATTLE", "").strip().lower()
+        close_game = os.environ.get(
+            "WOWS_CLOSE_GAME_WHEN_DONE", ""
+        ).strip().lower()
         return cls(
             max_rounds=max_rounds,
             duration_minutes=duration,
@@ -42,6 +46,7 @@ class RunLimits:
             stop_file=Path(stop) if stop else None,
             pause_file=Path(pause) if pause else None,
             quick_battle=quick in {"1", "true", "yes", "on"},
+            close_game_when_done=close_game in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -83,6 +88,7 @@ class RuntimeStatus:
     max_rounds: int = 0
     duration_minutes: float = 0
     quick_battle: bool = False
+    close_game_when_done: bool = False
     started_at: float = 0
     updated_at: float = field(default_factory=time.time)
     error: str = ""
@@ -129,6 +135,7 @@ class RuntimeStatus:
     flooding: bool = False
     damage_control_ready: bool = False
     heal_ready: bool = False
+    other_consumables_ready: bool = False
     elapsed_seconds: float = 0.0
     stop_after_current: bool = False
     rewards_status: str = "pending"
@@ -161,6 +168,7 @@ class RuntimeReporter:
             max_rounds=limits.max_rounds,
             duration_minutes=limits.duration_minutes,
             quick_battle=limits.quick_battle,
+            close_game_when_done=limits.close_game_when_done,
             started_at=time.time(),
         )
 

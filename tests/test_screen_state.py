@@ -84,6 +84,49 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.BATTLE,
         )
 
+    def test_prebattle_start_action_wins_over_false_battle_hud_anchors(self):
+        class ConflictingPrebattleVision(type(self).vision.__class__):
+            @staticmethod
+            def in_loading(_image):
+                return True
+
+            @staticmethod
+            def _has_loading_start_action(_image):
+                return True
+
+            @staticmethod
+            def _has_battle_hud(_image):
+                return True
+
+            @staticmethod
+            def in_results(_image):
+                return False
+
+            @staticmethod
+            def in_port(_image):
+                return False
+
+            @staticmethod
+            def _is_login_splash(_image):
+                return False
+
+            @staticmethod
+            def _is_port_reward_overlay(_image):
+                return False
+
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+        self.assertEqual(
+            ConflictingPrebattleVision().classify_screen(image),
+            ScreenState.LOADING,
+        )
+
+    def test_live_consumables_are_not_a_loading_start_action(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "live_battle.png"))
+        self.assertIsNotNone(image)
+
+        self.assertFalse(self.vision._has_loading_start_action(image))
+
     def test_bright_live_battle_from_walkthrough_is_battle(self):
         self.assertEqual(
             self.classify(
