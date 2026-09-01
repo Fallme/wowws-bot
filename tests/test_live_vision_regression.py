@@ -370,6 +370,71 @@ def test_connected_grid_and_range_rings_are_not_islands():
     assert Vision().find_island_risk(minimap, pose) is None
 
 
+def test_kinematic_rudder_turns_around_a_predicted_collision():
+    pose = PlayerPose((160, 180), (0.0, -1.0))
+    island = {
+        "points": [
+            (0.495, 0.52),
+            (0.505, 0.52),
+            (0.505, 0.53),
+            (0.495, 0.53),
+        ]
+    }
+
+    plan = Vision.plan_kinematic_rudder(
+        (320, 320, 3),
+        pose,
+        (160, 30),
+        [island],
+        speed_knots=30,
+        rudder_shift_seconds=15,
+        turning_radius_km=1,
+        preferred_side=1,
+    )
+
+    assert plan.avoidance_required
+    assert plan.collision_time_seconds == pytest.approx(87, abs=2)
+    assert plan.rudder > 0
+    assert plan.minimum_clearance_km > 0.45
+
+
+def test_kinematic_rudder_steers_toward_a_clear_forward_enemy():
+    plan = Vision.plan_kinematic_rudder(
+        (320, 320, 3),
+        PlayerPose((160, 180), (0.0, -1.0)),
+        (260, 180),
+        [],
+        speed_knots=30,
+        rudder_shift_seconds=15,
+        turning_radius_km=1,
+    )
+
+    assert not plan.avoidance_required
+    assert plan.rudder > 0
+
+
+def test_kinematic_rudder_may_hold_straight_when_enemy_turn_crosses_land():
+    island = {
+        "points": [
+            (0.515, 0.53),
+            (0.54, 0.53),
+            (0.54, 0.55),
+            (0.515, 0.55),
+        ]
+    }
+
+    plan = Vision.plan_kinematic_rudder(
+        (320, 320, 3),
+        PlayerPose((160, 180), (0.0, -1.0)),
+        (260, 180),
+        [island],
+    )
+
+    assert plan.avoidance_required
+    assert plan.rudder == 0.0
+    assert plan.minimum_clearance_km > 0.45
+
+
 def test_snow_islands_produce_browser_outlines_while_grid_lines_are_filtered():
     minimap = np.full((420, 420, 3), (72, 48, 30), dtype=np.uint8)
     for coordinate in range(0, 421, 42):

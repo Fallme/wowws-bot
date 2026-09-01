@@ -43,6 +43,17 @@ class IslandRisk:
 
 
 @dataclass(frozen=True)
+class KinematicSteeringPlan:
+    """Best Q/E order after simulating the ship's delayed turning arc."""
+
+    rudder: float
+    avoidance_required: bool
+    collision_time_seconds: float | None
+    minimum_clearance_km: float
+    predicted_endpoint: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class CaptureZone:
     center: tuple[int, int]
     radius: float
@@ -763,6 +774,221 @@ class Vision:
                 terrain[labels == label] = 255
 
         return self._measure_island_risk(terrain, pose)
+
+    @staticmethod
+    def plan_kinematic_rudder(
+        minimap_shape,
+        pose,
+        target,
+        island_outlines,
+        *,
+        speed_knots: float = 30.0,
+        rudder_shift_seconds: float = 15.0,
+        turning_radius_km: float = 1.0,
+        horizon_seconds: float = 120.0,
+        safety_clearance_km: float = 0.45,
+        initial_rudder: float = 0.0,
+        preferred_side: int = 1,
+    ):
+        """Choose a Q/E notch by comparing physically plausible future paths.
+
+        The minimap grid is 50 km wide.  Each candidate helm order is simulated
+        with a bounded rudder slew and a circular full-rudder turn.  Terrain
+        clearance is a hard constraint; only after a route is safe do target
+        progress and final heading decide which course wins.
+        """
+        if pose is None or target is None:
+            return None
+        height, width = minimap_shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        heading_x, heading_y = pose.heading
+        heading_length = math.hypot(heading_x, heading_y)
+        if heading_length < 0.5:
+            return None
+
+        scale = float(min(width, height))
+        pixels_per_km = max(scale / 50.0, 1e-6)
+        speed_km_s = max(1.0, float(speed_knots)) * 1.852 / 3600.0
+        speed_pixels_s = speed_km_s * pixels_per_km
+        shift_seconds = max(1.0, float(rudder_shift_seconds))
+        turn_radius = max(0.25, float(turning_radius_km))
+        full_turn_rate = speed_km_s / turn_radius
+        horizon = max(30.0, min(float(horizon_seconds), 240.0))
+        clearance_limit = max(0.15, min(float(safety_clearance_km), 1.5))
+
+        terrain = np.zeros((height, width), dtype=np.uint8)
+        for outline in island_outlines or ():
+            points = (
+                outline.get("points", ())
+                if isinstance(outline, dict)
+                else ()
+            )
+            polygon = []
+            for point in points:
+                if not isinstance(point, (tuple, list)) or len(point) < 2:
+                    continue
+                polygon.append(
+                    [
+                        int(round(float(point[0]) * max(width - 1, 1))),
+                        int(round(float(point[1]) * max(height - 1, 1))),
+                    ]
+                )
+            if len(polygon) >= 3:
+                cv2.fillPoly(
+                    terrain,
+                    [np.asarray(polygon, dtype=np.int32)],
+                    255,
+                )
+        water = np.where(terrain > 0, 0, 255).astype(np.uint8)
+        terrain_clearance = (
+            cv2.distanceTransform(water, cv2.DIST_L2, 5) / pixels_per_km
+            if np.any(terrain)
+            else None
+        )
+
+        start_x = float(pose.position[0])
+        start_y = float(pose.position[1])
+        target_x = float(target[0])
+        target_y = float(target[1])
+        initial_distance_km = (
+            math.hypot(target_x - start_x, target_y - start_y)
+            / pixels_per_km
+        )
+        initial_helm = max(-1.0, min(float(initial_rudder), 1.0))
+        side = 1 if preferred_side >= 0 else -1
+        candidates = (0.0, 0.5 * side, -0.5 * side, 1.0 * side, -1.0 * side)
+        results = []
+
+        for candidate in candidates:
+            x = start_x
+            y = start_y
+            heading_angle = math.atan2(heading_y, heading_x)
+            effective_rudder = initial_helm
+            clearances = []
+            collision_time = None
+            elapsed = 0.0
+            while elapsed < horizon:
+                step = min(1.0, horizon - elapsed)
+                maximum_change = step / shift_seconds
+                helm_delta = max(
+                    -maximum_change,
+                    min(candidate - effective_rudder, maximum_change),
+                )
+                effective_rudder += helm_delta
+                # Positive E rudder turns clockwise in minimap coordinates,
+                # whose Y axis points down, hence the positive angle update.
+                heading_angle += effective_rudder * full_turn_rate * step
+                x += math.cos(heading_angle) * speed_pixels_s * step
+                y += math.sin(heading_angle) * speed_pixels_s * step
+                elapsed += step
+
+                if not (0 <= x < width and 0 <= y < height):
+                    clearance = 0.0
+                else:
+                    sample_x = min(width - 1, max(0, int(round(x))))
+                    sample_y = min(height - 1, max(0, int(round(y))))
+                    boundary_clearance = min(
+                        x,
+                        y,
+                        width - 1 - x,
+                        height - 1 - y,
+                    ) / pixels_per_km
+                    land_clearance = (
+                        float(terrain_clearance[sample_y, sample_x])
+                        if terrain_clearance is not None
+                        else 50.0
+                    )
+                    clearance = min(boundary_clearance, land_clearance)
+                clearances.append(clearance)
+                if collision_time is None and clearance <= clearance_limit:
+                    collision_time = elapsed
+
+            final_distance_km = (
+                math.hypot(target_x - x, target_y - y) / pixels_per_km
+            )
+            target_dx = target_x - x
+            target_dy = target_y - y
+            final_heading_x = math.cos(heading_angle)
+            final_heading_y = math.sin(heading_angle)
+            final_cross = final_heading_x * target_dy - final_heading_y * target_dx
+            final_dot = final_heading_x * target_dx + final_heading_y * target_dy
+            final_bearing = abs(math.atan2(final_cross, final_dot)) / math.pi
+            progress_km = initial_distance_km - final_distance_km
+            minimum_clearance = min(clearances) if clearances else 0.0
+            future_clearances = clearances[int(min(len(clearances), shift_seconds)) :]
+            mean_future_clearance = (
+                sum(future_clearances) / len(future_clearances)
+                if future_clearances
+                else minimum_clearance
+            )
+            end_clearance = clearances[-1] if clearances else 0.0
+            direction_change = abs(candidate - initial_helm)
+            target_score = (
+                progress_km * 2.2
+                + (1.0 - final_bearing) * 3.0
+                - abs(candidate) * 0.06
+                - direction_change * 0.08
+            )
+            escape_score = (
+                (collision_time if collision_time is not None else horizon) * 0.08
+                + min(mean_future_clearance, 4.0) * 1.6
+                + min(end_clearance, 4.0) * 2.4
+                + target_score * 0.15
+            )
+            results.append(
+                {
+                    "rudder": candidate,
+                    "collision_time": collision_time,
+                    "minimum_clearance": minimum_clearance,
+                    "target_score": target_score,
+                    "escape_score": escape_score,
+                    "endpoint": (
+                        max(0.0, min(x / max(width - 1, 1), 1.0)),
+                        max(0.0, min(y / max(height - 1, 1), 1.0)),
+                    ),
+                }
+            )
+
+        target_choice = max(results, key=lambda item: item["target_score"])
+        safe_results = [
+            item for item in results if item["collision_time"] is None
+        ]
+        avoidance_required = target_choice["collision_time"] is not None
+        if safe_results:
+            selected = max(
+                safe_results,
+                key=lambda item: (
+                    item["target_score"]
+                    + min(item["minimum_clearance"], 2.0) * 0.10
+                ),
+            )
+        else:
+            # If every path is already inside the safety envelope, neutral
+            # helm cannot create an escape. Pick the turning path that opens
+            # the most water even when straight would postpone contact by a
+            # few seconds.
+            selected = max(
+                (
+                    item
+                    for item in results
+                    if abs(item["rudder"]) >= 0.2
+                ),
+                key=lambda item: item["escape_score"],
+            )
+            avoidance_required = True
+
+        return KinematicSteeringPlan(
+            rudder=float(selected["rudder"]),
+            avoidance_required=avoidance_required,
+            collision_time_seconds=(
+                None
+                if target_choice["collision_time"] is None
+                else float(target_choice["collision_time"])
+            ),
+            minimum_clearance_km=float(selected["minimum_clearance"]),
+            predicted_endpoint=selected["endpoint"],
+        )
 
     def _measure_island_risk(self, terrain, pose):
         """Evaluate a frozen/rasterized terrain layer against live heading."""

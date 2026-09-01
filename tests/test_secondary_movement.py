@@ -274,6 +274,64 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.throttle, 1.0)
         self.assertGreater(abs(command.rudder), 0.7)
 
+    def test_kinematic_safe_course_owns_normal_qe_steering(self):
+        command = self.plan(
+            capture_point_bearing=-0.3,
+            kinematic_rudder=0.5,
+            kinematic_clearance_km=1.2,
+        )
+
+        self.assertEqual(command.mode, MovementMode.ROUTE_TRANSIT)
+        self.assertEqual(command.rudder, 0.5)
+
+    def test_kinematic_collision_prediction_overrides_old_straight_corridor(self):
+        command = self.plan(
+            island_distance=None,
+            kinematic_rudder=-1.0,
+            kinematic_avoidance_required=True,
+            kinematic_collision_time_seconds=24.0,
+            kinematic_clearance_km=0.7,
+        )
+
+        self.assertEqual(command.mode, MovementMode.AVOID_ISLAND)
+        self.assertEqual(command.throttle, 0.55)
+        self.assertEqual(command.rudder, -1.0)
+        self.assertIn("30节/15秒舵效/1.0km转弯半径", command.reason)
+
+    def test_kinematic_safe_straight_path_is_not_replaced_by_fallback_turn(self):
+        command = self.plan(
+            kinematic_rudder=0.0,
+            kinematic_avoidance_required=True,
+            kinematic_collision_time_seconds=52.0,
+            kinematic_clearance_km=0.7,
+        )
+
+        self.assertEqual(command.mode, MovementMode.AVOID_ISLAND)
+        self.assertEqual(command.rudder, 0.0)
+
+    def test_immediate_torpedoes_override_only_a_distant_predicted_island(self):
+        command = self.plan(
+            torpedoes_incoming=True,
+            kinematic_rudder=-0.5,
+            kinematic_avoidance_required=True,
+            kinematic_collision_time_seconds=90.0,
+            kinematic_clearance_km=0.8,
+        )
+
+        self.assertEqual(command.mode, MovementMode.EVADE)
+        self.assertEqual(command.throttle, 1.0)
+
+    def test_near_predicted_island_overrides_torpedoes(self):
+        command = self.plan(
+            torpedoes_incoming=True,
+            kinematic_rudder=-1.0,
+            kinematic_avoidance_required=True,
+            kinematic_collision_time_seconds=20.0,
+            kinematic_clearance_km=0.6,
+        )
+
+        self.assertEqual(command.mode, MovementMode.AVOID_ISLAND)
+
 
 if __name__ == "__main__":
     unittest.main()

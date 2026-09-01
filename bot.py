@@ -84,6 +84,11 @@ class BattleAnalysis:
     route_arrived: bool = False
     island_distance: float | None = None
     island_avoidance_rudder: float | None = None
+    kinematic_rudder: float | None = None
+    kinematic_avoidance_required: bool = False
+    kinematic_collision_time_seconds: float | None = None
+    kinematic_clearance_km: float | None = None
+    kinematic_target: str = ""
     movement_verified: bool = False
     on_fire: bool = False
     flooding: bool = False
@@ -154,6 +159,31 @@ class BattleBot:
         self.hwnd = hwnd
         self.ship = ship_config
         self.strategy = ship_config.get("strategy", {})
+        self.qe_speed_knots = max(
+            5.0,
+            float(
+                self.strategy.get(
+                    "qe_speed_knots",
+                    self.ship.get("navigation", {}).get("speed", 30.0),
+                )
+            ),
+        )
+        self.qe_rudder_shift_seconds = max(
+            3.0,
+            float(self.strategy.get("qe_rudder_shift_seconds", 15.0)),
+        )
+        self.qe_turning_radius_km = max(
+            0.25,
+            float(self.strategy.get("qe_turning_radius_km", 1.0)),
+        )
+        self.qe_prediction_horizon_seconds = max(
+            30.0,
+            float(self.strategy.get("qe_prediction_horizon_seconds", 120.0)),
+        )
+        self.qe_safety_clearance_km = max(
+            0.15,
+            float(self.strategy.get("qe_safety_clearance_km", 0.45)),
+        )
         self.vision = vision or Vision()
         # Keep the attribute name for compatibility with existing strategy and
         # tests; the default implementation is now native keyboard SendInput.
@@ -232,6 +262,9 @@ class BattleBot:
             secondary_inner_km=float(
                 self.strategy.get("secondary_inner_distance_km", 7.0)
             ),
+            qe_speed_knots=self.qe_speed_knots,
+            qe_rudder_shift_seconds=self.qe_rudder_shift_seconds,
+            qe_turning_radius_km=self.qe_turning_radius_km,
         )
         self.stuck_recovery = StuckRecoveryController(
             preferred_side=int(self.strategy.get("preferred_side", 1)),
@@ -835,6 +868,42 @@ class BattleBot:
         """
         self._apply_map_center_objective(analysis)
 
+    def _kinematic_target_normalized(
+        self, analysis: BattleAnalysis
+    ) -> tuple[tuple[float, float] | None, str]:
+        """Blend only a forward enemy into the fixed objective route."""
+        objective = analysis.navigation_target_normalized
+        enemy = analysis.nearest_enemy_normalized
+        enemy_bearing = analysis.minimap_target_bearing
+        enemy_allowed = bool(
+            enemy is not None
+            and enemy_bearing is not None
+            and abs(enemy_bearing) <= 0.50
+            and (
+                analysis.inside_capture_point
+                or analysis.capture_point_bearing is None
+                or abs(analysis.capture_point_bearing) <= 0.28
+            )
+        )
+        if not enemy_allowed:
+            return objective, "中央点"
+        if objective is None:
+            return enemy, "前方敌舰"
+        enemy_weight = min(
+            0.90,
+            float(self.strategy.get("enemy_steering_weight", 0.84))
+            + (0.06 if analysis.inside_capture_point else 0.0),
+        )
+        return (
+            (
+                objective[0] * (1.0 - enemy_weight)
+                + enemy[0] * enemy_weight,
+                objective[1] * (1.0 - enemy_weight)
+                + enemy[1] * enemy_weight,
+            ),
+            "前方敌舰",
+        )
+
     def _reassert_full_speed(self):
         reassert = getattr(self.gamepad, "reassert_full_speed", None)
         if reassert is not None:
@@ -927,30 +996,13 @@ class BattleBot:
         hold_seconds = float(
             self.strategy.get("rudder_minimum_hold_seconds", 1.1)
         )
-        maximum_hold_seconds = max(
-            hold_seconds,
-            min(
-                float(self.strategy.get("rudder_maximum_hold_seconds", 4.5)),
-                4.8,
-            ),
-        )
-        # A single Q/E order may not stay active long enough to make the
-        # ship circle.  Always release to neutral before another correction;
-        # the next minimap frame then has to justify a new steering order.
-        if (
-            current_direction
-            and self._rudder_commanded_at > 0
-            and now - self._rudder_commanded_at >= maximum_hold_seconds
-        ):
-            self._last_applied_rudder = 0.0
-            self._rudder_commanded_at = 0.0
-            self._rudder_release_until = now + 0.65
-            return 0.0
         if now < self._rudder_release_until:
             return 0.0
         changing_direction = desired_direction != current_direction
         if (
             changing_direction
+            and current_direction
+            and desired_direction
             and not safety_override
             and self._rudder_commanded_at > 0
             and now - self._rudder_commanded_at < hold_seconds
@@ -1342,6 +1394,49 @@ class BattleBot:
                             selected_enemy[0] / max(minimap.shape[1], 1),
                             selected_enemy[1] / max(minimap.shape[0], 1),
                         )
+                kinematic_planner = getattr(
+                    self.vision,
+                    "plan_kinematic_rudder",
+                    None,
+                )
+                if (
+                    kinematic_planner is not None
+                    and pose is not None
+                    and course_heading is not None
+                    and self._battle_map_islands
+                ):
+                    target_normalized, target_kind = (
+                        self._kinematic_target_normalized(analysis)
+                    )
+                    if target_normalized is not None:
+                        kinematic_plan = kinematic_planner(
+                            minimap.shape,
+                            navigation_pose,
+                            (
+                                target_normalized[0] * minimap.shape[1],
+                                target_normalized[1] * minimap.shape[0],
+                            ),
+                            self._battle_map_islands,
+                            speed_knots=self.qe_speed_knots,
+                            rudder_shift_seconds=self.qe_rudder_shift_seconds,
+                            turning_radius_km=self.qe_turning_radius_km,
+                            horizon_seconds=self.qe_prediction_horizon_seconds,
+                            safety_clearance_km=self.qe_safety_clearance_km,
+                            initial_rudder=self._last_applied_rudder,
+                            preferred_side=self.movement.preferred_side,
+                        )
+                        if kinematic_plan is not None:
+                            analysis.kinematic_rudder = kinematic_plan.rudder
+                            analysis.kinematic_avoidance_required = (
+                                kinematic_plan.avoidance_required
+                            )
+                            analysis.kinematic_collision_time_seconds = (
+                                kinematic_plan.collision_time_seconds
+                            )
+                            analysis.kinematic_clearance_km = (
+                                kinematic_plan.minimum_clearance_km
+                            )
+                            analysis.kinematic_target = target_kind
                 analysis.minimap_contacts = [
                     {
                         "position": [
@@ -1413,6 +1508,12 @@ class BattleBot:
                 analysis.island_avoidance_rudder = (
                     self._island_avoidance_rudder
                 )
+            if (
+                analysis.kinematic_avoidance_required
+                and analysis.kinematic_rudder is not None
+            ):
+                # The same predicted safe side also guides stuck recovery.
+                analysis.island_avoidance_rudder = analysis.kinematic_rudder
 
             viewport_enemies = self.vision.find_enemies_in_viewport(image)
             if len(viewport_enemies) > 8:
@@ -2006,6 +2107,15 @@ class BattleBot:
                 torpedoes_incoming=analysis.torpedoes_incoming,
                 island_distance=analysis.island_distance,
                 island_avoidance_rudder=analysis.island_avoidance_rudder,
+                kinematic_rudder=analysis.kinematic_rudder,
+                kinematic_avoidance_required=(
+                    analysis.kinematic_avoidance_required
+                ),
+                kinematic_collision_time_seconds=(
+                    analysis.kinematic_collision_time_seconds
+                ),
+                kinematic_clearance_km=analysis.kinematic_clearance_km,
+                kinematic_target=analysis.kinematic_target,
             )
         )
         safety_override = command.mode in {

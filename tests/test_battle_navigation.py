@@ -692,6 +692,57 @@ def test_island_override_releases_to_neutral_before_opposite_rudder():
     ) == -0.8
 
 
+def test_same_predicted_rudder_is_not_forced_neutral_before_ship_responds():
+    bot = BattleBot(
+        1,
+        {"strategy": {"rudder_minimum_hold_seconds": 4.0}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+    )
+
+    assert bot._latency_compensated_rudder(0.5, 10.0) == 0.5
+    assert bot._latency_compensated_rudder(0.5, 25.5) == 0.5
+
+
+def test_predicted_neutral_can_start_recentering_without_four_second_delay():
+    bot = BattleBot(
+        1,
+        {"strategy": {"rudder_minimum_hold_seconds": 4.0}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+    )
+
+    assert bot._latency_compensated_rudder(1.0, 10.0) == 1.0
+    assert bot._latency_compensated_rudder(0.0, 10.5) == 0.0
+
+
+def test_kinematic_target_blends_only_a_forward_enemy():
+    bot = BattleBot(
+        1,
+        {"strategy": {"enemy_steering_weight": 0.84}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+    )
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        navigation_target_normalized=(0.5, 0.2),
+        nearest_enemy_normalized=(0.8, 0.4),
+        minimap_target_bearing=0.25,
+        capture_point_bearing=0.1,
+    )
+
+    target, source = bot._kinematic_target_normalized(analysis)
+
+    assert source == "前方敌舰"
+    assert target == pytest.approx((0.752, 0.368))
+    analysis.minimap_target_bearing = 0.8
+    target, source = bot._kinematic_target_normalized(analysis)
+    assert source == "中央点"
+    assert target == (0.5, 0.2)
+
+
 def test_island_manoeuvre_rejects_ambiguous_turn_side():
     bot = BattleBot(
         1,

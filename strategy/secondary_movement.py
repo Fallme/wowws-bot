@@ -47,6 +47,11 @@ class SecondaryMovementInput:
     torpedoes_incoming: bool = False
     island_distance: float | None = None
     island_avoidance_rudder: float | None = None
+    kinematic_rudder: float | None = None
+    kinematic_avoidance_required: bool = False
+    kinematic_collision_time_seconds: float | None = None
+    kinematic_clearance_km: float | None = None
+    kinematic_target: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,9 @@ class SecondaryMovementController:
         straight_opening_seconds: float = 12.0,
         secondary_target_km: float = 10.0,
         secondary_inner_km: float = 7.0,
+        qe_speed_knots: float = 30.0,
+        qe_rudder_shift_seconds: float = 15.0,
+        qe_turning_radius_km: float = 1.0,
     ):
         # Legacy distance-band arguments remain accepted so existing ship
         # configs load cleanly. Station-first control deliberately does not
@@ -113,6 +121,13 @@ class SecondaryMovementController:
         self.secondary_inner_km = self._bounded(
             min(secondary_inner_km, self.secondary_target_km - 0.5), 3.0, 15.0
         )
+        self.qe_speed_knots = self._bounded(qe_speed_knots, 5.0, 60.0)
+        self.qe_rudder_shift_seconds = self._bounded(
+            qe_rudder_shift_seconds, 3.0, 45.0
+        )
+        self.qe_turning_radius_km = self._bounded(
+            qe_turning_radius_km, 0.25, 3.0
+        )
         # When the objective lies behind the current course, atan2 can jump
         # between +pi and -pi on adjacent minimap frames.  Keep one turn side
         # until the target is clearly ahead so Q/E cannot alternate into a
@@ -131,6 +146,11 @@ class SecondaryMovementController:
         self._objective_recovery_direction = 0
 
     def _island_rudder(self, state: SecondaryMovementInput) -> float:
+        if (
+            state.kinematic_avoidance_required
+            and state.kinematic_rudder is not None
+        ):
+            return self._clamp(state.kinematic_rudder)
         rudder = state.island_avoidance_rudder
         if rudder is None or abs(rudder) < 0.2:
             return 0.76 * self.preferred_side
@@ -186,7 +206,17 @@ class SecondaryMovementController:
         )
         if objective_is_behind and not inside_capture:
             if not self._objective_recovery_direction:
-                self._objective_recovery_direction = 1 if objective > 0 else -1
+                if (
+                    state.kinematic_rudder is not None
+                    and abs(state.kinematic_rudder) >= 0.2
+                ):
+                    self._objective_recovery_direction = (
+                        1 if state.kinematic_rudder > 0 else -1
+                    )
+                else:
+                    self._objective_recovery_direction = (
+                        1 if objective > 0 else -1
+                    )
             # A half-rudder correction cannot recover a battleship already
             # steaming away from the objective.  Enemy markers are ignored
             # until this fixed-side U-turn brings the target ahead again.
@@ -200,6 +230,9 @@ class SecondaryMovementController:
             return 0.76 * self._objective_recovery_direction
         if objective is None or abs(objective) <= 0.18 or inside_capture:
             self._objective_recovery_direction = 0
+
+        if state.kinematic_rudder is not None:
+            return self._clamp(state.kinematic_rudder)
 
         # Outside the objective, a red contact may bias the helm only when the
         # fixed map objective is already in the forward cone.  This prevents a
@@ -263,6 +296,44 @@ class SecondaryMovementController:
             "final_approach": "进入中央占领点",
         }.get(state.route_phase, "驶向中央占领点")
 
+    def _kinematic_avoidance_command(
+        self, state: SecondaryMovementInput
+    ) -> MovementCommand:
+        collision_seconds = state.kinematic_collision_time_seconds
+        emergency = bool(
+            collision_seconds is None or collision_seconds <= 30.0
+        )
+        clearance_text = (
+            f"，预测净空约{state.kinematic_clearance_km:.1f}km"
+            if state.kinematic_clearance_km is not None
+            else ""
+        )
+        collision_text = (
+            f"约{collision_seconds:.0f}秒后触岸"
+            if collision_seconds is not None
+            else "候选航迹均不安全"
+        )
+        return MovementCommand(
+            MovementMode.AVOID_ISLAND,
+            throttle=(
+                0.55
+                if emergency
+                else (0.82 if state.inside_capture_point else 1.0)
+            ),
+            rudder=self._island_rudder(state),
+            reason=(
+                f"运动学预测{collision_text}，按{self.qe_speed_knots:.0f}节/"
+                f"{self.qe_rudder_shift_seconds:.0f}秒舵效/"
+                f"{self.qe_turning_radius_km:.1f}km转弯半径"
+                f"选择安全航迹{clearance_text}"
+                + (
+                    f"；避山优先，安全后继续朝{state.kinematic_target}推进"
+                    if state.kinematic_target
+                    else ""
+                )
+            ),
+        )
+
     def plan(self, state: SecondaryMovementInput) -> MovementCommand:
         if state.elapsed < self.straight_opening_seconds:
             return MovementCommand(
@@ -272,8 +343,19 @@ class SecondaryMovementController:
                 reason="已锁定中央点航线，开局直航建立真实航迹",
             )
 
+        kinematic_emergency = bool(
+            state.kinematic_avoidance_required
+            and (
+                state.kinematic_collision_time_seconds is None
+                or state.kinematic_collision_time_seconds <= 30.0
+            )
+        )
+        if kinematic_emergency:
+            return self._kinematic_avoidance_command(state)
+
         if (
-            state.island_distance is not None
+            state.kinematic_rudder is None
+            and state.island_distance is not None
             and state.island_distance <= self.island_emergency_distance
         ):
             return MovementCommand(
@@ -291,8 +373,12 @@ class SecondaryMovementController:
                 reason="发现来袭鱼雷，保持全速向可通航一侧规避",
             )
 
+        if state.kinematic_avoidance_required:
+            return self._kinematic_avoidance_command(state)
+
         if (
-            state.island_distance is not None
+            state.kinematic_rudder is None
+            and state.island_distance is not None
             and state.island_distance <= self.island_warning_distance
         ):
             return MovementCommand(
@@ -320,11 +406,20 @@ class SecondaryMovementController:
             )
             objective = self._objective_text(state)
             phase_text = self._route_reason_prefix(state)
+            target_suffix = (
+                f"；运动学航迹朝{state.kinematic_target}收敛"
+                if state.kinematic_rudder is not None
+                and state.kinematic_target
+                else ""
+            )
             return MovementCommand(
                 MovementMode.ROUTE_TRANSIT,
                 throttle=1.0,
                 rudder=rudder,
-                reason=f"{phase_text}，四档全速推进；当前目标{objective}",
+                reason=(
+                    f"{phase_text}，四档全速推进；当前目标{objective}"
+                    f"{target_suffix}"
+                ),
             )
 
         enemy_outside = bool(

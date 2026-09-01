@@ -49,6 +49,11 @@ pommern:
     island_emergency_distance: 0.060 # 近岛立即硬舵，但仍保持向前脱离
     island_turn_commit_seconds: 3.8  # 单次绕岛转向上限；新帧必须重新确认
     rudder_minimum_hold_seconds: 4.0 # 普通航向修正避免左右指令反复抵消
+    qe_speed_knots: 30.0            # Q/E航迹预测使用的满速
+    qe_rudder_shift_seconds: 15.0   # 中舵到满舵约15秒
+    qe_turning_radius_km: 1.0       # 满舵稳态转弯半径
+    qe_prediction_horizon_seconds: 120.0 # 每帧向前模拟2分钟航迹
+    qe_safety_clearance_km: 0.45    # 舰体中心与岸线的最低预测净空
     capture_throttle: 0.72           # 进入中央占领点后约 3/4 航速继续搜索
     enemy_steering_weight: 0.84      # 前方红点优先，中央点仅作弱防漂移约束
     center_steering_gain: 1.35       # 中央点航向控制增益
@@ -122,6 +127,11 @@ napoli:
     island_emergency_distance: 0.060
     island_turn_commit_seconds: 3.8
     rudder_minimum_hold_seconds: 4.0
+    qe_speed_knots: 36.0
+    qe_rudder_shift_seconds: 15.0
+    qe_turning_radius_km: 1.0
+    qe_prediction_horizon_seconds: 120.0
+    qe_safety_clearance_km: 0.45
     capture_throttle: 0.72
     enemy_steering_weight: 0.84
     center_steering_gain: 1.35
