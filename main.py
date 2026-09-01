@@ -54,10 +54,6 @@ BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("runner")
 
 
-class GameWindowUnavailableWhilePaused(RuntimeError):
-    """Raised after the paused workflow loses its game window for a grace period."""
-
-
 @dataclass(frozen=True)
 class ResumeGateResult:
     """Outcome of the cooperative pause gate.
@@ -95,6 +91,39 @@ def count_quick_battle_for_plan(
     if closure_confirmed and battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
         return max(0, int(completed_rounds)) + 1
     return max(0, int(completed_rounds))
+
+
+def count_settled_battle_for_plan(
+    completed_rounds: int,
+    *,
+    settlement_confirmed: bool,
+) -> int:
+    """Count a normal battle only after its result boundary was confirmed."""
+
+    if settlement_confirmed:
+        return max(0, int(completed_rounds)) + 1
+    return max(0, int(completed_rounds))
+
+
+def lifecycle_stop_requested(
+    limits,
+    completed_rounds: int,
+    started_at: float,
+    *,
+    round_active: bool,
+) -> bool:
+    """Apply plan limits only between complete battle cycles.
+
+    The Stop button is a hard interrupt. Round/time limits are soft while a
+    matchmaking, loading, battle, or settlement cycle is active, so a pause
+    cannot make the outer loop exit before that same round reaches results.
+    """
+
+    if limits.stop_requested():
+        return True
+    if round_active:
+        return False
+    return limits.schedule_reached(completed_rounds, started_at)
 
 
 def is_game_window_alive(hwnd) -> bool:
@@ -348,8 +377,11 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
     while time.monotonic() < deadline:
         if operation_paused(bot):
             # Keyboard/Web pause applies before the first recognized page too.
-            # Do not focus or capture until the quiet period (or Web resume).
+            # Do not focus or capture until the quiet period (or Web resume),
+            # and do not spend the startup timeout while intentionally paused.
+            paused_at = time.monotonic()
             time.sleep(0.15)
+            deadline += max(0.0, time.monotonic() - paused_at)
             continue
         if not ensure_capture_foreground(bot):
             time.sleep(0.5)
@@ -1961,10 +1993,16 @@ def wait_for_web_resume(
     bot=None,
     *,
     resume_state="preparing",
-    window_missing_timeout=5.0,
     poll_interval=0.15,
 ):
-    """Freeze lifecycle actions and report whether old phase state is stale."""
+    """Freeze lifecycle actions and report whether old phase state is stale.
+
+    Only an explicit Stop request closes this gate permanently. A missing or
+    recreated game window remains recoverable: after Continue, foreground
+    restoration keeps retrying until the window can be rebound, while callers
+    always discard their old phase-local assumptions and classify the live
+    screen again.
+    """
     intervention = getattr(bot, "intervention", None)
 
     def keyboard_paused():
@@ -1997,7 +2035,8 @@ def wait_for_web_resume(
         movement_mode="manual_pause",
         movement_reason="保持现有船速与舵位；5秒静默后自动恢复，持续20秒则等待网页继续",
     )
-    window_missing_since = None
+    window_missing_reported = False
+    foreground_retry_reported = False
     latch_reported = bool(
         web_paused or (intervention is not None and intervention.latched)
     )
@@ -2022,19 +2061,44 @@ def wait_for_web_resume(
                 and intervention is not None
                 and not restore_game_foreground_after_pause(bot, resume_source)
             ):
-                # A new key/mouse event can land between the last quiet-period
-                # poll and SetForegroundWindow.  Stay inside this pause gate;
-                # never resume the caller with an unverified foreground.
-                reporter.update(
-                    "paused",
-                    "检测到新的用户操作，继续等待5秒静默",
-                    paused_by_user=True,
-                    manual_intervention_latched=bool(
-                        intervention is not None and intervention.latched
-                    ),
-                    movement_mode="manual_pause",
-                )
-                time.sleep(max(0.01, float(poll_interval)))
+                # A new user event can land between the quiet-period poll and
+                # SetForegroundWindow. A recreated game window can also make
+                # one restore attempt fail. Neither condition terminates the
+                # task: stay here until Stop or a verified foreground exists.
+                web_paused = limits.pause_requested()
+                key_paused = keyboard_paused()
+                if web_paused or key_paused:
+                    foreground_retry_reported = False
+                    reporter.update(
+                        "paused",
+                        "检测到新的用户操作，继续等待5秒静默",
+                        paused_by_user=True,
+                        manual_intervention_latched=bool(
+                            web_paused
+                            or (
+                                intervention is not None
+                                and intervention.latched
+                            )
+                        ),
+                        movement_mode="manual_pause",
+                    )
+                    time.sleep(max(0.01, float(poll_interval)))
+                else:
+                    if not foreground_retry_reported:
+                        logger.warning(
+                            "暂停已解除但游戏窗口暂不可用；保留任务并等待重新绑定"
+                        )
+                        reporter.update(
+                            "recovering",
+                            "暂停已解除，游戏窗口暂不可用；任务保持运行并等待恢复",
+                            paused_by_user=False,
+                            manual_intervention_latched=False,
+                            movement_mode="idle",
+                            movement_reason="等待重新找到游戏窗口后识别当前阶段",
+                            error="game_window_rebind_pending",
+                        )
+                        foreground_retry_reported = True
+                    time.sleep(max(0.25, float(poll_interval)))
                 continue
             break
         if (
@@ -2052,32 +2116,23 @@ def wait_for_web_resume(
                 movement_mode="manual_pause",
                 movement_reason="保持既有操纵状态，等待网页手动继续",
             )
-        now = time.monotonic()
         if bot is not None and not is_game_window_alive(getattr(bot, "hwnd", 0)):
-            if window_missing_since is None:
-                window_missing_since = now
-                logger.warning("暂停期间游戏窗口句柄失效，开始无操作确认")
-            elif now - window_missing_since >= max(
-                0.0, float(window_missing_timeout)
-            ):
+            if not window_missing_reported:
+                window_missing_reported = True
+                logger.warning("暂停期间游戏窗口暂不可用；保留任务，继续后重新查找")
                 reporter.update(
-                    "failed",
-                    "暂停期间游戏窗口已关闭，任务已安全退出",
-                    paused_by_user=False,
-                    manual_intervention_latched=False,
-                    movement_mode="idle",
-                    movement_reason="未切换前台、未向失效窗口发送控制指令",
-                    error="game_window_unavailable_while_paused",
-                    safety_state="blocked",
-                )
-                raise GameWindowUnavailableWhilePaused(
-                    "暂停期间连续无法找到原游戏窗口"
+                    "paused",
+                    "暂停期间游戏窗口暂不可用；任务已保留，继续后会重新查找",
+                    paused_by_user=True,
+                    manual_intervention_latched=bool(
+                        web_paused
+                        or (intervention is not None and intervention.latched)
+                    ),
+                    movement_mode="manual_pause",
+                    movement_reason="暂停期间不切窗口、不发送指令",
                 )
         else:
-            # Minimize, foreground changes and one-off handle inspection
-            # failures do not trip the worker; only one stale HWND sustained
-            # for the full grace period does.
-            window_missing_since = None
+            window_missing_reported = False
         time.sleep(max(0.01, float(poll_interval)))
     logger.info("[SYSTEM] %s，开始重新识别当前画面并接续原流程", resume_source)
     reporter.update(
@@ -2227,24 +2282,76 @@ def run():
         return 2
 
     reporter.update("preparing", "正在执行港口画面与输入自动自检")
-    try:
-        calibration = automatic_input_preflight(
+    while True:
+        preflight_resume_gate = wait_for_web_resume(
+            limits,
+            reporter,
             bot,
-            title,
-            rect,
-            initial_state,
+            resume_state="preparing",
         )
-    except (SafetyFault, CaptureFault) as error:
-        logger.error("自动自检失败: %s", error)
-        reporter.update(
-            "failed",
-            "自动自检失败，需要人工检查游戏窗口后重试",
-            error=str(error),
-            safety_state="blocked",
-            calibration_valid=False,
-        )
-        shutdown_bot(bot)
-        return 2
+        if not preflight_resume_gate:
+            bot.stop(release_input=False)
+            return 0
+        if preflight_resume_gate.resumed:
+            # The page may have moved from port to loading/battle/results while
+            # paused. Never run a stale port preflight (which releases throttle)
+            # against a live battle; classify the current page again first.
+            reporter.update(
+                "recovering",
+                "启动自检暂停已解除，正在重新识别当前阶段",
+            )
+            initial_frame, initial_state = wait_for_recognized_screen(
+                bot,
+                timeout=min(screen_timeout, 30.0),
+            )
+            if initial_state == ScreenState.DAILY_REWARD:
+                backend = getattr(
+                    getattr(bot, "distance_reader", None), "backend", None
+                )
+                if claim_daily_reward(
+                    bot.hwnd,
+                    initial_frame,
+                    backend=backend,
+                    should_abort=lambda: operation_paused(bot),
+                ):
+                    time.sleep(1.0)
+                return_to_port(bot, attempts=4)
+                # Re-enter the same pause-aware recognition path. No stale
+                # DAILY_REWARD state is passed into the input preflight.
+                continue
+            if initial_state == ScreenState.UNKNOWN:
+                if operation_paused(bot):
+                    continue
+                logger.warning("暂停恢复后页面仍未知；保持任务并继续识别")
+                reporter.update(
+                    "recovering",
+                    "暂停恢复后页面暂未识别，任务保持运行并继续重试",
+                    error="preflight_scene_retrying",
+                )
+                time.sleep(1.0)
+                continue
+        try:
+            calibration = automatic_input_preflight(
+                bot,
+                title,
+                rect,
+                initial_state,
+            )
+            break
+        except (SafetyFault, CaptureFault) as error:
+            if operation_paused(bot) or limits.pause_requested():
+                logger.info("[USER] 启动自检期间发生暂停；保留任务，恢复后重识别")
+                continue
+            logger.error("自动自检失败: %s", error)
+            reporter.update(
+                "failed",
+                "自动自检失败，需要人工检查游戏窗口后重试",
+                error=str(error),
+                safety_state="blocked",
+                calibration_valid=False,
+            )
+            shutdown_bot(bot)
+            return 2
     capture_backend = getattr(bot.vision.screen_capture, "last_backend", "unknown")
     reporter.update(
         "preparing",
@@ -2266,10 +2373,23 @@ def run():
     # to start selection again until settlement positively closes this round.
     round_in_progress = False
     round_entry_pending = False
+    # A stable result page is the only boundary that permits a later PORT to
+    # close the round. Keep this evidence across pauses because the player may
+    # press Return to Port before reward OCR resumes.
+    round_result_seen = False
     plan_completed = False
 
     def should_stop():
-        return limits.reached(completed_rounds, started_at)
+        return lifecycle_stop_requested(
+            limits,
+            completed_rounds,
+            started_at,
+            round_active=(
+                round_in_progress
+                or round_entry_pending
+                or round_result_seen
+            ),
+        )
 
     def user_stop_requested():
         return limits.stop_requested()
@@ -2294,7 +2414,11 @@ def run():
                 time.sleep(1.0)
                 continue
             current_round = completed_rounds + 1
-            round_locked = round_in_progress or round_entry_pending
+            round_locked = (
+                round_in_progress
+                or round_entry_pending
+                or round_result_seen
+            )
             logger.info(
                 "=== 第 %s 局%s ===",
                 current_round,
@@ -2315,8 +2439,72 @@ def run():
                 attempts=5,
                 stable_frames=2,
                 poll_interval=0.2,
-                round_in_progress=round_locked,
+                # Before results, a port-looking frame can be a dangerous HUD
+                # false positive. Once results were stably seen, PORT is a
+                # valid continuation and may close this exact round once.
+                round_in_progress=(round_locked and not round_result_seen),
             )
+            if round_result_seen and current_scene in {
+                ScreenState.LOADING,
+                ScreenState.BATTLE,
+            }:
+                # The player may click Continue Battle while automation is
+                # paused. A previously confirmed result followed by loading or
+                # a battle HUD proves that exact old cycle closed and a new one
+                # has begun. Commit the old round once and initialize the live
+                # one as fresh control state.
+                completed_rounds = count_settled_battle_for_plan(
+                    completed_rounds,
+                    settlement_confirmed=round_result_seen,
+                )
+                closed_round = current_round
+                round_result_seen = False
+                round_entry_pending = False
+                round_in_progress = True
+                setattr(bot, "_round_control_initialized", False)
+                current_round = completed_rounds + 1
+                logger.info(
+                    "暂停期间已从结算进入新战斗；第 %s 局计数完成，接续第 %s 局",
+                    closed_round,
+                    current_round,
+                )
+                reporter.update(
+                    "recovering",
+                    "已确认上一局结算并进入新战斗；上一局已计数，正在接续当前局",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status=(
+                        "skipped" if limits.quick_battle else "unrecognized"
+                    ),
+                    rewards_round=(0 if limits.quick_battle else closed_round),
+                    last_rewards={},
+                    last_outcome="unknown",
+                )
+                if user_stop_requested() or limits.schedule_reached(
+                    completed_rounds,
+                    started_at,
+                ):
+                    manually_stopped = user_stop_requested()
+                    plan_completed = not manually_stopped
+                    reporter.update(
+                        "stopped" if manually_stopped else "completed",
+                        "已按用户要求安全停止"
+                        if manually_stopped
+                        else "运行计划已完成；不接管暂停期间新进入的战斗",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        movement_mode="idle",
+                        movement_reason="控制已安全释放",
+                        route_phase="unplanned",
+                        route_progress=0.0,
+                        route_waypoint=0,
+                        route_arrived=False,
+                        inside_capture_point=False,
+                        paused_by_user=False,
+                        manual_intervention_active=False,
+                        manual_intervention_latched=False,
+                    )
+                    return 0
             prepared = False
             resuming_this_battle = False
             result_ready = False
@@ -2379,16 +2567,77 @@ def run():
                 preparation_failures = 0
                 continue
             elif current_scene == ScreenState.RESULTS:
-                if not round_in_progress:
+                if not (
+                    round_in_progress
+                    or round_entry_pending
+                    or round_result_seen
+                ):
                     round_entry_pending = False
                     logger.info("当前结算页不属于已进入的新战斗：不重复计数，返回港口")
                     return_to_port(bot, attempts=3)
                     port_configured = False
                     continue
+                round_entry_pending = False
+                round_in_progress = True
+                round_result_seen = True
                 logger.info("已确认本组战斗的结算页：保留页面，先执行收益 OCR")
                 prepared = True
                 result_ready = True
             elif current_scene == ScreenState.PORT:
+                if round_result_seen and round_in_progress:
+                    # Results were already stably observed before a pause or
+                    # manual Return-to-Port action. The full cycle is closed,
+                    # but reward numbers are no longer available. Count once,
+                    # clear every round lock, then begin the next lifecycle.
+                    completed_rounds = count_settled_battle_for_plan(
+                        completed_rounds,
+                        settlement_confirmed=round_result_seen,
+                    )
+                    round_in_progress = False
+                    round_entry_pending = False
+                    round_result_seen = False
+                    setattr(bot, "_round_control_initialized", False)
+                    logger.info(
+                        "已凭暂停前确认的结算证据在港口闭合本局，计入计划进度: %s",
+                        completed_rounds,
+                    )
+                    reporter.update(
+                        "returning",
+                        "已确认本局结算并回到港口；本局已计数，收益记为未识别",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        rewards_status=(
+                            "skipped" if limits.quick_battle else "unrecognized"
+                        ),
+                        rewards_round=(
+                            0 if limits.quick_battle else current_round
+                        ),
+                        last_rewards={},
+                        last_outcome="unknown",
+                    )
+                    if should_stop():
+                        manually_stopped = user_stop_requested()
+                        plan_completed = not manually_stopped
+                        reporter.update(
+                            "stopped" if manually_stopped else "completed",
+                            "已按用户要求安全停止"
+                            if manually_stopped
+                            else "运行计划已完成",
+                            current_round=current_round,
+                            completed_rounds=completed_rounds,
+                            movement_mode="idle",
+                            movement_reason="计划已完成，控制已安全释放",
+                            route_phase="unplanned",
+                            route_progress=0.0,
+                            route_waypoint=0,
+                            route_arrived=False,
+                            inside_capture_point=False,
+                            paused_by_user=False,
+                            manual_intervention_active=False,
+                            manual_intervention_latched=False,
+                        )
+                        return 0
+                    continue
                 # In the port we must always validate the selected ship and
                 # battle mode before joining.  Do not retain a stale success
                 # flag from a prior round.
@@ -2457,6 +2706,7 @@ def run():
                 if recovered_state == ScreenState.BATTLE:
                     round_entry_pending = False
                     round_in_progress = True
+                    round_result_seen = False
                     logger.info("准备恢复确认已在战斗中，下一循环直接接管")
                     preparation_failures = 0
                     continue
@@ -2892,6 +3142,7 @@ def run():
                 )
                 round_in_progress = False
                 round_entry_pending = False
+                round_result_seen = False
                 setattr(bot, "_round_control_initialized", False)
                 logger.info(
                     "快速战斗已确认离开，本局计入计划进度: %s",
@@ -2908,10 +3159,13 @@ def run():
                     last_outcome="unknown",
                 )
                 if should_stop():
-                    plan_completed = not user_stop_requested()
+                    manually_stopped = user_stop_requested()
+                    plan_completed = not manually_stopped
                     reporter.update(
-                        "completed",
-                        "快速战斗计划已完成",
+                        "stopped" if manually_stopped else "completed",
+                        "已按用户要求安全停止"
+                        if manually_stopped
+                        else "快速战斗计划已完成",
                         current_round=current_round,
                         completed_rounds=completed_rounds,
                         rewards_status="skipped",
@@ -2973,7 +3227,21 @@ def run():
                         manual_intervention_latched=False,
                     )
                     return 0
-                break
+                # A transient foreground/focus denial returns False without
+                # ending the battle. Preserve the round lock and let the next
+                # lifecycle pass classify battle/loading/results again.
+                logger.warning(
+                    "战斗控制本轮未启动，但未收到终止请求；保留当前局并重新识别"
+                )
+                reporter.update(
+                    "recovering",
+                    "战斗控制暂未接管，任务保持运行并重新识别当前阶段",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    error="battle_control_retrying",
+                    safety_state="armed",
+                )
+                continue
             reward_resume_gate = wait_for_web_resume(
                 limits,
                 reporter,
@@ -3018,6 +3286,7 @@ def run():
                     last_rewards={},
                 )
                 if post_battle_state == ScreenState.BATTLE:
+                    round_result_seen = False
                     logger.info("战斗仍在进行，下一循环继续当前战斗")
                 else:
                     logger.warning("异常/未知页面优先尝试返回港口")
@@ -3054,12 +3323,27 @@ def run():
                     last_rewards={},
                     last_outcome=rewards.outcome,
                 )
-            completed_rounds += 1
+            completed_rounds = count_settled_battle_for_plan(
+                completed_rounds,
+                settlement_confirmed=(result_confirmed and round_result_seen),
+            )
             round_in_progress = False
             round_entry_pending = False
+            round_result_seen = False
             setattr(bot, "_round_control_initialized", False)
             if should_stop():
-                plan_completed = not user_stop_requested()
+                if user_stop_requested():
+                    reporter.update(
+                        "stopped",
+                        "已按用户要求安全停止",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        paused_by_user=False,
+                        manual_intervention_active=False,
+                        manual_intervention_latched=False,
+                    )
+                    return 0
+                plan_completed = True
                 reporter.update(
                     "returning",
                     "运行计划已完成，正在返回港口",
@@ -3167,7 +3451,10 @@ def run():
                 logger.warning("回港兜底尚未确认，保留任务并在下一循环重识别")
             time.sleep(2)
         manually_stopped = user_stop_requested()
-        plan_completed = not manually_stopped
+        plan_completed = bool(
+            not manually_stopped
+            and limits.schedule_reached(completed_rounds, started_at)
+        )
         reporter.update(
             "stopped" if manually_stopped else "completed",
             "已按用户要求安全停止" if manually_stopped else "运行计划已完成",
@@ -3185,11 +3472,6 @@ def run():
             manual_intervention_latched=False,
         )
         return 0
-    except GameWindowUnavailableWhilePaused as error:
-        logger.error("暂停任务安全退出: %s", error)
-        # wait_for_web_resume has already written the precise failure state.
-        # Returning lets the control server reconcile and release the stale run.
-        return 2
     except KeyboardInterrupt:
         logger.info("用户中断")
         reporter.update(

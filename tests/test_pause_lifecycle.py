@@ -1,12 +1,9 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
 import core.window as game_window
 
 from main import (
-    GameWindowUnavailableWhilePaused,
     ensure_bound_game_foreground,
     refresh_game_window,
     restore_game_foreground_after_pause,
@@ -37,26 +34,38 @@ class PausedLimits:
         return False
 
 
-def test_missing_game_window_ends_paused_worker_without_input_or_focus():
+def test_missing_game_window_during_pause_remains_recoverable():
     reporter = RecordingReporter()
     controller = SimpleNamespace(commands=[])
-    bot = SimpleNamespace(hwnd=1234, gamepad=controller)
+    intervention = SimpleNamespace(
+        poll=lambda _controller, _now=None: False,
+        latched=False,
+        last_trigger="window_switch",
+        resumed_from_web=False,
+    )
+    bot = SimpleNamespace(
+        hwnd=1234,
+        gamepad=controller,
+        intervention=intervention,
+    )
 
     with (
         patch("main.is_game_window_alive", return_value=False),
-        patch("main.time.monotonic", side_effect=[100.0, 105.1]),
         patch("main.time.sleep", return_value=None),
-        patch("main.activate_window") as activate,
-        pytest.raises(GameWindowUnavailableWhilePaused),
+        patch("main.restore_game_foreground_after_pause", return_value=True) as restore,
     ):
-        wait_for_web_resume(PausedLimits(), reporter, bot)
+        resumed = wait_for_web_resume(
+            PausedLimits([True, True, False]),
+            reporter,
+            bot,
+        )
 
-    activate.assert_not_called()
+    assert resumed
+    assert resumed.resumed
+    restore.assert_called_once()
     assert controller.commands == []
-    state, _message, values = reporter.updates[-1]
-    assert state == "failed"
-    assert values["error"] == "game_window_unavailable_while_paused"
-    assert values["movement_mode"] == "idle"
+    assert not any(state == "failed" for state, _message, _values in reporter.updates)
+    assert any("任务已保留" in message for _state, message, _values in reporter.updates)
 
 
 def test_transient_window_check_failure_resets_after_handle_recovers():
@@ -96,8 +105,8 @@ def test_clear_pause_gate_does_not_request_scene_recovery():
 
 def test_new_activity_during_focus_restore_keeps_pause_gate_closed():
     reporter = RecordingReporter()
-    pause_values = [False, False, False]
-    polls = iter([True, False, False])
+    pause_values = [False, False, False, False]
+    polls = iter([True, False, True, False])
     intervention = SimpleNamespace(
         poll=lambda _controller, _now=None: next(polls),
         latched=False,

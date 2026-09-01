@@ -47,3 +47,29 @@ def test_runner_passes_selected_launcher_to_worker(tmp_path):
         )
 
     assert popen.call_args.kwargs["env"]["WOWS_LAUNCHER_CLIENT"] == "wgc"
+
+
+def test_pause_and_resume_never_create_a_stop_request(tmp_path):
+    manager = RunnerManager(Mock())
+    process = Mock(pid=1234)
+    process.poll.return_value = None
+    manager.process = process
+    pause = tmp_path / "pause.request"
+    resume = tmp_path / "resume.request"
+    stop = tmp_path / "stop.request"
+
+    with (
+        patch("control_server.PAUSE_PATH", pause),
+        patch("control_server.RESUME_PATH", resume),
+        patch("control_server.STOP_PATH", stop),
+    ):
+        assert manager.pause()
+        assert pause.exists()
+        assert not resume.exists()
+        assert not stop.exists()
+
+        assert manager.resume()
+        assert not pause.exists()
+        assert resume.exists()
+        assert not stop.exists()
+        assert manager.process is process

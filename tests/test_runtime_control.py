@@ -4,7 +4,11 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from main import count_quick_battle_for_plan
+from main import (
+    count_quick_battle_for_plan,
+    count_settled_battle_for_plan,
+    lifecycle_stop_requested,
+)
 from runtime_control import RunLimits, RuntimeReporter
 
 
@@ -51,6 +55,22 @@ class RunLimitsTests(unittest.TestCase):
             3,
         )
 
+    def test_normal_round_counts_only_after_settlement_confirmation(self):
+        self.assertEqual(
+            count_settled_battle_for_plan(
+                2,
+                settlement_confirmed=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            count_settled_battle_for_plan(
+                2,
+                settlement_confirmed=True,
+            ),
+            3,
+        )
+
     def test_quick_exit_signal_does_not_count_until_port_closure_is_confirmed(self):
         self.assertEqual(
             count_quick_battle_for_plan(
@@ -77,6 +97,42 @@ class RunLimitsTests(unittest.TestCase):
             pause.write_text("pause", encoding="utf-8")
             self.assertTrue(limits.pause_requested())
             self.assertFalse(limits.stop_requested())
+
+    def test_schedule_limit_waits_for_active_round_to_reach_settlement(self):
+        limits = RunLimits(duration_minutes=1)
+        started_at = time.monotonic() - 61
+
+        self.assertFalse(
+            lifecycle_stop_requested(
+                limits,
+                0,
+                started_at,
+                round_active=True,
+            )
+        )
+        self.assertTrue(
+            lifecycle_stop_requested(
+                limits,
+                0,
+                started_at,
+                round_active=False,
+            )
+        )
+
+    def test_explicit_stop_remains_hard_interrupt_during_active_round(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stop = Path(directory) / "stop.request"
+            stop.touch()
+            limits = RunLimits(stop_file=stop)
+
+            self.assertTrue(
+                lifecycle_stop_requested(
+                    limits,
+                    0,
+                    time.monotonic(),
+                    round_active=True,
+                )
+            )
 
     def test_close_game_option_is_read_from_environment(self):
         with patch.dict(
