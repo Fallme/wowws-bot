@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import json
 import logging
 import os
@@ -56,6 +58,49 @@ RESOURCES = (
     "free_xp",
     "elite_xp",
 )
+
+
+def ensure_elevated_control_server() -> bool:
+    """Restart the local panel elevated so it can control an elevated game.
+
+    World of Warships may run at high integrity (the live client on this host
+    does). Windows UIPI then silently rejects SendInput and returns access
+    denied for window messages from a normal control-panel process. Elevating
+    only ``main.py`` would require a new UAC prompt for every run and lose the
+    subprocess/log handle, so elevate the long-lived localhost panel once.
+    """
+    if os.name != "nt" or os.environ.get("WOWS_PANEL_SKIP_ELEVATION") == "1":
+        return True
+    shell32 = ctypes.windll.shell32
+    try:
+        if shell32.IsUserAnAdmin():
+            return True
+    except (AttributeError, OSError):
+        return True
+
+    execute = shell32.ShellExecuteW
+    execute.argtypes = (
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPCWSTR,
+        ctypes.c_int,
+    )
+    execute.restype = ctypes.wintypes.HINSTANCE
+    script = str(Path(__file__).resolve())
+    arguments = subprocess.list2cmdline([script])
+    result = execute(
+        None,
+        "runas",
+        sys.executable,
+        arguments,
+        str(BASE_DIR),
+        0,  # SW_HIDE; the browser is the user-facing console.
+    )
+    if int(result) <= 32:
+        raise OSError("控制台需要管理员权限才能向当前游戏发送输入；请允许 UAC 提示")
+    return False
 
 
 def validate_custom_ship(payload, *, allow_empty_name=False):
@@ -628,14 +673,17 @@ class RunnerManager:
     def _watch_stop_request(self, process):
         """Escalate a cooperative stop if the runner cannot exit promptly."""
         try:
-            process.wait(timeout=12)
+            # The runner polls stop.request at every lifecycle gate and should
+            # normally release controls in under a second. Do not leave an OCR
+            # or stale-window loop owning the task for another 12 seconds.
+            process.wait(timeout=3)
             return
         except subprocess.TimeoutExpired:
             pass
         if process.poll() is None:
             try:
                 process.send_signal(signal.CTRL_BREAK_EVENT)
-                process.wait(timeout=5)
+                process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 if process.poll() is None:
                     process.terminate()
@@ -708,13 +756,15 @@ class RunnerManager:
                 env.pop("WOWS_CUSTOM_SHIP_NAME", None)
                 env.pop("WOWS_CUSTOM_SECONDARY_RANGE", None)
             self.log_stream = LOG_PATH.open("w", encoding="utf-8")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.process = subprocess.Popen(
                 [sys.executable, str(BASE_DIR / "main.py")],
                 cwd=BASE_DIR,
                 env=env,
                 stdout=self.log_stream,
                 stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=creation_flags,
             )
             self.run_id = run_id
             self.store.create_run(
@@ -889,8 +939,12 @@ class RunnerManager:
         if not running and state.get("state") in {"completed", "stopped"}:
             state.update(
                 {
+                    "error": "",
                     "movement_mode": "idle",
                     "movement_reason": "控制已安全释放",
+                    "autopilot_enabled": False,
+                    "rudder_indicator": "neutral",
+                    "commanded_rudder": None,
                     "route_phase": "unplanned",
                     "route_progress": 0.0,
                     "route_waypoint": 0,
@@ -1136,6 +1190,8 @@ class ControlHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    if not ensure_elevated_control_server():
+        return
     host = os.environ.get("WOWS_PANEL_HOST", "127.0.0.1")
     port = int(os.environ.get("WOWS_PANEL_PORT", "8765"))
     server = ThreadingHTTPServer((host, port), ControlHandler)

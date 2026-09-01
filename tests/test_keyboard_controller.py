@@ -237,6 +237,17 @@ def test_escape_has_a_valid_windows_virtual_key_binding():
     assert controller.last_dispatch.action == "escape"
 
 
+def test_confirm_has_a_valid_windows_virtual_key_binding():
+    backend = RecordingBackend()
+    controller = KeyboardController(backend)
+
+    controller.confirm()
+
+    assert VK["enter"] == 0x0D
+    assert backend.events == [("tap", "enter")]
+    assert controller.last_dispatch.action == "confirm"
+
+
 def test_consumable_cycle_tries_every_common_ship_slot_once():
     backend = RecordingBackend()
     controller = KeyboardController(backend)

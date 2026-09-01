@@ -37,6 +37,7 @@ VK = {
     "u": 0x55,
     "y": 0x59,
     "esc": 0x1B,
+    "enter": 0x0D,
 }
 
 logger = logging.getLogger("input")
@@ -308,6 +309,12 @@ class KeyboardController:
         self._ensure_target_focus()
         self.device.tap("esc")
         self._record("escape", self._throttle_notch / self.MAX_NOTCH, 0.0)
+
+    def confirm(self):
+        """Activate the focused primary action on a positively verified page."""
+        self._ensure_target_focus()
+        self.device.tap("enter")
+        self._record("confirm", self._throttle_notch / self.MAX_NOTCH, 0.0)
 
     def damage_control(self):
         self._ensure_target_focus()

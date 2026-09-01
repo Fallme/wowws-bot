@@ -1996,6 +1996,11 @@ class Vision:
         return solid_button_ratio > 0.12 and anchor_count >= 3
 
     def in_loading(self, image):
+        # Positive port controls outrank broad loading artwork metrics. This
+        # also keeps the battle-HUD port veto below from exposing the older
+        # dark/textured loading fallback on a valid port frame.
+        if self.in_port(image):
+            return False
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if gray.mean() < 40 and gray.std() < 25:
             return True
@@ -2423,6 +2428,15 @@ class Vision:
         return solid_button_ratio > 0.30 and outer.mean() < 150
 
     def _has_battle_hud(self, image):
+        # A dense port can imitate every broad battle ROI: the lower-right
+        # ship carousel looks like a minimap, the left menu like the player
+        # block, and the orange Join Battle button like the score clock. The
+        # port detector requires a solid action button plus three independent
+        # port anchors, so let that stronger positive evidence veto the loose
+        # HUD geometry before it can block ship selection.
+        if self.in_port(image):
+            logger.debug("Battle HUD vetoed by positive port controls")
+            return False
         height, width = image.shape[:2]
         minimap = self._crop_region(image, MINIMAP_REGION)
         player_hud = image[int(height * 0.70) :, : int(width * 0.25)]

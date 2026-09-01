@@ -41,7 +41,13 @@ if not errorlevel 1 (
 
 echo [4/4] 正在启动本地控制台...
 start "WOWS Control Panel" /min cmd /c ""%~dp0start_control_panel.bat""
-timeout /t 3 /nobreak >nul
+echo 如果出现 Windows 用户账户控制提示，请选择“是”...
+powershell -NoProfile -Command "$deadline=(Get-Date).AddSeconds(30); do { if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { exit 0 }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); exit 1" >nul 2>nul
+if errorlevel 1 (
+    echo 控制台尚未启动，请确认已允许管理员权限后重新运行 one_click_run.bat。
+    pause
+    exit /b 1
+)
 start "" "http://127.0.0.1:8765/"
 echo 安装完成，控制台已在浏览器中打开。
 exit /b 0

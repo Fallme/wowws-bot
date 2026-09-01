@@ -53,6 +53,10 @@ LAST_SELECTED_SHIP_PATH = BASE_DIR / "data" / "last_selected_ship.txt"
 SUPPORTED_MODES = {"cooperative", "asymmetric"}
 SUPPORTED_SHIPS = frozenset(SHIP_NAME_TEMPLATES)
 CUSTOM_SHIP_KEY = "custom"
+BUILTIN_SHIP_OCR_NAMES = {
+    "pommern": ("波美拉尼亚", "Pommern"),
+    "napoli": ("那不勒斯", "Napoli"),
+}
 SHIP_TIER_PREFIXES = frozenset(
     {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"}
     | {str(tier) for tier in range(1, 11)}
@@ -1129,8 +1133,17 @@ def claim_daily_reward(
     *,
     backend=None,
     should_abort=None,
+    confirm_action=None,
+    close_action=None,
 ):
-    """Claim the first-login daily reward after OCR verification."""
+    """Claim and close the first-login daily reward after OCR verification.
+
+    Mouse input is preferred because OCR provides the exact button centre.
+    ``confirm_action`` is a narrow Enter-key fallback for game clients that
+    reject synthetic mouse messages.  ``close_action`` is invoked only after
+    the claim button disappeared (or a fresh verification capture was not
+    available), so a missed click cannot silently close an unclaimed reward.
+    """
     if _operation_paused(should_abort):
         return False
     image = image if image is not None else _capture(hwnd)
@@ -1138,7 +1151,71 @@ def claim_daily_reward(
     if point is None:
         return False
     logger.info("识别到每日奖励页面，点击领取: local=%s", point)
-    return _click_local(hwnd, point)
+    dispatched = _click_local(hwnd, point)
+    used_keyboard_fallback = False
+    if not dispatched and confirm_action is not None:
+        if _operation_paused(should_abort) or not ensure_game_window_foreground(hwnd):
+            return False
+        try:
+            logger.warning("每日奖励鼠标点击未派发，改用 Enter 确认领取")
+            confirm_action()
+            dispatched = True
+            used_keyboard_fallback = True
+        except Exception:
+            logger.warning("每日奖励 Enter 领取兜底失败", exc_info=True)
+    if not dispatched:
+        return False
+
+    time.sleep(0.85)
+    if _operation_paused(should_abort):
+        logger.info("每日奖励领取后进入暂停；恢复时再识别并关闭页面")
+        return True
+
+    # Re-capture before Esc. When the button is still present, the game did
+    # not accept the first mouse event even if Windows reported it dispatched.
+    # Retry once with Enter, then keep the page open if it still cannot be
+    # confirmed. This is safer than closing and forfeiting the reward.
+    claim_still_visible = None
+    try:
+        refreshed = _capture(hwnd)
+        claim_still_visible = daily_reward_claim_point(refreshed, backend) is not None
+    except Exception:
+        logger.info("领取后暂时无法复核每日奖励页面；按已派发处理")
+
+    if claim_still_visible and confirm_action is not None and not used_keyboard_fallback:
+        if _operation_paused(should_abort) or not ensure_game_window_foreground(hwnd):
+            return True
+        try:
+            logger.warning("领取按钮仍可见，使用 Enter 再确认一次")
+            confirm_action()
+            time.sleep(0.85)
+            refreshed = _capture(hwnd)
+            claim_still_visible = (
+                daily_reward_claim_point(refreshed, backend) is not None
+            )
+        except Exception:
+            logger.warning("每日奖励二次确认失败", exc_info=True)
+
+    if claim_still_visible:
+        logger.warning("领取按钮仍然可见，保留页面等待下一轮重试，不发送 Esc")
+        return False
+
+    if close_action is not None:
+        if _operation_paused(should_abort):
+            return True
+        if not ensure_game_window_foreground(hwnd):
+            logger.warning("领取已派发，但游戏未在前台；暂不发送 Esc")
+            return True
+        try:
+            close_action()
+            logger.info("每日奖励已领取，已按 Esc 关闭奖励页面")
+            time.sleep(0.45)
+        except Exception:
+            # The reward action itself succeeded. The caller's scene recovery
+            # will see the remaining overlay and retry Esc without re-selecting
+            # a ship or starting a new round.
+            logger.warning("每日奖励已领取，但 Esc 关闭页面失败", exc_info=True)
+    return True
 
 
 def _ocr_name_matches(
@@ -1356,7 +1433,13 @@ def ensure_selected_ship_commander(
                 backend,
             )
         else:
-            requested_selected = is_requested_ship_selected(image, ship_key)
+            requested_selected = is_requested_ship_selected(
+                image,
+                ship_key,
+                minimum_score=0.64,
+                minimum_margin=0.08,
+                backend=backend,
+            )
         if not requested_selected:
             logger.warning(
                 "拒绝召回指挥官：右上角当前舰船不是指定舰船 (%s)",
@@ -1518,31 +1601,106 @@ def selected_ship_scores(image):
     return scores
 
 
+def detect_selected_ship(
+    image,
+    backend=None,
+    *,
+    minimum_template_score=0.64,
+    minimum_template_margin=0.08,
+    minimum_ocr_confidence=0.68,
+):
+    """Read the currently selected built-in ship from the upper-right card.
+
+    The bottom carousel may contain several requested-ship name matches and is
+    deliberately excluded. OCR is confined to the upper-right detail card;
+    the existing gold-title templates provide a resolution/UI-scale fallback.
+    Returns ``(ship_key, confidence, source)`` or ``(None, confidence, source)``.
+    """
+    if image is None or not hasattr(image, "size") or image.size == 0:
+        return None, 0.0, "invalid"
+
+    if backend is not None:
+        height, width = image.shape[:2]
+        # The card can grow leftward at larger UI scales, while the ship title
+        # itself remains in the upper-right quadrant.
+        detail = image[
+            int(height * 0.035) : int(height * 0.25),
+            int(width * 0.68) : width,
+        ]
+        try:
+            candidates = _ocr_line_candidates(
+                backend.recognize(detail),
+                minimum_confidence=minimum_ocr_confidence,
+            )
+        except Exception:
+            logger.warning("右上角当前舰船 OCR 失败，改用舰名模板", exc_info=True)
+            candidates = []
+        ocr_matches = []
+        for candidate in candidates:
+            text = candidate["text"]
+            confidence = float(candidate["confidence"])
+            for ship_key, aliases in BUILTIN_SHIP_OCR_NAMES.items():
+                for alias in aliases:
+                    wanted = _normalize_ship_name(alias)
+                    if text == wanted or any(
+                        text == prefix + wanted for prefix in SHIP_TIER_PREFIXES
+                    ):
+                        ocr_matches.append((confidence, ship_key, text))
+        if ocr_matches:
+            confidence, ship_key, raw_text = max(ocr_matches)
+            logger.info(
+                "右上角舰船卡片识别: ship=%s source=ocr confidence=%.3f text=%s",
+                ship_key,
+                confidence,
+                raw_text,
+            )
+            return ship_key, confidence, "ocr"
+
+    scores = selected_ship_scores(image)
+    if not scores:
+        return None, 0.0, "template"
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    ship_key, score = ordered[0]
+    competitor = ordered[1][1] if len(ordered) > 1 else 0.0
+    logger.info(
+        "右上角舰船卡片模板复核: best=%s %.3f competitor=%.3f",
+        ship_key,
+        score,
+        competitor,
+    )
+    if (
+        score >= minimum_template_score
+        and score - competitor >= minimum_template_margin
+    ):
+        return ship_key, score, "template"
+    return None, score, "template_ambiguous"
+
+
 def is_requested_ship_selected(
     image,
     ship_key,
     minimum_score=0.72,
     minimum_margin=0.15,
+    backend=None,
 ):
     """Verify the selected ship from its detail-panel title, not card styling."""
     ship_key = (ship_key or "").strip().lower()
     if ship_key not in SUPPORTED_SHIPS:
         raise ValueError(f"Unsupported ship: {ship_key}")
-    scores = selected_ship_scores(image)
-    target_score = scores[ship_key]
-    competitor_score = max(
-        score for key, score in scores.items() if key != ship_key
+    selected_key, confidence, source = detect_selected_ship(
+        image,
+        backend,
+        minimum_template_score=minimum_score,
+        minimum_template_margin=minimum_margin,
     )
     logger.info(
-        "舰船详情标题复核 %s: target=%.3f competitor=%.3f",
+        "舰船详情标题复核 %s: selected=%s confidence=%.3f source=%s",
         ship_key,
-        target_score,
-        competitor_score,
+        selected_key or "unknown",
+        confidence,
+        source,
     )
-    return (
-        target_score >= minimum_score
-        and target_score - competitor_score >= minimum_margin
-    )
+    return selected_key == ship_key
 
 
 def _confirm_custom_ship_after_click(
@@ -1708,6 +1866,44 @@ def select_requested_ship(
     if vision.classify_screen(image) != ScreenState.PORT:
         logger.warning("当前不是港口，拒绝选择舰船")
         return False
+    selection_backend = ocr_backend or RapidOcrBackend()
+    full_name = ""
+    current_selected_key = None
+    if is_custom:
+        full_name = (
+            custom_name or os.environ.get("WOWS_CUSTOM_SHIP_NAME", "")
+        ).strip()
+        if not full_name:
+            raise ShipSelectionError("自定义舰船名称为空，请返回网页重新选择")
+        if is_custom_ship_selected(image, full_name, selection_backend):
+            logger.info("右上角舰船卡片已是目标自定义舰船: %s", full_name)
+            _remember_selected_ship(f"custom:{full_name}")
+            return True
+        logger.info("右上角舰船卡片不是目标自定义舰船，开始查找: %s", full_name)
+    else:
+        current_selected_key, confidence, source = detect_selected_ship(
+            image,
+            selection_backend,
+        )
+        if current_selected_key == ship_key:
+            logger.info(
+                "右上角舰船卡片已是目标舰船: %s confidence=%.3f source=%s；"
+                "跳过舰船栏轮询",
+                ship_key,
+                confidence,
+                source,
+            )
+            _remember_selected_ship(ship_key)
+            return True
+        if current_selected_key:
+            logger.info(
+                "右上角当前舰船为 %s，不符合目标 %s；开始查找舰船栏",
+                current_selected_key,
+                ship_key,
+            )
+        else:
+            logger.info("右上角当前舰船暂未确认；开始查找目标舰船 %s", ship_key)
+
     if require_port_action:
         # Scene colour/texture is not enough to authorize carousel input. A
         # live battle at some UI scales can satisfy the broad port anchors.
@@ -1726,26 +1922,19 @@ def select_requested_ship(
             return False
         if port_battle_action_point(
             image,
-            ocr_backend or RapidOcrBackend(),
+            selection_backend,
         ) is None:
             logger.warning("选船互锁：未识别到港口“加入战斗”文字，禁止滚动或点击舰船")
             return False
     if is_custom:
-        full_name = (custom_name or os.environ.get("WOWS_CUSTOM_SHIP_NAME", "")).strip()
-        if not full_name:
-            raise ShipSelectionError("自定义舰船名称为空，请返回网页重新选择")
         return _select_custom_ship(
             hwnd,
             image,
             full_name,
-            ocr_backend or RapidOcrBackend(),
+            selection_backend,
             max_scrolls=max(0, int(custom_max_scrolls)),
             should_abort=should_abort,
         )
-    if is_requested_ship_selected(image, ship_key):
-        logger.info("目标舰船已选中: %s", ship_key)
-        _remember_selected_ship(ship_key)
-        return True
     match = find_ship_card(image, ship_key)
     if match is None and hwnd:
         rect = get_client_rect(hwnd)
@@ -1754,7 +1943,11 @@ def select_requested_ship(
         if _operation_paused(should_abort):
             return False
         image = _capture(hwnd)
-        if is_requested_ship_selected(image, ship_key):
+        selected_key, _confidence, _source = detect_selected_ship(
+            image,
+            selection_backend,
+        )
+        if selected_key == ship_key:
             _remember_selected_ship(ship_key)
             return True
         match = find_ship_card(image, ship_key)
@@ -1776,14 +1969,18 @@ def select_requested_ship(
             if _operation_paused(should_abort):
                 return False
             image = _capture(hwnd)
-            if is_requested_ship_selected(image, ship_key):
+            selected_key, _confidence, _source = detect_selected_ship(
+                image,
+                selection_backend,
+            )
+            if selected_key == ship_key:
                 _remember_selected_ship(ship_key)
                 return True
             match = find_ship_card(image, ship_key)
             if match is not None:
                 break
     if match is None:
-        if _last_confirmed_ship() == ship_key:
+        if current_selected_key is None and _last_confirmed_ship() == ship_key:
             logger.warning(
                 "滚动搜索后舰名区域仍暂不可读，沿用上次确认舰船: %s",
                 ship_key,
@@ -1799,9 +1996,19 @@ def select_requested_ship(
     time.sleep(1.8)
     if _operation_paused(should_abort):
         return False
-    if not is_requested_ship_selected(_capture(hwnd), ship_key):
+    selected_key, confidence, source = detect_selected_ship(
+        _capture(hwnd),
+        selection_backend,
+    )
+    if selected_key != ship_key:
         logger.warning("舰船选择复核失败: %s", ship_key)
         return False
+    logger.info(
+        "舰船选择复核成功: %s confidence=%.3f source=%s",
+        ship_key,
+        confidence,
+        source,
+    )
     _remember_selected_ship(ship_key)
     return True
 

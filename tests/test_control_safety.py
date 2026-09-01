@@ -1,6 +1,34 @@
 from unittest.mock import Mock, patch
 
-from control_server import RunnerManager
+from control_server import RunnerManager, ensure_elevated_control_server
+
+
+def test_control_server_keeps_running_when_already_elevated():
+    shell = Mock()
+    shell.IsUserAnAdmin.return_value = 1
+    with (
+        patch("control_server.os.name", "nt"),
+        patch("control_server.ctypes.windll.shell32", shell),
+        patch.dict("control_server.os.environ", {"WOWS_PANEL_SKIP_ELEVATION": "0"}),
+    ):
+        assert ensure_elevated_control_server()
+
+
+def test_control_server_restarts_itself_elevated_once():
+    shell = Mock()
+    shell.IsUserAnAdmin.return_value = 0
+    shell.ShellExecuteW.return_value = 33
+    with (
+        patch("control_server.os.name", "nt"),
+        patch("control_server.ctypes.windll.shell32", shell),
+        patch("control_server.sys.executable", r"E:\aimemo\wowws-bot\.venv\Scripts\python.exe"),
+        patch.dict("control_server.os.environ", {"WOWS_PANEL_SKIP_ELEVATION": "0"}),
+    ):
+        assert not ensure_elevated_control_server()
+
+    shell.ShellExecuteW.assert_called_once()
+
+
 def test_runner_starts_without_manual_calibration(tmp_path):
     manager = RunnerManager(Mock())
     process = Mock(pid=1234)

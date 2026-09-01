@@ -44,6 +44,7 @@ class PortSelectionTests(unittest.TestCase):
         from port_navigator import (
             _find_mode_card_from_ocr,
             ShipSelectionError,
+            detect_selected_ship,
             detect_port_mode,
             ensure_requested_mode,
             find_custom_ship_card,
@@ -59,6 +60,7 @@ class PortSelectionTests(unittest.TestCase):
         cls.OcrToken = OcrToken
         cls.find_mode_card_from_ocr = staticmethod(_find_mode_card_from_ocr)
         cls.ShipSelectionError = ShipSelectionError
+        cls.detect_selected_ship = staticmethod(detect_selected_ship)
         cls.detect_port_mode = staticmethod(detect_port_mode)
         cls.ensure_requested_mode = staticmethod(ensure_requested_mode)
         cls.find_custom_ship_card = staticmethod(find_custom_ship_card)
@@ -209,6 +211,37 @@ class PortSelectionTests(unittest.TestCase):
         self.assertLess(scores["pommern"], 0.55)
         self.assertTrue(self.is_requested_ship_selected(image, "napoli"))
         self.assertFalse(self.is_requested_ship_selected(image, "pommern"))
+
+    def test_selected_target_is_read_before_battle_hud_interlock(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
+
+        class ConflictingVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+            @staticmethod
+            def _has_battle_hud(_image):
+                raise AssertionError("read-only selected-ship check must run first")
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator._scroll_ship_carousel_down") as scroll,
+            patch("port_navigator._click_local") as click,
+        ):
+            selected = self.select_requested_ship(
+                1,
+                "napoli",
+                ConflictingVision(),
+                ocr_backend=self.backend(),
+                require_port_action=True,
+            )
+
+        self.assertTrue(selected)
+        scroll.assert_not_called()
+        click.assert_not_called()
 
     def test_finds_exact_custom_ship_name_from_split_ocr_tokens(self):
         image = np.zeros((1440, 2560, 3), dtype=np.uint8)

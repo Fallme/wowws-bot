@@ -148,13 +148,21 @@ def _interaction_paused() -> bool:
 def _enable_dpi_awareness():
     """Keep captures and clicks in the same physical-pixel coordinate space."""
     try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
+        # The API returns FALSE instead of raising when the request is denied.
+        # Treat only a successful call as configured so the older fallbacks
+        # still get a chance on hosts that impose their own DPI context.
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            ctypes.c_void_p(-4)
+        ):
+            return
     except (AttributeError, OSError):
         pass
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        return
+        # S_OK (0) means success. E_ACCESSDENIED means a context was already
+        # chosen, in which case the physical cursor APIs below remain the
+        # authoritative coordinate conversion path.
+        if int(ctypes.windll.shcore.SetProcessDpiAwareness(2)) == 0:
+            return
     except (AttributeError, OSError):
         pass
     try:
@@ -166,6 +174,30 @@ def _enable_dpi_awareness():
 _enable_dpi_awareness()
 
 
+def _get_physical_cursor_pos(user32, point) -> bool:
+    """Read the cursor in unvirtualized desktop pixels when Windows supports it."""
+    getter = getattr(user32, "GetPhysicalCursorPos", None)
+    if getter is not None:
+        try:
+            if getter(ctypes.byref(point)):
+                return True
+        except (AttributeError, OSError):
+            pass
+    return bool(user32.GetCursorPos(ctypes.byref(point)))
+
+
+def _set_physical_cursor_pos(user32, x: int, y: int) -> bool:
+    """Position the cursor using physical pixels, bypassing DPI virtualization."""
+    setter = getattr(user32, "SetPhysicalCursorPos", None)
+    if setter is not None:
+        try:
+            if setter(int(x), int(y)):
+                return True
+        except (AttributeError, OSError):
+            pass
+    return bool(user32.SetCursorPos(int(x), int(y)))
+
+
 def _foreground_matches(hwnd) -> bool:
     """Treat a foreground child/owned game surface as the game window itself."""
     try:
@@ -174,9 +206,21 @@ def _foreground_matches(hwnd) -> bool:
             return True
         if not foreground:
             return False
-        return int(win32gui.GetAncestor(foreground, win32con.GA_ROOT)) == int(
+        if int(win32gui.GetAncestor(foreground, win32con.GA_ROOT)) == int(
             win32gui.GetAncestor(int(hwnd), win32con.GA_ROOT)
+        ):
+            return True
+        # DirectX can replace the visible render surface without immediately
+        # invalidating the previously bound top-level HWND. Treat any visible
+        # surface owned by the exact same game process as foreground; matching
+        # only roots made an already-active game look permanently background.
+        _target_thread, target_pid = win32process.GetWindowThreadProcessId(
+            int(hwnd)
         )
+        _foreground_thread, foreground_pid = (
+            win32process.GetWindowThreadProcessId(foreground)
+        )
+        return bool(target_pid and int(target_pid) == int(foreground_pid))
     except Exception:
         return False
 
@@ -260,6 +304,29 @@ def activate_window(hwnd):
                     win32gui.SetForegroundWindow(int(hwnd))
                 except Exception:
                     logger.debug("DirectX foreground fallback failed", exc_info=True)
+            if not _foreground_matches(hwnd) and not _interaction_paused():
+                try:
+                    # SetForegroundWindow can remain locked even after the
+                    # input queues were joined. A short topmost transition is
+                    # a z-order operation only and gives a maximized DirectX
+                    # window one final activation path without synthetic Alt
+                    # keys (which would be misreported as user intervention).
+                    flags = (
+                        win32con.SWP_NOMOVE
+                        | win32con.SWP_NOSIZE
+                        | win32con.SWP_SHOWWINDOW
+                    )
+                    user32.ShowWindowAsync(int(hwnd), win32con.SW_MAXIMIZE)
+                    win32gui.SetWindowPos(
+                        int(hwnd), win32con.HWND_TOPMOST, 0, 0, 0, 0, flags
+                    )
+                    win32gui.SetWindowPos(
+                        int(hwnd), win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags
+                    )
+                    win32gui.BringWindowToTop(int(hwnd))
+                    win32gui.SetForegroundWindow(int(hwnd))
+                except Exception:
+                    logger.debug("DirectX topmost activation fallback failed", exc_info=True)
         finally:
             if attached_game:
                 user32.AttachThreadInput(current_thread, int(game_thread), False)
@@ -402,50 +469,27 @@ def physical_click(
         return False
     if hwnd and not ensure_game_window_foreground(hwnd):
         return False
+    user32 = ctypes.windll.user32
     original = ctypes.wintypes.POINT()
-    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(original)):
+    if not _get_physical_cursor_pos(user32, original):
         return False
 
     try:
-        virtual_left = ctypes.windll.user32.GetSystemMetrics(76)
-        virtual_top = ctypes.windll.user32.GetSystemMetrics(77)
-        virtual_width = ctypes.windll.user32.GetSystemMetrics(78)
-        virtual_height = ctypes.windll.user32.GetSystemMetrics(79)
-        if virtual_width <= 1 or virtual_height <= 1:
+        # Captured frames and OCR boxes are physical client pixels. Legacy
+        # absolute mouse_event movement is DPI-virtualized when Codex/the web
+        # launcher runs at a different scale than the game, which caused the
+        # 2K claim target (998, 976) to land around (1275, 756). Windows'
+        # physical cursor API accepts the same unvirtualized pixels as the
+        # capture pipeline, so use it as the primary path.
+        if not _set_physical_cursor_pos(user32, screen_x, screen_y):
             return False
-
-        normalized_x = int(
-            (screen_x - virtual_left) * 65535 / (virtual_width - 1)
-        )
-        normalized_y = int(
-            (screen_y - virtual_top) * 65535 / (virtual_height - 1)
-        )
-        normalized_x = max(0, min(normalized_x, 65535))
-        normalized_y = max(0, min(normalized_y, 65535))
-        move_flags = (
-            win32con.MOUSEEVENTF_MOVE
-            | win32con.MOUSEEVENTF_ABSOLUTE
-            | 0x4000  # MOUSEEVENTF_VIRTUALDESK
-        )
-        ctypes.windll.user32.mouse_event(
-            move_flags, normalized_x, normalized_y, 0, 0
-        )
         time.sleep(0.15 + max(0.0, extra_delay))
         moved = ctypes.wintypes.POINT()
-        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(moved)):
+        if not _get_physical_cursor_pos(user32, moved):
             return False
         if abs(moved.x - screen_x) > 3 or abs(moved.y - screen_y) > 3:
-            # ``mouse_event(MOVE|ABSOLUTE)`` can still be DPI-virtualized when
-            # the worker is launched by a 150% scaled desktop host.  Captures
-            # and GetWindowRect then use physical pixels (for example
-            # 2560x1600) while the injected move lands at the corresponding
-            # logical coordinate (1707x1067).  Fall back to SetCursorPos and
-            # verify the physical destination before sending *one* click.  No
-            # button event has been emitted at this point, so this cannot
-            # duplicate a UI action.
             logger.info(
-                "绝对鼠标移动发生坐标缩放: target=(%s,%s) actual=(%s,%s)；"
-                "改用物理坐标定位",
+                "物理鼠标首次定位有偏差: target=(%s,%s) actual=(%s,%s)；重试",
                 screen_x,
                 screen_y,
                 moved.x,
@@ -453,12 +497,10 @@ def physical_click(
             )
             positioned = False
             for _ in range(2):
-                if not ctypes.windll.user32.SetCursorPos(
-                    int(screen_x), int(screen_y)
-                ):
+                if not _set_physical_cursor_pos(user32, screen_x, screen_y):
                     continue
                 time.sleep(0.04)
-                if not ctypes.windll.user32.GetCursorPos(ctypes.byref(moved)):
+                if not _get_physical_cursor_pos(user32, moved):
                     continue
                 if (
                     abs(moved.x - screen_x) <= 3
@@ -490,13 +532,13 @@ def physical_click(
         if _interaction_paused():
             logger.info("[USER] 鼠标移动后检测到暂停，取消本次点击")
             return False
-        ctypes.windll.user32.mouse_event(down_flag, 0, 0, 0, 0)
+        user32.mouse_event(down_flag, 0, 0, 0, 0)
         time.sleep(0.05)
-        ctypes.windll.user32.mouse_event(up_flag, 0, 0, 0, 0)
+        user32.mouse_event(up_flag, 0, 0, 0, 0)
         time.sleep(0.1)
         return True
     finally:
-        ctypes.windll.user32.SetCursorPos(original.x, original.y)
+        _set_physical_cursor_pos(user32, original.x, original.y)
 
 
 def window_message_click(
@@ -568,16 +610,30 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
         return False
     if hwnd and not ensure_game_window_foreground(hwnd):
         return False
+    user32 = ctypes.windll.user32
     original = ctypes.wintypes.POINT()
-    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(original)):
+    if not _get_physical_cursor_pos(user32, original):
         return False
     try:
-        ctypes.windll.user32.SetCursorPos(int(screen_x), int(screen_y))
+        if not _set_physical_cursor_pos(user32, screen_x, screen_y):
+            return False
         time.sleep(0.10)
+        moved = ctypes.wintypes.POINT()
+        if not _get_physical_cursor_pos(user32, moved):
+            return False
+        if abs(moved.x - screen_x) > 3 or abs(moved.y - screen_y) > 3:
+            logger.warning(
+                "无法将滚轮定位到物理坐标: target=(%s,%s) actual=(%s,%s)",
+                screen_x,
+                screen_y,
+                moved.x,
+                moved.y,
+            )
+            return False
         if _interaction_paused():
             logger.info("[USER] 滚轮派发前检测到暂停，取消本次滚动")
             return False
-        ctypes.windll.user32.mouse_event(
+        user32.mouse_event(
             win32con.MOUSEEVENTF_WHEEL,
             0,
             0,
@@ -587,7 +643,7 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
         time.sleep(0.35)
         return True
     finally:
-        ctypes.windll.user32.SetCursorPos(original.x, original.y)
+        _set_physical_cursor_pos(user32, original.x, original.y)
 
 
 def click_center(hwnd):

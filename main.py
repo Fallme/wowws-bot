@@ -620,8 +620,10 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
             image,
             backend=backend,
             should_abort=port_action_paused,
+            confirm_action=getattr(bot.gamepad, "confirm", None),
+            close_action=getattr(bot.gamepad, "escape", None),
         ):
-            logger.info("每日奖励领取操作已派发，重新识别页面后继续港口流程")
+            logger.info("每日奖励领取及关闭操作已派发，重新识别后继续港口流程")
             time.sleep(1.0)
         return False
 
@@ -1806,8 +1808,10 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
                 image,
                 backend=backend,
                 should_abort=lambda: operation_paused(bot),
+                confirm_action=getattr(bot.gamepad, "confirm", None),
+                close_action=getattr(bot.gamepad, "escape", None),
             ):
-                logger.info("每日登录奖励已领取，继续确认港口")
+                logger.info("每日登录奖励已领取并关闭，继续确认港口")
                 time.sleep(1.0)
                 continue
             logger.warning("每日奖励页面已识别，但领取按钮未能安全点击")
@@ -2248,6 +2252,8 @@ def run():
             initial_frame,
             backend=backend,
             should_abort=lambda: operation_paused(bot),
+            confirm_action=getattr(bot.gamepad, "confirm", None),
+            close_action=getattr(bot.gamepad, "escape", None),
         ):
             time.sleep(1.0)
         # Re-enter the scene loop even if the first click was not confirmed:
@@ -2313,6 +2319,8 @@ def run():
                     initial_frame,
                     backend=backend,
                     should_abort=lambda: operation_paused(bot),
+                    confirm_action=getattr(bot.gamepad, "confirm", None),
+                    close_action=getattr(bot.gamepad, "escape", None),
                 ):
                     time.sleep(1.0)
                 return_to_port(bot, attempts=4)
@@ -2550,6 +2558,8 @@ def run():
                     bot.hwnd,
                     backend=backend,
                     should_abort=lambda: operation_paused(bot),
+                    confirm_action=getattr(bot.gamepad, "confirm", None),
+                    close_action=getattr(bot.gamepad, "escape", None),
                 ):
                     time.sleep(1.0)
                 return_to_port(bot, attempts=4)

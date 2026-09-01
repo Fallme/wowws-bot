@@ -57,6 +57,7 @@ class ScreenStateRegressionTests(unittest.TestCase):
         for filename in ("port_ship_selected.png", "port_mode_selector.png"):
             image = cv2.imread(str(self.FIXTURE_ROOT / filename))
             self.assertTrue(self.vision._is_port_ship_bar(image), filename)
+            self.assertFalse(self.vision._has_battle_hud(image), filename)
 
     def test_positive_port_controls_take_precedence_over_battle_candidate(self):
         """A port must never become battle merely because its lower UI is textured."""
