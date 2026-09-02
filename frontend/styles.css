@@ -53,3 +53,68 @@ html,body{height:100%;overflow:hidden}.app-shell{width:min(1640px,calc(100% - 32
 
 /* Client choice stays compact; the full detected path is available as a tooltip. */
 .launcher-control{margin-top:0!important}.launcher-choice{min-width:0;padding:7px 9px!important}.launcher-choice strong,.launcher-choice small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.launcher-choice small.detected{color:var(--green)}.launcher-choice small.missing{color:#a67a72}.launcher-choice:disabled{cursor:not-allowed;opacity:.55}
+
+/* Responsive command deck: narrow windows use a compact mission rail while
+   wide windows reserve most horizontal space for live navigation data. */
+.preset-card{grid-area:preset}.live-card{grid-area:live}.totals-card{grid-area:totals}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+@media(min-width:1300px){
+  .command-grid{
+    grid-template-columns:clamp(285px,21vw,380px) minmax(570px,1fr) clamp(300px,22vw,400px);
+    grid-template-areas:"preset live totals";
+  }
+}
+
+@media(min-width:901px) and (max-width:1299px){
+  html,body{height:auto;min-height:100%;overflow-x:hidden;overflow-y:auto}
+  .app-shell{height:auto;min-height:100dvh;overflow:visible}
+  .command-grid{
+    overflow:visible;
+    grid-template-columns:clamp(245px,26vw,275px) minmax(0,1fr);
+    grid-template-areas:"preset live" "totals live";
+    grid-template-rows:auto auto;
+    align-items:start;
+    align-content:start;
+  }
+  .live-card{min-height:0!important;align-self:stretch}
+  .live-workspace{grid-template-columns:minmax(190px,.72fr) minmax(255px,1.28fr);gap:10px}
+  .map-column .route-visual{width:min(100%,270px)}
+  .operation-banner{grid-template-columns:68px minmax(105px,auto) minmax(0,1fr);gap:8px}
+  .operation-banner strong{font-size:15px}
+  .telemetry-grid>div{padding:7px 8px}
+  .telemetry-grid strong{font-size:9px}
+  .totals-card{display:flex;grid-column:auto;padding:13px}
+  .totals-card .section-title{margin-bottom:8px}
+  .totals-card .task-note{margin-bottom:8px;font-size:8px}
+  .totals-card .task-reward-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px}
+  .totals-card .reward-total{min-height:64px;padding:8px}
+  .totals-card .reward-total strong{margin:5px 0 2px;font-size:18px}
+  .totals-card .reward-total.task-time strong{font-size:16px}
+  .totals-card .task-history-heading{margin:10px 0 6px}
+  .totals-card .task-history{max-height:180px;overflow:auto;overscroll-behavior:contain}
+  .totals-card .history-row{min-height:38px;padding:6px 7px}
+}
+
+@media(max-width:900px){
+  html,body{height:auto;min-height:100%;overflow-x:hidden;overflow-y:auto}
+  .app-shell{height:auto;min-height:100dvh;overflow:visible}
+  .command-grid{
+    overflow:visible;
+    grid-template-columns:minmax(0,1fr);
+    grid-template-areas:"preset" "live" "totals";
+    align-items:start;
+    align-content:start;
+  }
+  .live-card{min-height:auto!important}
+  .live-workspace{grid-template-columns:minmax(210px,.8fr) minmax(280px,1.2fr);gap:10px}
+  .totals-card{grid-column:auto}
+  .task-history{max-height:260px;overflow:auto;overscroll-behavior:contain}
+}
+
+@media(max-width:650px){
+  .live-workspace{grid-template-columns:1fr}
+  .map-column .route-visual{width:min(100%,330px)}
+  .operation-banner{grid-template-columns:1fr;gap:5px}
+  .operation-banner p{padding-left:0;border-left:0;white-space:normal}
+}

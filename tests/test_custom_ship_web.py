@@ -59,6 +59,14 @@ class CustomShipWebTests(unittest.TestCase):
         self.assertIn(".operation-banner", stylesheet)
         self.assertIn("grid-template-rows:minmax(0,1fr) auto", stylesheet)
 
+    def test_narrow_console_pairs_task_totals_with_preset_rail(self):
+        stylesheet = (self.ROOT / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn('grid-template-areas:"preset live" "totals live"', stylesheet)
+        self.assertIn("grid-template-columns:clamp(245px,26vw,275px) minmax(0,1fr)", stylesheet)
+        self.assertIn(".totals-card .task-history{max-height:180px;overflow:auto", stylesheet)
+        self.assertIn('grid-template-areas:"preset live totals"', stylesheet)
+
 
 if __name__ == "__main__":
     unittest.main()
