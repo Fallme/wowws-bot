@@ -140,6 +140,58 @@ class Vision:
         )
 
     @staticmethod
+    def read_autopilot_enabled_text(image, backend) -> bool:
+        """Read the exact green lower-left ``自动驾驶`` status text.
+
+        The same words also exist as a neutral key hint before a route starts.
+        OCR first locates that text, then colour is measured only inside its
+        returned glyph box. This avoids the unrelated green consumables and
+        minimap content that made the old broad mask report false positives.
+        """
+        if image is None or image.size == 0 or backend is None:
+            return False
+        height, width = image.shape[:2]
+        top = int(height * 0.68)
+        crop = image[top : int(height * 0.97), 0 : int(width * 0.28)]
+        if crop.size == 0:
+            return False
+        try:
+            tokens = backend.recognize(crop)
+        except Exception:
+            logger.debug("自动驾驶状态文字 OCR 失败", exc_info=True)
+            return False
+        for token in tokens:
+            text = "".join(str(getattr(token, "text", "") or "").split())
+            if "自动驾驶" not in text or float(
+                getattr(token, "confidence", 0.0)
+            ) < 0.55:
+                continue
+            if "启用" in text or "开启" in text:
+                return True
+            points = np.asarray(getattr(token, "box", ()) or (), dtype=np.float32)
+            if points.shape != (4, 2):
+                continue
+            x1, y1 = np.floor(points.min(axis=0)).astype(int)
+            x2, y2 = np.ceil(points.max(axis=0)).astype(int)
+            padding = max(2, int(round(min(width / 2560, height / 1600) * 3)))
+            x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
+            x2 = min(crop.shape[1], x2 + padding + 1)
+            y2 = min(crop.shape[0], y2 + padding + 1)
+            glyphs = crop[y1:y2, x1:x2]
+            if glyphs.size == 0:
+                continue
+            hsv = cv2.cvtColor(glyphs, cv2.COLOR_BGR2HSV)
+            green = (
+                (hsv[:, :, 0] >= 35)
+                & (hsv[:, :, 0] <= 90)
+                & (hsv[:, :, 1] > 55)
+                & (hsv[:, :, 2] > 80)
+            )
+            if int(np.count_nonzero(green)) >= 12 and float(np.mean(green)) >= 0.03:
+                return True
+        return False
+
+    @staticmethod
     def detect_rudder_indicator(image) -> str:
         """Read the green Q/E steering cue shown near the lower HUD centre."""
         if image is None or image.size == 0:

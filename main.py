@@ -105,6 +105,18 @@ def count_settled_battle_for_plan(
     return max(0, int(completed_rounds))
 
 
+def finalize_round_diagnostics(bot, round_number: int, *, outcome="unknown"):
+    """Seal the matching frames/events/log and prune older round evidence."""
+    finalize = getattr(bot, "complete_round_diagnostics", None)
+    if finalize is None:
+        return None
+    try:
+        return finalize(int(round_number), outcome=str(outcome or "unknown"))
+    except Exception:
+        logger.exception("第 %s 局诊断证据封存失败；保留现有文件", round_number)
+        return None
+
+
 def lifecycle_stop_requested(
     limits,
     completed_rounds: int,
@@ -937,13 +949,10 @@ def run_battle(
         # stayed at STOP. Reassert FULL at the actual control hand-off for both
         # fresh and resumed battles. An already-visible native route is the
         # only exception because W would cancel that valid autopilot.
-        autopilot_visible = False
-        detector = getattr(bot.vision, "is_autopilot_enabled", None)
-        if detector is not None and not abandoned_native_route:
-            try:
-                autopilot_visible = bool(detector(control_frame))
-            except Exception:
-                autopilot_visible = False
+        autopilot_visible = bool(
+            getattr(bot, "opening_autopilot_active", False)
+            and not abandoned_native_route
+        )
         if not autopilot_visible:
             resynchronize = getattr(
                 bot.gamepad,
@@ -972,6 +981,10 @@ def run_battle(
     prestarted_motion = bool(
         getattr(bot, "_opening_motion_prestarted", False)
     )
+    preconfigured_target = getattr(bot, "opening_autopilot_target", "")
+    preconfigured_target_normalized = getattr(
+        bot, "opening_autopilot_target_normalized", None
+    )
     setattr(bot, "_opening_autopilot_preconfigured", False)
     setattr(bot, "_opening_autopilot_attempted", False)
     setattr(bot, "_opening_motion_prestarted", False)
@@ -991,6 +1004,16 @@ def run_battle(
             # Compatibility for small test doubles and third-party adapters.
             bot.reset()
         setattr(bot, "_round_control_initialized", True)
+        if preconfigured_autopilot:
+            enable = getattr(bot, "enable_opening_autopilot", None)
+            if enable is not None:
+                try:
+                    enable(
+                        preconfigured_target or "新一局预先设置的自动航线",
+                        target_normalized=preconfigured_target_normalized,
+                    )
+                except TypeError:
+                    enable(preconfigured_target or "新一局预先设置的自动航线")
     if abandoned_native_route:
         # ``reset(preserve_movement=True)`` rebuilds vision/route state during
         # same-battle recovery. Preserve the decision to ignore a stale green
@@ -999,27 +1022,16 @@ def run_battle(
         setattr(bot, "native_autopilot_abandoned", True)
     autopilot_set = False
     if resume_existing or preconfigured_autopilot:
-        # Re-read the live HUD before issuing any command. A stale workflow flag
-        # must never send W/Q/E and cancel an already active game-native route.
-        try:
-            resume_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
-            autopilot_set = bool(
-                not abandoned_native_route
-                and not getattr(bot, "native_autopilot_abandoned", False)
-                and bot.vision.classify_screen(resume_frame) == ScreenState.BATTLE
-                and bot.vision.is_autopilot_enabled(resume_frame)
-            )
-        except (AttributeError, CaptureFault):
-            autopilot_set = False
-        if autopilot_set:
-            enable = getattr(bot, "enable_opening_autopilot", None)
-            if enable is not None:
-                enable(
-                    "新一局预先设置的自动航线"
-                    if preconfigured_autopilot
-                    else "恢复的游戏自动航线"
-                )
-        elif not opening_autopilot_attempted and not abandoned_native_route:
+        autopilot_set = bool(
+            not abandoned_native_route
+            and not getattr(bot, "native_autopilot_abandoned", False)
+            and getattr(bot, "opening_autopilot_active", False)
+        )
+        if (
+            not autopilot_set
+            and not opening_autopilot_attempted
+            and not abandoned_native_route
+        ):
             # A recovered battle must use the same opening rule as a freshly
             # detected battle: establish native autopilot first, then let the
             # Q/E controller take over only after the game route ends.
@@ -1374,7 +1386,6 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                     )
         target_label = "敌方方向重试航点" if retrying else "地图中心敌方远端"
         rect = get_client_rect(bot.hwnd)
-        verify_autopilot = getattr(bot.vision, "is_autopilot_enabled", None)
         accepted = False
         local_x, local_y = tactical_map_local_point(width, height, normalized_target)
         selected_target = normalized_target
@@ -1461,7 +1472,7 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             )
             tactical_static_frames = []
             if static_sampler is not None:
-                for sample_index in range(3):
+                for sample_index in range(5):
                     tactical_frame = bot.vision.grab(
                         bot.hwnd,
                         allow_stale=True,
@@ -1475,11 +1486,11 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                         )
                         break
                     tactical_static_frames.append(tactical_frame)
-                    if sample_index < 2:
+                    if sample_index < 4:
                         time.sleep(0.12)
-                if len(tactical_static_frames) < 3:
+                if len(tactical_static_frames) < 5:
                     logger.warning(
-                        "M大地图静态层未完整确认；本局仅对缺失层使用小地图三帧兜底"
+                        "M大地图静态层未完整确认；本局仅对缺失层使用小地图多帧兜底"
                     )
             if intervention is not None and intervention.poll(bot.gamepad):
                 mark_pause = getattr(bot, "mark_manual_pause", None)
@@ -1510,11 +1521,11 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             map_open = False
             setattr(bot, "_tactical_map_left_open", False)
             time.sleep(0.55)
-            # Close M promptly, then process the three frames captured while
+            # Close M promptly, then process the five frames captured while
             # it was open. Full-resolution Hough/terrain work can take a few
             # seconds on CPU and must not leave the tactical overlay covering
             # the live battle for that whole period.
-            if len(tactical_static_frames) == 3:
+            if len(tactical_static_frames) == 5:
                 static_complete = False
                 for tactical_frame in tactical_static_frames:
                     static_complete = bool(
@@ -1522,11 +1533,8 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                     ) or static_complete
                 if not static_complete:
                     logger.warning(
-                        "M大地图静态层未完整确认；本局仅对缺失层使用小地图三帧兜底"
+                        "M大地图静态层未完整确认；本局仅对缺失层使用小地图多帧兜底"
                     )
-            if verify_autopilot is None:
-                accepted = True
-                break
             verification = bot.vision.grab(bot.hwnd, allow_stale=True)
             if tactical_map_is_open(bot, verification):
                 # The closing M can be dropped while the DirectX overlay is
@@ -1540,10 +1548,12 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             if classify_runtime_screen(bot, verification) != ScreenState.BATTLE:
                 logger.warning("自动航行复核时场景已离开战斗，立即撤销后续驾驶")
                 return False
-            if verify_autopilot(verification):
-                accepted = True
-                break
-            logger.warning("战术地图单次落点未出现自动驾驶标识")
+            # The green lower-left text is a persistent key hint, not a route
+            # acknowledgement. Accept a successful click followed by a fresh
+            # battle frame; BattleBot then verifies it through movement and
+            # speed feedback and safely falls back when either stalls.
+            accepted = True
+            break
         if not accepted:
             logger.warning("战术地图落点未生效，交由通用驾驶接管；本局不再打开M地图")
             return False
@@ -2466,6 +2476,11 @@ def run():
                     settlement_confirmed=round_result_seen,
                 )
                 closed_round = current_round
+                finalize_round_diagnostics(
+                    bot,
+                    closed_round,
+                    outcome="unknown",
+                )
                 round_result_seen = False
                 round_entry_pending = False
                 round_in_progress = True
@@ -2602,6 +2617,11 @@ def run():
                     completed_rounds = count_settled_battle_for_plan(
                         completed_rounds,
                         settlement_confirmed=round_result_seen,
+                    )
+                    finalize_round_diagnostics(
+                        bot,
+                        current_round,
+                        outcome="unknown",
                     )
                     round_in_progress = False
                     round_entry_pending = False
@@ -2924,6 +2944,9 @@ def run():
                     autopilot_enabled=False
                     if analysis is None
                     else analysis.autopilot_enabled,
+                    autopilot_confirmed=False
+                    if analysis is None
+                    else analysis.autopilot_confirmed,
                     rudder_indicator="neutral"
                     if analysis is None
                     else analysis.rudder_indicator,
@@ -3150,6 +3173,11 @@ def run():
                     battle_finished,
                     closure_confirmed=True,
                 )
+                finalize_round_diagnostics(
+                    bot,
+                    current_round,
+                    outcome="quick_battle",
+                )
                 round_in_progress = False
                 round_entry_pending = False
                 round_result_seen = False
@@ -3336,6 +3364,11 @@ def run():
             completed_rounds = count_settled_battle_for_plan(
                 completed_rounds,
                 settlement_confirmed=(result_confirmed and round_result_seen),
+            )
+            finalize_round_diagnostics(
+                bot,
+                current_round,
+                outcome=rewards.outcome,
             )
             round_in_progress = False
             round_entry_pending = False

@@ -1,5 +1,6 @@
 import math
 import time
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +58,12 @@ class ZeroHealthHazardVision(HazardVision):
     @staticmethod
     def read_health_fraction(_image, _backend):
         return 0.0
+
+
+class DamagedHazardVision(HazardVision):
+    @staticmethod
+    def read_health_fraction(_image, _backend):
+        return 0.8
 
 
 class RecordingGamepad:
@@ -337,6 +344,52 @@ def test_tactical_map_static_layers_lock_after_three_frames_and_stop_updating():
     assert vision.zone_calls == 3
 
 
+def test_island_layer_voting_survives_one_empty_detection_frame():
+    samples = deque(maxlen=5)
+    island = {
+        "points": [(0.10, 0.20), (0.25, 0.20), (0.25, 0.35), (0.10, 0.35)],
+        "area": 0.0225,
+    }
+
+    assert BattleBot._confirmed_island_layer(samples, [island]) is None
+    assert BattleBot._confirmed_island_layer(samples, []) is None
+    assert BattleBot._confirmed_island_layer(samples, [island]) is None
+    assert BattleBot._confirmed_island_layer(samples, [island]) == [island]
+
+
+def test_player_pose_uses_short_cache_when_one_minimap_frame_misses_arrow():
+    image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
+
+    class IntermittentPoseVision(FixtureVision):
+        def __init__(self, frame):
+            super().__init__(frame)
+            self.missing = False
+
+        def find_player_pose_on_minimap(self, _minimap):
+            if not self.missing:
+                return PlayerPose(position=(120, 160), heading=(1.0, 0.0))
+            return None
+
+    vision = IntermittentPoseVision(image)
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=vision,
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+
+    first = bot.analyze()
+    vision.missing = True
+    second = bot.analyze()
+
+    assert first.player_position == (120, 160)
+    assert not first.player_pose_cached
+    assert second.player_position == (120, 160)
+    assert second.minimap_heading == pytest.approx((1.0, 0.0))
+    assert second.player_pose_cached
+
+
 def test_locked_static_map_keeps_player_and_enemy_layers_live_each_frame():
     image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
 
@@ -473,7 +526,29 @@ def test_missing_health_digits_never_calls_bar_estimator():
     assert not analysis.health_recognized
 
 
-def test_fire_and_flooding_require_two_consecutive_frames():
+def test_fire_needs_two_frames_and_flooding_needs_four_of_five_plus_hp_loss():
+    image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=DamagedHazardVision(image),
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+
+    samples = []
+    for tick in range(5):
+        bot.tick = tick
+        samples.append(bot.analyze())
+
+    assert not samples[0].on_fire
+    assert not samples[0].flooding
+    assert samples[1].on_fire
+    assert not samples[3].flooding
+    assert samples[4].flooding
+
+
+def test_full_health_suppresses_false_flooding_even_across_five_frames():
     image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
     bot = BattleBot(
         1,
@@ -483,14 +558,12 @@ def test_fire_and_flooding_require_two_consecutive_frames():
         distance_reader=FixtureDistanceReader(),
     )
 
-    first = bot.analyze()
-    bot.tick = 1
-    second = bot.analyze()
+    for tick in range(5):
+        bot.tick = tick
+        analysis = bot.analyze()
 
-    assert not first.on_fire
-    assert not first.flooding
-    assert second.on_fire
-    assert second.flooding
+    assert analysis.health == 1.0
+    assert not analysis.flooding
 
 
 def test_death_suppresses_stale_fire_and_flooding_icons():
@@ -949,7 +1022,7 @@ def test_battle_feedback_accepts_slow_battleship_minimap_progress():
     assert bot.feedback.update(12, (102, 100), 1.0).verified
 
 
-def test_lost_native_autopilot_requests_retry_before_generic_qe_route():
+def test_missing_green_hud_guess_does_not_cancel_native_autopilot():
     class FallbackGamepad(RecordingGamepad):
         def __init__(self):
             super().__init__()
@@ -984,9 +1057,8 @@ def test_lost_native_autopilot_requests_retry_before_generic_qe_route():
         capture_point_distance_km=8.0,
     )
 
-    # A single missed HUD sample must not cancel native navigation or fall
-    # through into ordinary Q/E steering.  Only three consecutive misses are
-    # accepted as a real native-autopilot loss.
+    # The old green-pixel guess is not route authority. Position/speed
+    # feedback owns cancellation, so missing HUD samples keep Q/E interlocked.
     bot._execute_rules(analysis, now)
     bot._execute_rules(analysis, now + 0.1)
 
@@ -996,12 +1068,10 @@ def test_lost_native_autopilot_requests_retry_before_generic_qe_route():
 
     bot._execute_rules(analysis, now + 0.2)
 
-    # The route disappeared before a confirmed arrival. Q/E remains blocked
-    # while the lifecycle receives a request to retry the tactical-map route.
-    assert gamepad.takeovers == 1
+    assert gamepad.takeovers == 0
     assert gamepad.movements == []
-    assert not bot.opening_autopilot_active
-    assert bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active
+    assert not bot.autopilot_retry_pending
     assert not bot.generic_center_route_active
 
 
@@ -1024,14 +1094,13 @@ def test_native_autopilot_arrival_allows_qe_on_following_frame():
         map_center_distance_km=12.0,
     )
 
-    for offset in (0.0, 0.1, 0.2):
-        bot._execute_rules(analysis, now + offset)
+    bot._execute_rules(analysis, now)
 
     assert not bot.autopilot_retry_pending
     assert bot.generic_center_route_active
     assert gamepad.movements == []
 
-    bot._execute_rules(analysis, now + 0.3)
+    bot._execute_rules(analysis, now + 0.1)
     assert len(gamepad.movements) == 1
 
 

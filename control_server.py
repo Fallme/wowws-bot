@@ -24,6 +24,7 @@ import yaml
 
 from core.calibration import CalibrationStore
 from core.launcher import launcher_statuses, normalize_launch_client
+from core.window import find_game_window
 from web_workflow import WebCalibrationWorkflow, game_status
 
 logger = logging.getLogger("control")
@@ -60,24 +61,104 @@ RESOURCES = (
 )
 
 
-def ensure_elevated_control_server() -> bool:
-    """Restart the local panel elevated so it can control an elevated game.
+class ElevationRequiredError(RuntimeError):
+    """The verified game process has a higher Windows integrity level."""
 
-    World of Warships may run at high integrity (the live client on this host
-    does). Windows UIPI then silently rejects SendInput and returns access
-    denied for window messages from a normal control-panel process. Elevating
-    only ``main.py`` would require a new UAC prompt for every run and lose the
-    subprocess/log handle, so elevate the long-lived localhost panel once.
-    """
-    if os.name != "nt" or os.environ.get("WOWS_PANEL_SKIP_ELEVATION") == "1":
-        return True
-    shell32 = ctypes.windll.shell32
+
+class _TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = (("TokenIsElevated", ctypes.wintypes.DWORD),)
+
+
+def current_process_is_elevated() -> bool:
+    if os.name != "nt":
+        return False
     try:
-        if shell32.IsUserAnAdmin():
-            return True
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except (AttributeError, OSError):
-        return True
+        return False
 
+
+def process_is_elevated(process_id: int) -> bool | None:
+    """Return a process elevation flag, or ``None`` when it cannot be read."""
+    if os.name != "nt" or not process_id:
+        return False
+    process_handle = 0
+    token_handle = ctypes.wintypes.HANDLE()
+    try:
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.DWORD,
+        )
+        open_process.restype = ctypes.wintypes.HANDLE
+        process_handle = open_process(
+            0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            int(process_id),
+        )
+        if not process_handle:
+            return None
+        if not advapi32.OpenProcessToken(
+            process_handle,
+            0x0008,  # TOKEN_QUERY
+            ctypes.byref(token_handle),
+        ):
+            return None
+        elevation = _TOKEN_ELEVATION()
+        returned = ctypes.wintypes.DWORD()
+        if not advapi32.GetTokenInformation(
+            token_handle,
+            20,  # TokenElevation
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(returned),
+        ):
+            return None
+        return bool(elevation.TokenIsElevated)
+    except (AttributeError, OSError, ValueError):
+        return None
+    finally:
+        try:
+            if token_handle.value:
+                ctypes.windll.kernel32.CloseHandle(token_handle)
+            if process_handle:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+        except (AttributeError, OSError):
+            pass
+
+
+def running_game_requires_elevation(
+    *,
+    window_finder=find_game_window,
+    elevation_reader=process_is_elevated,
+) -> bool:
+    """Only flag a confirmed integrity mismatch with the verified game HWND."""
+    if os.name != "nt" or current_process_is_elevated():
+        return False
+    windows = window_finder()
+    if not windows:
+        return False
+    hwnd, _title, rect = max(
+        windows,
+        key=lambda item: max(0, item[2][2] - item[2][0])
+        * max(0, item[2][3] - item[2][1]),
+    )
+    process_id = ctypes.wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(
+        int(hwnd),
+        ctypes.byref(process_id),
+    )
+    return elevation_reader(int(process_id.value or 0)) is True
+
+
+def request_elevated_control_server() -> bool:
+    """Launch one elevated replacement after a confirmed input mismatch."""
+    if os.name != "nt" or current_process_is_elevated():
+        return False
+    shell32 = ctypes.windll.shell32
     execute = shell32.ShellExecuteW
     execute.argtypes = (
         ctypes.wintypes.HWND,
@@ -89,7 +170,9 @@ def ensure_elevated_control_server() -> bool:
     )
     execute.restype = ctypes.wintypes.HINSTANCE
     script = str(Path(__file__).resolve())
-    arguments = subprocess.list2cmdline([script])
+    arguments = subprocess.list2cmdline(
+        [script, "--no-browser", "--wait-for-port"]
+    )
     result = execute(
         None,
         "runas",
@@ -100,7 +183,16 @@ def ensure_elevated_control_server() -> bool:
     )
     if int(result) <= 32:
         raise OSError("控制台需要管理员权限才能向当前游戏发送输入；请允许 UAC 提示")
-    return False
+    return True
+
+
+def ensure_elevated_control_server() -> bool:
+    """Run normally by default; keep explicit forced elevation for recovery."""
+    if os.name != "nt" or os.environ.get("WOWS_PANEL_FORCE_ELEVATION") != "1":
+        return True
+    if current_process_is_elevated():
+        return True
+    return not request_elevated_control_server()
 
 
 def validate_custom_ship(payload, *, allow_empty_name=False):
@@ -722,6 +814,10 @@ class RunnerManager:
                 limit_value = 0
             elif not 1 <= limit_value <= (100 if limit_type == "rounds" else 1440):
                 raise ValueError("运行限制超出允许范围")
+            if running_game_requires_elevation():
+                raise ElevationRequiredError(
+                    "检测到游戏以管理员权限运行，普通权限控制会被 Windows 拦截"
+                )
 
             run_id = uuid.uuid4().hex[:12]
             DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -943,6 +1039,7 @@ class RunnerManager:
                     "movement_mode": "idle",
                     "movement_reason": "控制已安全释放",
                     "autopilot_enabled": False,
+                    "autopilot_confirmed": False,
                     "rudder_indicator": "neutral",
                     "commanded_rudder": None,
                     "route_phase": "unplanned",
@@ -1083,6 +1180,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     "calibration": CalibrationStore().status().to_dict(),
                     "game": game_status(),
                     "launchers": launcher_statuses(),
+                    "control_elevated": current_process_is_elevated(),
                 }
             )
             return
@@ -1112,6 +1210,21 @@ class ControlHandler(SimpleHTTPRequestHandler):
             payload = self._payload()
             if path == "/api/run/start":
                 self._json({"ok": True, **RUNNER.start(payload)}, HTTPStatus.CREATED)
+                return
+            if path == "/api/control/elevate":
+                if RUNNER.status().get("running"):
+                    raise RuntimeError("自动任务运行中，不能重启控制台权限")
+                launched = request_elevated_control_server()
+                self._json(
+                    {
+                        "ok": True,
+                        "restarting": launched,
+                        "control_elevated": current_process_is_elevated(),
+                    },
+                    HTTPStatus.ACCEPTED,
+                )
+                if launched:
+                    threading.Timer(0.45, self.server.shutdown).start()
                 return
             if path == "/api/custom-ship":
                 name, secondary_range = validate_custom_ship(
@@ -1185,6 +1298,11 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 self._json({"ok": True, **clear_generated_screenshots()})
                 return
             self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+        except ElevationRequiredError as error:
+            self._json(
+                {"error": str(error), "code": "elevation_required"},
+                HTTPStatus.CONFLICT,
+            )
         except (ValueError, RuntimeError, json.JSONDecodeError) as error:
             self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
@@ -1194,10 +1312,22 @@ def main():
         return
     host = os.environ.get("WOWS_PANEL_HOST", "127.0.0.1")
     port = int(os.environ.get("WOWS_PANEL_PORT", "8765"))
-    server = ThreadingHTTPServer((host, port), ControlHandler)
+    wait_for_port = "--wait-for-port" in sys.argv
+    deadline = time.monotonic() + (12.0 if wait_for_port else 0.0)
+    while True:
+        try:
+            server = ThreadingHTTPServer((host, port), ControlHandler)
+            break
+        except OSError:
+            if not wait_for_port or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
     url = f"http://{host}:{port}"
     print(f"战舰控制台已启动: {url}")
-    if os.environ.get("WOWS_PANEL_NO_BROWSER") != "1":
+    if (
+        os.environ.get("WOWS_PANEL_NO_BROWSER") != "1"
+        and "--no-browser" not in sys.argv
+    ):
         threading.Timer(0.7, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()

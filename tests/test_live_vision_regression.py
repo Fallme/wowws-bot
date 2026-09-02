@@ -523,6 +523,25 @@ def test_rudder_indicator_reads_q_and_e_without_viewport_navigation():
     assert Vision().detect_rudder_indicator(e_frame) == "E"
 
 
+def test_autopilot_status_uses_ocr_text_box_colour_not_broad_green_hud():
+    height, width = 1600, 2560
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    crop_top = int(height * 0.68)
+    box = ((100.0, 100.0), (240.0, 100.0), (240.0, 140.0), (100.0, 140.0))
+
+    class Backend:
+        @staticmethod
+        def recognize(_image):
+            return [OcrToken("自动驾驶", 0.99, box)]
+
+    # Unrelated green content outside the OCR glyph box is ignored.
+    image[1200:1300, 500:650] = (0, 255, 0)
+    assert not Vision.read_autopilot_enabled_text(image, Backend())
+
+    image[crop_top + 100 : crop_top + 141, 100:241] = (80, 180, 80)
+    assert Vision.read_autopilot_enabled_text(image, Backend())
+
+
 def test_no_commander_detector_requires_confirm_button():
     image = np.full((1000, 1600, 3), 75, dtype=np.uint8)
     image[360:660, 480:1120] = 40

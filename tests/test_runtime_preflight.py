@@ -1081,7 +1081,7 @@ def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
     assert 810 < clicks[0][0] <= 930
 
 
-def test_opening_autopilot_captures_and_freezes_three_tactical_map_frames():
+def test_opening_autopilot_captures_and_freezes_five_tactical_map_frames():
     minimap = np.zeros((200, 200, 3), dtype=np.uint8)
     static_samples = []
     lifecycle = []
@@ -1104,9 +1104,12 @@ def test_opening_autopilot_captures_and_freezes_three_tactical_map_frames():
             return PlayerPose(position=(50, 100), heading=(1.0, 0.0))
 
     class TacticalTextBackend:
-        @staticmethod
-        def recognize(_image):
-            return [OcrToken("自动驾驶控制", 0.99)]
+        calls = 0
+
+        @classmethod
+        def recognize(cls, _image):
+            cls.calls += 1
+            return [OcrToken("自动驾驶控制", 0.99)] if cls.calls == 1 else []
 
     bot = SimpleNamespace(
         hwnd=1,
@@ -1132,7 +1135,7 @@ def test_opening_autopilot_captures_and_freezes_three_tactical_map_frames():
         assert configure_opening_autopilot(bot)
 
     assert lifecycle == ["begin"]
-    assert len(static_samples) == 3
+    assert len(static_samples) == 5
     assert all(sample.shape == (1000, 1600, 3) for sample in static_samples)
 
 
@@ -1260,7 +1263,7 @@ def test_opening_autopilot_uses_only_one_enemy_biased_destination():
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
         ),
     ):
-        assert not configure_opening_autopilot(bot, retrying=True)
+        assert configure_opening_autopilot(bot, retrying=True)
 
     assert len(clicks) == 1
 
