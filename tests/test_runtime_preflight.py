@@ -1,7 +1,9 @@
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from core.calibration import AUTOMATIC_PREFLIGHT_KEY, CalibrationStore
 from core.frame_guard import CaptureFault
@@ -12,6 +14,7 @@ from main import (
     configure_opening_autopilot,
     dismiss_battle_overlay,
     normalize_tactical_map_overlay,
+    opening_autopilot_target,
     prepare_battle,
     refresh_game_window,
     run_battle,
@@ -903,6 +906,14 @@ def test_tactical_map_text_is_positive_evidence_for_open_overlay():
     assert tactical_map_is_open(bot, image)
 
 
+def test_opening_waypoint_is_near_center_on_enemy_side():
+    target = opening_autopilot_target((0.22, 0.89))
+
+    assert target[0] == pytest.approx(0.599, abs=0.01)
+    assert target[1] == pytest.approx(0.362, abs=0.01)
+    assert math.dist(target, (0.5, 0.5)) == pytest.approx(0.17)
+
+
 def test_interrupted_tactical_map_is_closed_once_before_battle_resume():
     toggles = []
 
@@ -1069,6 +1080,7 @@ def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
             "main.physical_click",
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
         ),
+        patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
     ):
         assert configure_opening_autopilot(bot)
         assert not configure_opening_autopilot(bot)
@@ -1078,7 +1090,7 @@ def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
     # Capture-circle OCR is telemetry only. The first target already crosses
     # the centre on the spawn-to-centre ray; later retries advance farther
     # into the enemy half.
-    assert 810 < clicks[0][0] <= 930
+    assert 920 < clicks[0][0] <= 970
 
 
 def test_opening_autopilot_captures_and_freezes_five_tactical_map_frames():
@@ -1131,6 +1143,7 @@ def test_opening_autopilot_captures_and_freezes_five_tactical_map_frames():
             return_value={"left": 0, "top": 0, "right": 1600, "bottom": 1000},
         ),
         patch("main.physical_click", return_value=True),
+        patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
     ):
         assert configure_opening_autopilot(bot)
 
@@ -1262,10 +1275,97 @@ def test_opening_autopilot_uses_only_one_enemy_biased_destination():
             "main.physical_click",
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
         ),
+        patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
     ):
         assert configure_opening_autopilot(bot, retrying=True)
 
     assert len(clicks) == 1
+
+
+def test_opening_autopilot_never_clicks_until_map_is_stably_confirmed():
+    minimap = np.zeros((200, 200, 3), dtype=np.uint8)
+
+    class VisionWithoutMapEvidence:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def find_minimap(_image):
+            return minimap
+
+        @staticmethod
+        def find_player_pose_on_minimap(_minimap):
+            return PlayerPose(position=(40, 180), heading=(0.0, -1.0))
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=VisionWithoutMapEvidence(),
+        gamepad=SimpleNamespace(toggle_tactical_map=lambda: None),
+        intervention=None,
+        enable_opening_autopilot=lambda *_args, **_kwargs: None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.get_client_rect", return_value={"left": 0, "top": 0}),
+        patch("main.tactical_map_is_open", return_value=False),
+        patch("main.physical_click") as click,
+        patch("main.window_message_click") as message_click,
+    ):
+        assert not configure_opening_autopilot(bot)
+
+    click.assert_not_called()
+    message_click.assert_not_called()
+    assert not getattr(bot, "_tactical_map_attempted_this_battle", False)
+    assert bot._tactical_map_left_open
+
+
+def test_opening_autopilot_requires_lower_left_game_confirmation():
+    minimap = np.zeros((200, 200, 3), dtype=np.uint8)
+    enabled = []
+
+    class UnconfirmedAutopilotVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def find_minimap(_image):
+            return minimap
+
+        @staticmethod
+        def find_player_pose_on_minimap(_minimap):
+            return PlayerPose(position=(40, 180), heading=(0.0, -1.0))
+
+        @staticmethod
+        def read_autopilot_enabled_text(_image, _backend):
+            return False
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=UnconfirmedAutopilotVision(),
+        distance_reader=SimpleNamespace(backend=object()),
+        gamepad=SimpleNamespace(toggle_tactical_map=lambda: None),
+        intervention=None,
+        enable_opening_autopilot=lambda *_args, **_kwargs: enabled.append(True),
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.get_client_rect", return_value={"left": 0, "top": 0}),
+        patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
+        patch("main.physical_click", return_value=True),
+    ):
+        assert not configure_opening_autopilot(bot)
+
+    assert enabled == []
 
 
 def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():

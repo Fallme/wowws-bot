@@ -43,6 +43,7 @@ class PortSelectionTests(unittest.TestCase):
         from core.ocr import OcrToken
         from port_navigator import (
             _find_mode_card_from_ocr,
+            battle_survey_dismiss_point,
             ShipSelectionError,
             detect_selected_ship,
             detect_port_mode,
@@ -59,6 +60,9 @@ class PortSelectionTests(unittest.TestCase):
 
         cls.OcrToken = OcrToken
         cls.find_mode_card_from_ocr = staticmethod(_find_mode_card_from_ocr)
+        cls.battle_survey_dismiss_point = staticmethod(
+            battle_survey_dismiss_point
+        )
         cls.ShipSelectionError = ShipSelectionError
         cls.detect_selected_ship = staticmethod(detect_selected_ship)
         cls.detect_port_mode = staticmethod(detect_port_mode)
@@ -137,6 +141,25 @@ class PortSelectionTests(unittest.TestCase):
 
         self.assertTrue(self.is_battle_survey_page(image, backend=survey))
         self.assertFalse(self.is_battle_survey_page(image, backend=unrelated))
+
+    def test_battle_survey_accepts_evaluation_wording_and_locates_skip(self):
+        image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("战斗评价", 0.98),
+            self.OcrToken("非常不满意 不满意 一般 满意 非常满意", 0.98),
+            self.OcrToken(
+                "跳过",
+                0.99,
+                ((900, 600), (980, 600), (980, 640), (900, 640)),
+            ),
+        )
+
+        self.assertTrue(self.is_battle_survey_page(image, backend=backend))
+        # Survey OCR crop begins at (224, 120).
+        self.assertEqual(
+            self.battle_survey_dismiss_point(image, backend=backend),
+            (1164, 740),
+        )
 
     def test_mode_card_click_point_comes_from_ocr_box(self):
         image = np.zeros((1000, 1600, 3), dtype=np.uint8)

@@ -97,12 +97,17 @@ def _battle_replay(image, vision, backend, movement):
     minimap = vision.find_minimap(image)
     health = vision.read_health_fraction(image, backend)
     speed = vision.read_speed_knots(image, backend)
+    autopilot_color_hint = bool(vision.is_autopilot_enabled(image))
+    autopilot_confirmed = bool(
+        vision.read_autopilot_enabled_text(image, backend)
+    )
     payload = {
         "health_fraction": _round(health, 4),
         "speed_knots": _round(speed, 1),
         "on_fire": bool(vision.is_on_fire(image)),
         "flooding": bool(vision.is_flooding(image)),
-        "autopilot": bool(vision.is_autopilot_enabled(image)),
+        "autopilot": autopilot_confirmed,
+        "autopilot_color_hint": autopilot_color_hint,
         "rudder_indicator": vision.detect_rudder_indicator(image),
         "minimap": {"available": minimap is not None},
     }

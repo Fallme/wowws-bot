@@ -79,6 +79,7 @@ PORT_MODE_TEXT_AREA = RelativeRegion(0.51, 0.0, 0.72, 0.11)
 RESULTS_RETURN_TEXT_AREA = RelativeRegion(0.25, 0.78, 0.70, 1.0)
 RESULTS_REQUEUE_TEXT_AREA = RelativeRegion(0.58, 0.78, 1.0, 1.0)
 QUICK_EXIT_CONFIRM_ACTION_AREA = RelativeRegion(0.34, 0.52, 0.59, 0.70)
+BATTLE_SURVEY_AREA = RelativeRegion(0.14, 0.12, 0.86, 0.88)
 
 # Resolution and in-game UI scale are independent. The first term follows the
 # framebuffer width; these factors cover the common compact/normal/large UI
@@ -470,6 +471,53 @@ def _selector_title_seen(image, backend) -> bool:
     return "选择一种战斗模式" in text
 
 
+def _battle_survey_ocr(image, backend):
+    if backend is None or image is None or getattr(image, "size", 0) == 0:
+        return (), (0, 0)
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = BATTLE_SURVEY_AREA.pixels(width, height)
+    dialog = image[y1:y2, x1:x2]
+    if dialog.size == 0:
+        return (), (x1, y1)
+    try:
+        return tuple(backend.recognize(dialog) or ()), (x1, y1)
+    except (TypeError, ValueError):
+        logger.debug("战斗评价页面 OCR 返回了非序列结果")
+    except Exception:
+        logger.debug("战斗评价页面 OCR 失败", exc_info=True)
+    return (), (x1, y1)
+
+
+def _battle_survey_evidence(tokens) -> tuple[bool, int, bool]:
+    text = "".join(
+        unicodedata.normalize("NFKC", str(token.text or ""))
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.55
+    ).replace(" ", "")
+    question_seen = any(
+        phrase in text
+        for phrase in (
+            "满意度如何",
+            "战斗评价",
+            "评价本场战斗",
+            "评价这场战斗",
+            "您对这场战斗",
+            "您觉得这场战斗",
+        )
+    ) or (
+        "刚刚进行" in text and "这场战斗" in text and "满意" in text
+    )
+    choice_hits = sum(
+        label in text
+        for label in ("非常不满意", "不满意", "一般", "满意", "非常满意")
+    )
+    action_seen = any(
+        label in text
+        for label in ("跳过", "关闭", "暂不评价", "以后再说", "取消")
+    )
+    return question_seen, choice_hits, action_seen
+
+
 def is_battle_survey_page(image, backend=None) -> bool:
     """Recognize the optional post-battle satisfaction survey by OCR.
 
@@ -478,41 +526,67 @@ def is_battle_survey_page(image, backend=None) -> bool:
     therefore requires the survey-specific question plus either its Close
     action or multiple satisfaction choices before Esc recovery is allowed.
     """
-    if image is None or image.size == 0 or backend is None:
-        return False
-    height, width = image.shape[:2]
-    dialog = image[
-        int(height * 0.24) : int(height * 0.62),
-        int(width * 0.24) : int(width * 0.76),
-    ]
-    try:
-        tokens = backend.recognize(dialog)
-    except Exception:
-        logger.debug("战斗评价页面 OCR 失败", exc_info=True)
-        return False
-    try:
-        tokens = list(tokens or [])
-    except TypeError:
-        logger.debug("战斗评价页面 OCR 返回了非序列结果")
-        return False
-    text = "".join(
-        unicodedata.normalize("NFKC", str(token.text or ""))
-        for token in tokens
-        if float(getattr(token, "confidence", 0.0)) >= 0.60
-    ).replace(" ", "")
-    question_seen = (
-        "满意度如何" in text
-        or (
-            "刚刚进行" in text
-            and "这场战斗" in text
-            and "满意" in text
+    tokens, _origin = _battle_survey_ocr(image, backend)
+    question_seen, choice_hits, action_seen = _battle_survey_evidence(tokens)
+    return bool(question_seen and (action_seen or choice_hits >= 2))
+
+
+def battle_survey_dismiss_point(image, backend=None):
+    """Return the OCR-derived Skip/Close action only on a verified survey."""
+    tokens, (origin_x, origin_y) = _battle_survey_ocr(image, backend)
+    question_seen, choice_hits, action_seen = _battle_survey_evidence(tokens)
+    if not question_seen or not (action_seen or choice_hits >= 2):
+        return None
+    labels = ("暂不评价", "以后再说", "跳过", "关闭", "取消")
+    candidates = []
+    for token in tokens:
+        if float(getattr(token, "confidence", 0.0)) < 0.55:
+            continue
+        text = unicodedata.normalize("NFKC", str(token.text or "")).replace(" ", "")
+        if not any(label in text for label in labels):
+            continue
+        geometry = _token_geometry(token)
+        if geometry is None:
+            continue
+        x1, y1, x2, y2 = geometry
+        candidates.append(
+            (
+                float(getattr(token, "confidence", 0.0)),
+                (int(round(origin_x + (x1 + x2) / 2)), int(round(origin_y + (y1 + y2) / 2))),
+            )
         )
-    )
-    choice_hits = sum(
-        label in text
-        for label in ("非常不满意", "不满意", "一般", "满意", "非常满意")
-    )
-    return bool(question_seen and ("关闭" in text or choice_hits >= 2))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def dismiss_battle_survey(
+    hwnd,
+    image,
+    *,
+    backend=None,
+    should_abort=None,
+    escape_action=None,
+) -> bool:
+    """Dismiss a positively identified survey without choosing a rating."""
+    if _operation_paused(should_abort) or not is_battle_survey_page(image, backend):
+        return False
+    point = battle_survey_dismiss_point(image, backend)
+    if point is not None:
+        if _operation_paused(should_abort):
+            return False
+        logger.info("识别到战斗评价页，点击跳过/关闭: local=%s", point)
+        return bool(_click_local(hwnd, point))
+    if escape_action is None or _operation_paused(should_abort):
+        return False
+    logger.info("识别到战斗评价页但未定位按钮，按 Esc 跳过")
+    try:
+        escape_action()
+    except RuntimeError as error:
+        logger.info("评价页 Esc 暂未派发: %s", error)
+        return False
+    return True
 
 
 def in_battle_type_selector(image, backend=None):

@@ -11,6 +11,7 @@ class ScreenState(str, Enum):
     BATTLE = "battle"
     ESCAPE_MENU = "escape_menu"
     EXIT_CONFIRMATION = "exit_confirmation"
+    SURVEY = "survey"
     RESULTS = "results"
     UNKNOWN = "unknown"
 

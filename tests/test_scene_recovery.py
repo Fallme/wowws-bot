@@ -157,3 +157,37 @@ def test_active_round_battle_hud_overrides_false_port_classification():
         )
 
     assert state == ScreenState.BATTLE
+
+
+def test_active_round_returns_survey_instead_of_collapsing_it_to_unknown():
+    frame = object()
+
+    class SurveyVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.PORT
+
+        @staticmethod
+        def _has_battle_hud(_image):
+            return False
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SurveyVision(),
+        distance_reader=SimpleNamespace(backend=object()),
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.is_battle_survey_page", return_value=True),
+    ):
+        state = recover_current_scene(
+            bot,
+            attempts=2,
+            round_in_progress=True,
+        )
+
+    assert state == ScreenState.SURVEY
