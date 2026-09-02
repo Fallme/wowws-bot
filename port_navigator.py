@@ -80,6 +80,7 @@ RESULTS_RETURN_TEXT_AREA = RelativeRegion(0.25, 0.78, 0.70, 1.0)
 RESULTS_REQUEUE_TEXT_AREA = RelativeRegion(0.58, 0.78, 1.0, 1.0)
 QUICK_EXIT_CONFIRM_ACTION_AREA = RelativeRegion(0.34, 0.52, 0.59, 0.70)
 BATTLE_SURVEY_AREA = RelativeRegion(0.14, 0.12, 0.86, 0.88)
+PORT_EXIT_CONFIRM_ACTION_AREA = RelativeRegion(0.40, 0.38, 0.60, 0.58)
 
 # Resolution and in-game UI scale are independent. The first term follows the
 # framebuffer width; these factors cover the common compact/normal/large UI
@@ -1074,6 +1075,86 @@ def quick_exit_menu_action_point(image, backend=None):
         ("离开战斗", "退出战斗"),
         rejected=("退出游戏", "关闭游戏", "回到战斗"),
     )
+
+
+def _port_exit_confirmation_tokens(image, backend):
+    """Return OCR tokens only for the exact port ``退出游戏?`` dialog."""
+    if image is None or not hasattr(image, "size") or image.size == 0:
+        return []
+    backend = backend or RapidOcrBackend()
+    try:
+        tokens = list(backend.recognize(image) or ())
+    except Exception:
+        logger.warning("港口退出确认框 OCR 失败；拒绝点击", exc_info=True)
+        return []
+    normalized = [
+        (_normalize_ship_name(token.text), token)
+        for token in tokens
+        if float(getattr(token, "confidence", 0.0)) >= 0.55
+    ]
+    combined = "".join(text for text, _token in normalized)
+    if not (
+        _normalize_ship_name("确认") in combined
+        and any(
+            label in combined
+            for label in (
+                _normalize_ship_name("退出游戏"),
+                _normalize_ship_name("关闭游戏"),
+            )
+        )
+    ):
+        return []
+    return [token for _text, token in normalized]
+
+
+def port_exit_confirmation_no_action_point(image, backend=None):
+    """Locate the exact ``否`` action on a verified port-exit dialog."""
+    tokens = _port_exit_confirmation_tokens(image, backend)
+    if not tokens:
+        return None
+    height, width = image.shape[:2]
+    left, top, right, bottom = PORT_EXIT_CONFIRM_ACTION_AREA.pixels(width, height)
+    candidates = []
+    for token in tokens:
+        if _normalize_ship_name(token.text) != _normalize_ship_name("否"):
+            continue
+        geometry = _token_geometry(token)
+        if geometry is None:
+            continue
+        x1, y1, x2, y2 = geometry
+        center = (int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)))
+        if not (left <= center[0] <= right and top <= center[1] <= bottom):
+            continue
+        candidates.append((float(getattr(token, "confidence", 0.0)), center))
+    return None if not candidates else max(candidates, key=lambda item: item[0])[1]
+
+
+def is_port_exit_confirmation_page(image, backend=None) -> bool:
+    return port_exit_confirmation_no_action_point(image, backend) is not None
+
+
+def dismiss_port_exit_confirmation(
+    hwnd,
+    image,
+    *,
+    backend=None,
+    should_abort=None,
+) -> bool:
+    """Cancel a verified request to quit the client without closing the game."""
+    if _operation_paused(should_abort):
+        return False
+    point = port_exit_confirmation_no_action_point(image, backend)
+    if point is None:
+        return False
+    logger.info("识别到港口“退出游戏”确认框，点击“否”: local=%s", point)
+    return bool(_click_local(hwnd, point))
+
+
+def is_early_exit_confirmation_page(image, backend=None) -> bool:
+    """Public OCR gate for the battle-only early-exit confirmation."""
+    if backend is None:
+        return False
+    return _is_early_exit_confirmation(image, backend)
 
 
 def _is_early_exit_confirmation(image, backend):
@@ -2337,6 +2418,18 @@ def handle_post_battle(
             image = _capture(hwnd)
         except CaptureFault as error:
             logger.info("结算导航画面暂不可用，保留当前页面: %s", error)
+            return False
+        if is_port_exit_confirmation_page(image, backend):
+            if dismiss_port_exit_confirmation(
+                hwnd,
+                image,
+                backend=backend,
+                should_abort=should_abort,
+            ):
+                logger.info("结算导航已取消港口退出游戏确认框")
+                time.sleep(0.8)
+                continue
+            logger.warning("结算导航未能取消港口退出确认框")
             return False
         state = vision.classify_screen(image)
         logger.info("结算导航识别: %s", state.value)

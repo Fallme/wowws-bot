@@ -11,6 +11,7 @@ from core.ocr import OcrToken
 from core.ui import ScreenState
 from main import (
     automatic_input_preflight,
+    classify_runtime_screen,
     configure_opening_autopilot,
     dismiss_battle_overlay,
     normalize_tactical_map_overlay,
@@ -57,6 +58,52 @@ class FakeController:
 
     def stop(self):
         self.stop_calls += 1
+
+
+def test_runtime_exit_colour_requires_exact_ocr_before_it_is_actionable():
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+    class EmptyBackend:
+        @staticmethod
+        def recognize(_image):
+            return []
+
+    bot = SimpleNamespace(
+        vision=SimpleNamespace(classify_screen=lambda _image: ScreenState.EXIT_CONFIRMATION),
+        distance_reader=SimpleNamespace(backend=EmptyBackend()),
+    )
+
+    assert classify_runtime_screen(bot, frame) == ScreenState.UNKNOWN
+
+
+def test_runtime_promotes_exact_port_exit_dialog_from_unknown():
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+    class PortExitBackend:
+        @staticmethod
+        def recognize(_image):
+            return [
+                OcrToken("确认", 0.99),
+                OcrToken("退出游戏？", 0.99),
+                OcrToken(
+                    "否",
+                    0.99,
+                    ((850, 470), (890, 470), (890, 500), (850, 500)),
+                ),
+            ]
+
+    bot = SimpleNamespace(
+        vision=SimpleNamespace(
+            classify_screen=lambda _image: ScreenState.UNKNOWN,
+            is_daily_reward_page=lambda _image, _backend: False,
+        ),
+        distance_reader=SimpleNamespace(backend=PortExitBackend()),
+    )
+
+    assert (
+        classify_runtime_screen(bot, frame)
+        == ScreenState.PORT_EXIT_CONFIRMATION
+    )
 
 
 def test_startup_recovers_stable_mode_selector_before_port_workflow():

@@ -34,6 +34,7 @@ from core.window import (
 )
 from port_navigator import (
     claim_daily_reward,
+    dismiss_port_exit_confirmation,
     enter_battle,
     ensure_selected_ship_commander,
     ensure_requested_mode,
@@ -41,7 +42,9 @@ from port_navigator import (
     dismiss_battle_survey,
     handle_post_battle,
     in_battle_type_selector,
+    is_early_exit_confirmation_page,
     is_battle_survey_page,
+    is_port_exit_confirmation_page,
     queue_next_battle,
     is_daily_reward_page,
     select_mode_from_screen,
@@ -329,9 +332,24 @@ def ensure_capture_foreground(bot) -> bool:
 def classify_runtime_screen(bot, image) -> ScreenState:
     """Classify normal game pages plus OCR-confirmed first-login rewards."""
     state = bot.vision.classify_screen(image)
+    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    # The visual exit-confirmation heuristic deliberately has broad colour
+    # tolerance for different maps and UI scales. It is never sufficient to
+    # authorize Esc on its own: a port animation can put a similarly solid
+    # teal rectangle in the same region. Require exact dialog text first.
+    if state == ScreenState.EXIT_CONFIRMATION:
+        if is_port_exit_confirmation_page(image, backend):
+            return ScreenState.PORT_EXIT_CONFIRMATION
+        if is_early_exit_confirmation_page(image, backend):
+            return state
+        return ScreenState.UNKNOWN
     if state != ScreenState.UNKNOWN:
         return state
-    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    try:
+        if is_port_exit_confirmation_page(image, backend):
+            return ScreenState.PORT_EXIT_CONFIRMATION
+    except Exception:
+        logger.debug("港口退出确认框 OCR 检查失败", exc_info=True)
     detector = getattr(bot.vision, "is_daily_reward_page", None)
     try:
         if detector is not None:
@@ -435,6 +453,26 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
                     logger.info("评价页按钮复核未定位，按 Esc 跳过")
                     escape()
             survey_consecutive = 0
+            previous_state = ScreenState.UNKNOWN
+            consecutive = 0
+            time.sleep(0.8)
+            continue
+
+        if last_state == ScreenState.PORT_EXIT_CONFIRMATION:
+            # Esc in port opens this dialog and does not reliably close it.
+            # Cancel only through the OCR-located ``否`` action.
+            if operation_paused(bot):
+                time.sleep(0.15)
+                continue
+            if dismiss_port_exit_confirmation(
+                bot.hwnd,
+                image,
+                backend=backend,
+                should_abort=lambda: operation_paused(bot),
+            ):
+                logger.info("启动恢复：已取消港口退出游戏确认框")
+            else:
+                logger.warning("港口退出确认框已识别，但“否”点击暂未派发")
             previous_state = ScreenState.UNKNOWN
             consecutive = 0
             time.sleep(0.8)
@@ -782,6 +820,7 @@ def wait_for_battle(
     battle_frames = 0
     loading_seen = bool(loading_already_seen or not require_new_round)
     clock_frames = 0
+    unknown_frames = 0
     last_clock = None
     clock_backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
     opening_attempted = False
@@ -819,6 +858,7 @@ def wait_for_battle(
             )
             last_state = state
         if state == ScreenState.LOADING:
+            unknown_frames = 0
             if require_new_round and not new_round_state_reset:
                 # Loading is the definitive boundary between matches. Only
                 # here may the next battle receive its one tactical-map setup.
@@ -829,6 +869,7 @@ def wait_for_battle(
             clock_frames = 0
             continue
         if state == ScreenState.BATTLE:
+            unknown_frames = 0
             if require_new_round and not loading_seen:
                 battle_frames = 0
                 clock_frames = 0
@@ -872,6 +913,25 @@ def wait_for_battle(
         else:
             battle_frames = 0
             clock_frames = 0
+        if state == ScreenState.UNKNOWN:
+            unknown_frames += 1
+            if unknown_frames >= 3:
+                logger.warning(
+                    "等待战斗时场景连续未知；交回生命周期识别，避免加载锁死"
+                )
+                return False
+        elif state not in {ScreenState.LOADING, ScreenState.BATTLE}:
+            unknown_frames = 0
+        if state in {
+            ScreenState.PORT,
+            ScreenState.DAILY_REWARD,
+            ScreenState.PORT_EXIT_CONFIRMATION,
+        }:
+            logger.info(
+                "等待战斗时回到可处理页面 %s；交回生命周期分流",
+                state.value,
+            )
+            return False
         # The loading boundary (or a caller that has just positively observed
         # the join/requeue transition) is the round identity. Battle-clock OCR
         # is useful telemetry but must not hold a visible HUD for three minutes
@@ -951,7 +1011,10 @@ def run_battle(
             control_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
         except TypeError:
             control_frame = bot.vision.grab(bot.hwnd)
-        if classify_runtime_screen(bot, control_frame) != ScreenState.BATTLE:
+        if (
+            classify_battle_continuity_screen(bot, control_frame)
+            != ScreenState.BATTLE
+        ):
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
             return "resume_state"
         # The first HUD frame can appear before the game accepts movement
@@ -1420,7 +1483,7 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
         return False
     try:
         image = bot.vision.grab(bot.hwnd, allow_stale=True)
-        if bot.vision.classify_screen(image) != ScreenState.BATTLE:
+        if classify_battle_continuity_screen(bot, image) != ScreenState.BATTLE:
             return False
         height, width = image.shape[:2]
         player_normalized = None
@@ -1442,7 +1505,10 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             if pose_attempt < 2:
                 time.sleep(0.15)
                 image = bot.vision.grab(bot.hwnd, allow_stale=True)
-                if classify_runtime_screen(bot, image) != ScreenState.BATTLE:
+                if (
+                    classify_battle_continuity_screen(bot, image)
+                    != ScreenState.BATTLE
+                ):
                     return False
                 height, width = image.shape[:2]
         if player_normalized is None:
@@ -1551,7 +1617,10 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                 logger.warning("第 %s/3 次 M 图关闭未生效；安全收尾后重试", attempt_number)
                 continue
             setattr(bot, "_tactical_map_left_open", False)
-            if classify_runtime_screen(bot, verification) != ScreenState.BATTLE:
+            if (
+                classify_battle_continuity_screen(bot, verification)
+                != ScreenState.BATTLE
+            ):
                 logger.warning("自动航行复核时已离开战斗，撤销剩余尝试")
                 return False
 
@@ -1869,6 +1938,18 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
                 continue
             logger.warning("每日奖励页面已识别，但领取按钮未能安全点击")
             return False
+        if state == ScreenState.PORT_EXIT_CONFIRMATION:
+            if dismiss_port_exit_confirmation(
+                bot.hwnd,
+                image,
+                backend=backend,
+                should_abort=lambda: operation_paused(bot),
+            ):
+                logger.info("已取消港口退出游戏确认框，继续确认港口")
+                time.sleep(0.8)
+                continue
+            logger.warning("港口退出确认框未能安全取消；保留页面重试")
+            return False
         if state == ScreenState.BATTLE:
             # A live match is not an unknown dialog.  Do not press Esc here:
             # the caller must hand control back to the battle loop.
@@ -1888,13 +1969,10 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
             dismiss_battle_overlay(bot, state)
             return False
         else:
-            # Unknown dialogs must never receive a blind click.  Esc is the
-            # game's universal back action and keeps recovery scoped to the
-            # already-verified game client.
-            escape = getattr(bot.gamepad, "escape", None)
-            if escape is not None:
-                logger.info("未知页面，按 Esc 尝试返回港口")
-                escape()
+            # Esc in a port-looking transition opens the client's quit-game
+            # confirmation. Unknown pages remain observation-only; every
+            # supported overlay has its own positive OCR/visual gate.
+            logger.info("未知页面缺少可验证操作，不发送 Esc；稍后重新识别")
         time.sleep(3)
     logger.warning("未能确认已返回港口；未执行盲点操作")
     return False
@@ -2046,6 +2124,7 @@ def recover_after_battle_fault(
             ScreenState.SURVEY,
             ScreenState.ESCAPE_MENU,
             ScreenState.EXIT_CONFIRMATION,
+            ScreenState.PORT_EXIT_CONFIRMATION,
         }:
             return last_state
         if last_state == ScreenState.LOADING:
@@ -2062,10 +2141,8 @@ def recover_after_battle_fault(
             time.sleep(min(2.0 * attempt, 5.0))
 
     # An unresolved loading screen is useful to the outer preparation loop.
-    # Every other unfamiliar page follows the global recovery rule: Esc is
-    # sent only to the verified game client, then the ordinary port detector
-    # decides whether recovery succeeded.  This is deliberately bounded so a
-    # login/disconnect prompt cannot spin forever or receive blind clicks.
+    # Every other unfamiliar page remains observation-only. Sending Esc on a
+    # port transition opens the quit-game confirmation and creates a loop.
     if last_state == ScreenState.LOADING:
         return last_state
     logger.warning("本局尚未确认结算，场景连续未知；保持识别且不执行回港/选船操作")
@@ -2348,7 +2425,7 @@ def run():
     if initial_state == ScreenState.UNKNOWN:
         reporter.update(
             "recovering",
-            "启动时页面未知，正在按 Esc 返回港口并重新识别",
+            "启动时页面未知，正在安全重识别已知界面",
             safety_state="armed",
             calibration_valid=True,
         )
@@ -2609,6 +2686,25 @@ def run():
                     logger.warning("战斗评价页暂未关闭；保持任务并重新识别")
                 time.sleep(0.8)
                 continue
+            if current_scene == ScreenState.PORT_EXIT_CONFIRMATION:
+                try:
+                    image = bot.vision.grab(bot.hwnd, allow_stale=True)
+                except CaptureFault as error:
+                    logger.info("取消港口退出确认框前画面暂不可用: %s", error)
+                    continue
+                if dismiss_port_exit_confirmation(
+                    bot.hwnd,
+                    image,
+                    backend=getattr(
+                        getattr(bot, "distance_reader", None), "backend", None
+                    ),
+                    should_abort=lambda: operation_paused(bot),
+                ):
+                    logger.info("已取消港口退出游戏确认框；下一循环重新识别")
+                else:
+                    logger.warning("港口退出确认框暂未取消；保持任务并重试")
+                time.sleep(0.8)
+                continue
             if current_scene == ScreenState.BATTLE:
                 if round_entry_pending:
                     round_entry_pending = False
@@ -2622,9 +2718,6 @@ def run():
                     "接续本局控制" if resuming_this_battle else "建立本局控制",
                 )
             elif current_scene == ScreenState.LOADING:
-                if round_entry_pending:
-                    round_entry_pending = False
-                    round_in_progress = True
                 resuming_this_battle = bool(
                     getattr(bot, "_round_control_initialized", False)
                 )
@@ -2632,16 +2725,20 @@ def run():
                     "当前处于加载中：%s",
                     "等待同一局 HUD 恢复" if resuming_this_battle else "等待本局 HUD 出现",
                 )
-                # Loading after a committed join is already inside this round.
-                # Lock before waiting so a pause during the transition cannot
-                # fall back into carousel selection.
-                round_in_progress = True
                 prepared = wait_for_battle(
                     bot,
                     should_stop=should_stop,
                     require_new_round=not resuming_this_battle,
                     loading_already_seen=not resuming_this_battle,
                 )
+                # A loading-looking frame is not by itself round identity: a
+                # dimmed port dialog briefly satisfies the same colour test.
+                # Commit the lock only after two live HUD frames appear. A
+                # pause preserves round_entry_pending, so resume still cannot
+                # fall into ship selection during a real matchmaking load.
+                if prepared:
+                    round_entry_pending = False
+                    round_in_progress = True
             elif current_scene == ScreenState.DAILY_REWARD:
                 logger.info("当前处于每日奖励页：领取后回港并重新开始准备")
                 backend = getattr(

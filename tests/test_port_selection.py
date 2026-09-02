@@ -54,6 +54,8 @@ class PortSelectionTests(unittest.TestCase):
             is_requested_ship_selected,
             in_battle_type_selector,
             is_battle_survey_page,
+            is_port_exit_confirmation_page,
+            port_exit_confirmation_no_action_point,
             select_requested_ship,
             selected_ship_scores,
         )
@@ -73,6 +75,12 @@ class PortSelectionTests(unittest.TestCase):
         cls.is_requested_ship_selected = staticmethod(is_requested_ship_selected)
         cls.in_battle_type_selector = staticmethod(in_battle_type_selector)
         cls.is_battle_survey_page = staticmethod(is_battle_survey_page)
+        cls.is_port_exit_confirmation_page = staticmethod(
+            is_port_exit_confirmation_page
+        )
+        cls.port_exit_confirmation_no_action_point = staticmethod(
+            port_exit_confirmation_no_action_point
+        )
         cls.select_requested_ship = staticmethod(select_requested_ship)
         cls.selected_ship_scores = staticmethod(selected_ship_scores)
 
@@ -159,6 +167,47 @@ class PortSelectionTests(unittest.TestCase):
         self.assertEqual(
             self.battle_survey_dismiss_point(image, backend=backend),
             (1164, 740),
+        )
+
+    def test_port_exit_confirmation_requires_exact_heading_and_clicks_no(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("确认", 0.99),
+            self.OcrToken("退出游戏？", 0.99),
+            self.OcrToken(
+                "是",
+                0.99,
+                ((1172, 718), (1199, 718), (1199, 747), (1172, 747)),
+            ),
+            self.OcrToken(
+                "否",
+                0.91,
+                ((1361, 718), (1391, 718), (1391, 748), (1361, 748)),
+            ),
+        )
+
+        self.assertTrue(
+            self.is_port_exit_confirmation_page(image, backend=backend)
+        )
+        self.assertEqual(
+            self.port_exit_confirmation_no_action_point(image, backend=backend),
+            (1376, 733),
+        )
+
+    def test_port_exit_confirmation_rejects_generic_yes_no_dialog(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken("确认", 0.99),
+            self.OcrToken("离开战斗？", 0.99),
+            self.OcrToken(
+                "否",
+                0.99,
+                ((1361, 718), (1391, 718), (1391, 748), (1361, 748)),
+            ),
+        )
+
+        self.assertFalse(
+            self.is_port_exit_confirmation_page(image, backend=backend)
         )
 
     def test_mode_card_click_point_comes_from_ocr_box(self):
