@@ -118,3 +118,15 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   .operation-banner{grid-template-columns:1fr;gap:5px}
   .operation-banner p{padding-left:0;border-left:0;white-space:normal}
 }
+
+/* Navigation-arrow silhouette for the live player pose; currentColor keeps
+   the existing white/cyan marker palette unchanged. */
+.ship-marker{
+  width:20px;
+  height:24px;
+  font-size:0;
+  background:currentColor;
+  clip-path:polygon(50% 0,100% 100%,50% 76%,0 100%);
+  filter:drop-shadow(0 0 5px var(--cyan));
+  text-shadow:none;
+}

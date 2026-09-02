@@ -67,6 +67,20 @@ class CustomShipWebTests(unittest.TestCase):
         self.assertIn(".totals-card .task-history{max-height:180px;overflow:auto", stylesheet)
         self.assertIn('grid-template-areas:"preset live totals"', stylesheet)
 
+    def test_live_player_marker_uses_navigation_arrow_silhouette(self):
+        html = (self.ROOT / "index.html").read_text(encoding="utf-8")
+        stylesheet = (self.ROOT / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'class="ship-marker" id="mapPlayer" aria-label="舰船位置"',
+            html,
+        )
+        self.assertIn(
+            "clip-path:polygon(50% 0,100% 100%,50% 76%,0 100%)",
+            stylesheet,
+        )
+        self.assertIn("background:currentColor", stylesheet)
+
 
 if __name__ == "__main__":
     unittest.main()

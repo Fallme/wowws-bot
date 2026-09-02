@@ -913,6 +913,17 @@ def test_opening_waypoint_is_near_center_on_enemy_side():
     assert target[1] == pytest.approx(0.362, abs=0.01)
     assert math.dist(target, (0.5, 0.5)) == pytest.approx(0.17)
 
+    retries = [
+        opening_autopilot_target((0.22, 0.89), attempt_index=index)
+        for index in range(3)
+    ]
+    assert len(set(retries)) == 3
+    assert [round(math.dist(point, (0.5, 0.5)), 3) for point in retries] == [
+        0.17,
+        0.203,
+        0.233,
+    ]
+
 
 def test_interrupted_tactical_map_is_closed_once_before_battle_resume():
     toggles = []
@@ -1085,7 +1096,8 @@ def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
         assert configure_opening_autopilot(bot)
         assert not configure_opening_autopilot(bot)
 
-    assert events == ["toggle", "toggle", "地图中心敌方远端"]
+    assert events[:2] == ["toggle", "toggle"]
+    assert "第1次" in events[2]
     assert len(clicks) == 1
     # Capture-circle OCR is telemetry only. The first target already crosses
     # the centre on the spawn-to-centre ray; later retries advance farther
@@ -1320,13 +1332,15 @@ def test_opening_autopilot_never_clicks_until_map_is_stably_confirmed():
 
     click.assert_not_called()
     message_click.assert_not_called()
-    assert not getattr(bot, "_tactical_map_attempted_this_battle", False)
-    assert bot._tactical_map_left_open
+    assert bot._tactical_map_attempted_this_battle
+    assert not bot._tactical_map_left_open
 
 
 def test_opening_autopilot_requires_lower_left_game_confirmation():
     minimap = np.zeros((200, 200, 3), dtype=np.uint8)
     enabled = []
+    toggles = []
+    clicks = []
 
     class UnconfirmedAutopilotVision:
         @staticmethod
@@ -1353,19 +1367,30 @@ def test_opening_autopilot_requires_lower_left_game_confirmation():
         hwnd=1,
         vision=UnconfirmedAutopilotVision(),
         distance_reader=SimpleNamespace(backend=object()),
-        gamepad=SimpleNamespace(toggle_tactical_map=lambda: None),
+        gamepad=SimpleNamespace(
+            toggle_tactical_map=lambda: toggles.append("m")
+        ),
         intervention=None,
         enable_opening_autopilot=lambda *_args, **_kwargs: enabled.append(True),
     )
     with (
         patch("main.time.sleep", return_value=None),
         patch("main.get_client_rect", return_value={"left": 0, "top": 0}),
-        patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
-        patch("main.physical_click", return_value=True),
+        patch(
+            "main.tactical_map_is_open",
+            side_effect=([True] * 5 + [False]) * 3,
+        ),
+        patch(
+            "main.physical_click",
+            side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
+        ),
     ):
         assert not configure_opening_autopilot(bot)
 
     assert enabled == []
+    assert toggles == ["m"] * 6
+    assert len(clicks) == 3
+    assert len(set(clicks)) == 3
 
 
 def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():

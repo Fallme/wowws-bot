@@ -1371,6 +1371,7 @@ def opening_autopilot_target(
     player_normalized: tuple[float, float],
     *,
     retrying: bool = False,
+    attempt_index: int = 0,
 ) -> tuple[float, float]:
     """Choose a central waypoint shifted into the enemy half.
 
@@ -1383,10 +1384,15 @@ def opening_autopilot_target(
     length = math.hypot(dx, dy)
     if length < 1e-6:
         return (0.5, 0.5)
-    offset = 0.20 if retrying else 0.17
+    attempt = max(0, min(2, int(attempt_index)))
+    forward_offsets = (0.17, 0.20, 0.23)
+    lateral_offsets = (0.0, 0.035, -0.035)
+    forward = forward_offsets[attempt] + (0.02 if retrying else 0.0)
+    lateral = lateral_offsets[attempt]
+    unit_x, unit_y = dx / length, dy / length
     return (
-        max(0.10, min(0.90, 0.5 + dx / length * offset)),
-        max(0.10, min(0.90, 0.5 + dy / length * offset)),
+        max(0.10, min(0.90, 0.5 + unit_x * forward - unit_y * lateral)),
+        max(0.10, min(0.90, 0.5 + unit_y * forward + unit_x * lateral)),
     )
 
 
@@ -1444,135 +1450,165 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                 "连续三帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管"
             )
             return False
-        normalized_target = opening_autopilot_target(
-            player_normalized,
-            retrying=retrying,
-        )
-        target_label = "敌方方向重试航点" if retrying else "地图中心敌方远端"
-        rect = get_client_rect(bot.hwnd)
-        local_x, local_y = tactical_map_local_point(width, height, normalized_target)
         if bool(getattr(bot, "_tactical_map_attempted_this_battle", False)):
-            logger.info("本局已经完成过一次战术地图落点尝试；不重复打开 M 地图")
+            logger.info("本局已经完成三次战术地图落点尝试；不再重复打开 M 地图")
             return False
 
+        rect = get_client_rect(bot.hwnd)
         intervention = getattr(bot, "intervention", None)
-        if intervention is not None and intervention.poll(bot.gamepad):
-            mark_pause = getattr(bot, "mark_manual_pause", None)
-            if mark_pause is not None:
-                mark_pause()
-            logger.info("用户键盘介入，取消本次自动航行设置")
-            return False
-
-        toggle_map()
-        acknowledge_automation_input(bot)
-        setattr(bot, "_tactical_map_left_open", True)
-        time.sleep(0.90)
-
-        tactical_static_frames = []
-        open_confirmations = 0
-        for sample_index in range(5):
-            tactical_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
-            if tactical_map_is_open(bot, tactical_frame):
-                open_confirmations += 1
-            tactical_static_frames.append(tactical_frame)
-            if sample_index < 4:
-                time.sleep(0.12)
-        if open_confirmations < 2:
-            _save_navigation_debug(bot, "tactical_open_unconfirmed", tactical_static_frames[-1])
-            logger.warning(
-                "M 大地图仅 %s/5 帧确认打开；禁止点击航点，本次交由 Q/E 驾驶兜底",
-                open_confirmations,
-            )
-            # Keep the uncertain-overlay marker. The common normalizer takes
-            # one fresh frame: it closes M only if that frame positively sees
-            # the tactical map, otherwise it clears the stale marker without
-            # risking a second blind toggle.
-            return False
-
-        # Consume the per-battle attempt only after the tactical overlay has
-        # been positively observed. A rejected/dropped M remains retryable.
-        setattr(bot, "_tactical_map_attempted_this_battle", True)
         begin_static_capture = getattr(bot, "begin_tactical_map_static_capture", None)
-        if begin_static_capture is not None:
-            begin_static_capture()
-
-        if intervention is not None and intervention.poll(bot.gamepad):
-            mark_pause = getattr(bot, "mark_manual_pause", None)
-            if mark_pause is not None:
-                mark_pause()
-            logger.info("用户键盘介入，战术地图停止落点并保留给统一恢复关闭")
-            return False
-
-        clicked = physical_click(
-            rect["left"] + local_x,
-            rect["top"] + local_y,
-            extra_delay=0.1,
-            hwnd=bot.hwnd,
-        ) or window_message_click(
-            bot.hwnd,
-            rect["left"] + local_x,
-            rect["top"] + local_y,
-            extra_delay=0.1,
-        )
-        if not clicked:
-            logger.warning("M 大地图航点点击未派发；保持地图状态给统一恢复处理")
-            return False
-
-        time.sleep(0.35)
-        toggle_map()
-        acknowledge_automation_input(bot)
-        time.sleep(0.65)
-        verification = bot.vision.grab(bot.hwnd, allow_stale=True)
-        if tactical_map_is_open(bot, verification):
-            setattr(bot, "_tactical_map_left_open", True)
-            logger.warning("M 大地图关闭未生效；不继续发送驾驶指令")
-            return False
-        setattr(bot, "_tactical_map_left_open", False)
-        if classify_runtime_screen(bot, verification) != ScreenState.BATTLE:
-            logger.warning("自动航行复核时已离开战斗，撤销后续驾驶")
-            return False
-
         static_sampler = getattr(bot, "capture_tactical_map_static_layer", None)
-        if static_sampler is not None:
-            static_complete = False
-            for tactical_frame in tactical_static_frames:
-                static_complete = bool(static_sampler(tactical_frame)) or static_complete
-            if not static_complete:
-                logger.warning("M 大地图静态层未完整确认；缺失项使用小地图多帧兜底")
-
-        # In production, success means the game's own lower-left green status
-        # explicitly says automatic navigation is enabled. Lightweight test
-        # adapters without this reader keep compatibility with the old hook.
         autopilot_reader = getattr(bot.vision, "read_autopilot_enabled_text", None)
         backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
-        if autopilot_reader is not None and backend is not None:
-            confirmed = False
-            confirmation_frame = verification
-            for confirmation_attempt in range(4):
-                if autopilot_reader(confirmation_frame, backend):
-                    confirmed = True
-                    break
-                if confirmation_attempt < 3:
-                    time.sleep(0.25)
-                    confirmation_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
-            if not confirmed:
-                _save_navigation_debug(bot, "autopilot_unconfirmed", confirmation_frame)
-                logger.warning(
-                    "航点已点击但左下角未确认“自动驾驶启用”；切换 Q/E 驾驶兜底"
-                )
+        static_capture_started = False
+        static_complete = False
+
+        for route_attempt in range(3):
+            attempt_number = route_attempt + 1
+            if route_attempt and not normalize_tactical_map_overlay(bot):
+                logger.warning("第 %s/3 次自动驾驶重试前无法安全关闭 M 图", attempt_number)
                 return False
-        try:
-            enable(target_label, target_normalized=normalized_target)
-        except TypeError:
-            # Compatibility for light-weight test/custom bot adapters.
-            enable(target_label)
-        logger.info(
-            "[SYSTEM] 战术地图自动航行: %s | local=(%s,%s)",
-            target_label,
-            local_x,
-            local_y,
-        )
-        return True
+            if intervention is not None and intervention.poll(bot.gamepad):
+                mark_pause = getattr(bot, "mark_manual_pause", None)
+                if mark_pause is not None:
+                    mark_pause()
+                logger.info("用户键盘介入，取消剩余自动航行尝试")
+                return False
+
+            normalized_target = opening_autopilot_target(
+                player_normalized,
+                retrying=retrying,
+                attempt_index=route_attempt,
+            )
+            local_x, local_y = tactical_map_local_point(
+                width,
+                height,
+                normalized_target,
+            )
+            toggle_map()
+            acknowledge_automation_input(bot)
+            # An accepted first M starts this battle's bounded three-attempt
+            # sequence. Rejected keyboard dispatch raises before this flag.
+            setattr(bot, "_tactical_map_attempted_this_battle", True)
+            setattr(bot, "_tactical_map_left_open", True)
+            time.sleep(0.90)
+
+            tactical_static_frames = []
+            open_confirmations = 0
+            for sample_index in range(5):
+                tactical_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
+                if tactical_map_is_open(bot, tactical_frame):
+                    open_confirmations += 1
+                tactical_static_frames.append(tactical_frame)
+                if sample_index < 4:
+                    time.sleep(0.12)
+            if open_confirmations < 2:
+                _save_navigation_debug(
+                    bot,
+                    f"tactical_open_unconfirmed_{attempt_number}",
+                    tactical_static_frames[-1],
+                )
+                logger.warning(
+                    "第 %s/3 次仅 %s/5 帧确认 M 图打开；不点击并更换偏移重试",
+                    attempt_number,
+                    open_confirmations,
+                )
+                continue
+
+            if not static_capture_started and begin_static_capture is not None:
+                begin_static_capture()
+                static_capture_started = True
+
+            if intervention is not None and intervention.poll(bot.gamepad):
+                mark_pause = getattr(bot, "mark_manual_pause", None)
+                if mark_pause is not None:
+                    mark_pause()
+                logger.info("用户键盘介入，战术地图停止落点并保留给统一恢复关闭")
+                return False
+
+            clicked = physical_click(
+                rect["left"] + local_x,
+                rect["top"] + local_y,
+                extra_delay=0.1,
+                hwnd=bot.hwnd,
+            ) or window_message_click(
+                bot.hwnd,
+                rect["left"] + local_x,
+                rect["top"] + local_y,
+                extra_delay=0.1,
+            )
+            if not clicked:
+                logger.warning("第 %s/3 次航点点击未派发；更换偏移重试", attempt_number)
+                continue
+
+            time.sleep(0.35)
+            toggle_map()
+            acknowledge_automation_input(bot)
+            time.sleep(0.65)
+            verification = bot.vision.grab(bot.hwnd, allow_stale=True)
+            if tactical_map_is_open(bot, verification):
+                setattr(bot, "_tactical_map_left_open", True)
+                logger.warning("第 %s/3 次 M 图关闭未生效；安全收尾后重试", attempt_number)
+                continue
+            setattr(bot, "_tactical_map_left_open", False)
+            if classify_runtime_screen(bot, verification) != ScreenState.BATTLE:
+                logger.warning("自动航行复核时已离开战斗，撤销剩余尝试")
+                return False
+
+            if static_sampler is not None and not static_complete:
+                for tactical_frame in tactical_static_frames:
+                    static_complete = (
+                        bool(static_sampler(tactical_frame)) or static_complete
+                    )
+
+            # In production, each click succeeds only when the game's exact
+            # lower-left green status confirms it. Test adapters without the
+            # OCR reader retain compatibility with the public enable hook.
+            confirmed = autopilot_reader is None or backend is None
+            confirmation_frame = verification
+            if not confirmed:
+                for confirmation_attempt in range(4):
+                    if autopilot_reader(confirmation_frame, backend):
+                        confirmed = True
+                        break
+                    if confirmation_attempt < 3:
+                        time.sleep(0.25)
+                        confirmation_frame = bot.vision.grab(
+                            bot.hwnd,
+                            allow_stale=True,
+                        )
+            if not confirmed:
+                _save_navigation_debug(
+                    bot,
+                    f"autopilot_unconfirmed_{attempt_number}",
+                    confirmation_frame,
+                )
+                logger.warning(
+                    "第 %s/3 次未确认“自动驾驶启用”；更换航点偏移重试",
+                    attempt_number,
+                )
+                continue
+
+            if static_sampler is not None and not static_complete:
+                logger.warning("M 大地图静态层未完整确认；缺失项使用小地图多帧兜底")
+            target_label = f"地图中心偏敌方航点（第{attempt_number}次）"
+            try:
+                enable(target_label, target_normalized=normalized_target)
+            except TypeError:
+                enable(target_label)
+            logger.info(
+                "[SYSTEM] 战术地图自动航行成功: %s | local=(%s,%s)",
+                target_label,
+                local_x,
+                local_y,
+            )
+            return True
+
+        if not normalize_tactical_map_overlay(bot):
+            logger.warning("三次自动驾驶均失败且 M 图尚未安全收尾")
+            return False
+        logger.warning("自动驾驶三次尝试均未确认成功；切换 Q/E 驾驶兜底")
+        return False
     except Exception:
         logger.exception("设置战术地图自动航行失败")
         try:
