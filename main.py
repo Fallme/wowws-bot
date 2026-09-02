@@ -977,6 +977,7 @@ def run_battle(
 ):
     intervention = getattr(bot, "intervention", None)
     resume_motion_reasserted = False
+    dead_at_start = False
     abandoned_native_route = bool(
         resume_existing
         and getattr(bot, "native_autopilot_abandoned", False)
@@ -1017,6 +1018,24 @@ def run_battle(
         ):
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
             return "resume_state"
+        # A run can be restarted while the previous match is still in the
+        # spectator/death HUD.  That screen retains enough battle anchors to
+        # classify as BATTLE, but it is not a live ship and must never trigger
+        # M-map/autopilot setup or a full-speed reassertion.  Probe the numeric
+        # HP before any command; the regular combat tick will continue to wait
+        # for the actual settlement boundary.
+        health_reader = getattr(bot.vision, "read_health_fraction", None)
+        if health_reader is not None:
+            try:
+                health_probe = health_reader(
+                    control_frame,
+                    getattr(getattr(bot, "distance_reader", None), "backend", None),
+                )
+                dead_at_start = health_probe is not None and float(health_probe) <= 0.0
+            except Exception:
+                logger.debug("战斗接管前生命值探测失败", exc_info=True)
+        if dead_at_start:
+            logger.info("接管前已确认舰船生命值为0；跳过全速重发和自动驾驶配置，等待结算")
         # The first HUD frame can appear before the game accepts movement
         # input. wait_for_battle may have sent W during that narrow transition
         # and advanced the controller cache even though the in-game telegraph
@@ -1027,7 +1046,7 @@ def run_battle(
             getattr(bot, "opening_autopilot_active", False)
             and not abandoned_native_route
         )
-        if not autopilot_visible:
+        if not autopilot_visible and not dead_at_start:
             resynchronize = getattr(
                 bot.gamepad,
                 "resynchronize_forward_controls",
@@ -1095,7 +1114,10 @@ def run_battle(
         # already stalled against terrain.
         setattr(bot, "native_autopilot_abandoned", True)
     autopilot_set = False
-    if resume_existing or preconfigured_autopilot:
+    if dead_at_start:
+        autopilot_set = False
+        logger.info("当前为沉船/观战阶段；不打开 M 地图，保持只读等待结算")
+    elif resume_existing or preconfigured_autopilot:
         autopilot_set = bool(
             not abandoned_native_route
             and not getattr(bot, "native_autopilot_abandoned", False)
