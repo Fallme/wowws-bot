@@ -3516,6 +3516,17 @@ def run():
                     return_to_port(bot)
                     port_configured = False
                 continue
+            # ``run_battle`` normally returns immediately after the HUD
+            # disappears, before the outer lifecycle has had a chance to
+            # classify the results page as ``RESULTS``.  Reward OCR is itself
+            # gated by consecutive result-page evidence, so promote that
+            # evidence to the round boundary here.  Without this hand-off a
+            # normal battle was treated as an unclosed round (completed_rounds
+            # stayed at zero) and the 1-round plan clicked "继续战斗" into a
+            # second match.
+            if not round_result_seen:
+                round_result_seen = True
+                logger.info("结算页已由收益 OCR 稳定确认；闭合当前战斗周期")
             if rewards.recognized:
                 logger.info(
                     "本局收益: 银币=%s 舰船经验=%s 全局经验=%s (%s)",
