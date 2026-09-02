@@ -1,6 +1,7 @@
 import math
 import time
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1075,7 +1076,7 @@ def test_missing_green_hud_guess_does_not_cancel_native_autopilot():
     assert not bot.generic_center_route_active
 
 
-def test_native_autopilot_arrival_allows_qe_on_following_frame():
+def test_confirmed_native_autopilot_never_hands_rudder_to_qe_at_visual_target():
     gamepad = RecordingGamepad()
     bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
     bot.intervention = SimpleNamespace(poll=lambda *_args: False)
@@ -1083,6 +1084,7 @@ def test_native_autopilot_arrival_allows_qe_on_following_frame():
         "地图中心敌方远端",
         target_normalized=(0.50, 0.25),
     )
+    bot._native_autopilot_confirmed = True
     now = time.monotonic()
     analysis = BattleAnalysis(
         image=None,
@@ -1096,12 +1098,88 @@ def test_native_autopilot_arrival_allows_qe_on_following_frame():
 
     bot._execute_rules(analysis, now)
 
+    assert bot.opening_autopilot_active
+    assert not bot.generic_center_route_active
+    bot._execute_rules(analysis, now + 0.1)
+
+    assert bot.opening_autopilot_active
+    assert not bot.generic_center_route_active
+    bot._execute_rules(analysis, now + 0.2)
+
     assert not bot.autopilot_retry_pending
-    assert bot.generic_center_route_active
+    assert bot.opening_autopilot_active
+    assert not bot.generic_center_route_active
     assert gamepad.movements == []
 
-    bot._execute_rules(analysis, now + 0.1)
-    assert len(gamepad.movements) == 1
+    bot._execute_rules(analysis, now + 0.3)
+    assert gamepad.movements == []
+
+
+def test_confirmed_native_autopilot_ignores_low_speed_and_stuck_feedback():
+    class FailingFeedback:
+        @staticmethod
+        def update(_now, _position, _throttle):
+            raise SafetyFault("已发送航行指令，但未观察到舰船位置变化")
+
+        @staticmethod
+        def reset():
+            pass
+
+    gamepad = RecordingGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.feedback = FailingFeedback()
+    bot.enable_opening_autopilot("地图中心偏敌方")
+    bot._native_autopilot_confirmed = True
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        in_battle=True,
+        speed_knots=0.0,
+        player_position=(100, 100),
+        island_distance=0.01,
+        island_avoidance_rudder=-1.0,
+    )
+
+    bot._execute_rules(analysis, 100.0)
+    bot._execute_rules(analysis, 140.0)
+
+    assert bot.opening_autopilot_active
+    assert not bot.autopilot_retry_pending
+    assert gamepad.movements == []
+    assert "禁止W/Q/E" in bot.last_movement_reason
+
+
+def test_native_autopilot_rejects_single_frame_false_arrival():
+    gamepad = RecordingGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.enable_opening_autopilot(
+        "地图中心敌方远端",
+        target_normalized=(0.60, 0.58),
+    )
+    now = time.monotonic()
+    normal = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        player_position=(270, 260),
+        minimap_player_normalized=(0.39, 0.40),
+    )
+    false_glyph = replace(
+        normal,
+        player_position=(405, 375),
+        minimap_player_normalized=(0.59, 0.58),
+    )
+
+    bot._execute_rules(normal, now)
+    bot._execute_rules(false_glyph, now + 1.8)
+    bot._execute_rules(normal, now + 3.6)
+
+    assert bot.opening_autopilot_active
+    assert not bot.generic_center_route_active
+    assert gamepad.movements == []
 
 
 def test_live_autopilot_hud_hard_interlock_blocks_even_emergency_rudder():

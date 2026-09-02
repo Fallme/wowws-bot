@@ -349,6 +349,10 @@ class BattleBot:
         self._fire_samples = deque(maxlen=2)
         self._flood_samples = deque(maxlen=5)
         self._autopilot_hud_samples = deque(maxlen=3)
+        # A single white minimap glyph must never end the native route.  The
+        # arrival decision is made only after several physically plausible,
+        # fresh player-arrow samples agree that the waypoint was reached.
+        self._autopilot_arrival_samples = deque(maxlen=3)
         self._autopilot_zero_speed_since: float | None = None
         # Set on the first control frame after the M-map click.  The game can
         # spend several seconds spawning the ship and rendering its minimap;
@@ -492,6 +496,7 @@ class BattleBot:
         self._fire_samples.clear()
         self._flood_samples.clear()
         self._autopilot_hud_samples.clear()
+        self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
         self._native_autopilot_started_at = None
         self._island_samples.clear()
@@ -863,6 +868,7 @@ class BattleBot:
         self.autopilot_retry_pending = False
         self.native_autopilot_abandoned = False
         self._autopilot_hud_samples.clear()
+        self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
         self._native_autopilot_started_at = None
         self.last_movement_command = None
@@ -926,6 +932,7 @@ class BattleBot:
         self.opening_autopilot_active = False
         self._native_autopilot_confirmed = False
         self.opening_autopilot_target_normalized = None
+        self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
         self._native_autopilot_started_at = None
         self.generic_center_route_active = True
@@ -1255,12 +1262,41 @@ class BattleBot:
                 analysis.minimap_enemy_count = len(minimap_enemies)
                 pose = self.vision.find_player_pose_on_minimap(minimap)
                 if pose is not None:
-                    self._cached_player_pose_normalized = (
+                    candidate_normalized = (
                         pose.position[0] / max(minimap.shape[1], 1),
                         pose.position[1] / max(minimap.shape[0], 1),
                     )
-                    self._cached_player_heading = tuple(pose.heading)
-                    self._cached_player_pose_at = observed_at
+                    # Capture points, range labels and ship status glyphs can
+                    # all contain a small filled white triangle.  Reject a
+                    # candidate that would require the ship to teleport across
+                    # the minimap.  At 30 knots the real per-frame displacement
+                    # is tiny; this deliberately generous bound still permits
+                    # delayed frames and short capture gaps.
+                    candidate_plausible = True
+                    if self._cached_player_pose_normalized is not None:
+                        elapsed = max(
+                            0.0,
+                            observed_at - float(self._cached_player_pose_at),
+                        )
+                        maximum_jump = min(0.12, 0.03 + elapsed * 0.003)
+                        candidate_plausible = (
+                            math.dist(
+                                candidate_normalized,
+                                self._cached_player_pose_normalized,
+                            )
+                            <= maximum_jump
+                        )
+                    if candidate_plausible:
+                        self._cached_player_pose_normalized = candidate_normalized
+                        self._cached_player_heading = tuple(pose.heading)
+                        self._cached_player_pose_at = observed_at
+                    else:
+                        logger.debug(
+                            "拒绝小地图玩家箭头瞬移候选: previous=%s candidate=%s",
+                            self._cached_player_pose_normalized,
+                            candidate_normalized,
+                        )
+                        pose = None
                 elif (
                     self._cached_player_pose_normalized is not None
                     and self._cached_player_heading is not None
@@ -2131,14 +2167,39 @@ class BattleBot:
                 0.0,
                 now - float(self._native_autopilot_started_at),
             )
-            arrived = bool(
+            if self._native_autopilot_confirmed:
+                # Once the game's lower-left status has positively confirmed
+                # the native route, it exclusively owns engine and rudder.
+                # Position, terrain, enemy and stuck heuristics are telemetry
+                # only: none of them may emit W/Q/E or cancel the route.  This
+                # prevents a transient minimap glyph/zero-speed sample from
+                # turning into an avoidance command roughly 30 seconds later.
+                self._autopilot_arrival_samples.clear()
+                self._autopilot_zero_speed_since = None
+                self.last_movement_command = None
+                self.last_movement_reason = (
+                    f"游戏自动航行至{self.opening_autopilot_target}；"
+                    "已确认原生自动驾驶，禁止W/Q/E、避山及脱困接管"
+                )
+                if self._last_movement_mode != "autopilot_route":
+                    logger.info("[SYSTEM] %s", self.last_movement_reason)
+                self._last_movement_mode = "autopilot_route"
+                return
+            near_target = bool(
                 self.opening_autopilot_target_normalized is not None
                 and analysis.minimap_player_normalized is not None
+                and not analysis.player_pose_cached
                 and math.dist(
                     self.opening_autopilot_target_normalized,
                     analysis.minimap_player_normalized,
                 )
                 <= 0.085
+            )
+            self._autopilot_arrival_samples.append(near_target)
+            arrived = bool(
+                len(self._autopilot_arrival_samples)
+                == self._autopilot_arrival_samples.maxlen
+                and all(self._autopilot_arrival_samples)
             )
             if arrived:
                 self.feedback.reset()

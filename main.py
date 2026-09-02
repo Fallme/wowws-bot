@@ -875,10 +875,12 @@ def wait_for_battle(
                 battle_frames = 0
                 clock_frames = 0
                 continue
+            battle_frames += 1
             if (
                 require_new_round
                 and not opening_attempted
                 and hasattr(bot, "gamepad")
+                and battle_frames >= 2
             ):
                 find_minimap = getattr(bot.vision, "find_minimap", None)
                 find_player_pose = getattr(
@@ -938,7 +940,6 @@ def wait_for_battle(
                 if opening_configured:
                     setattr(bot, "_opening_autopilot_preconfigured", True)
                     logger.info("新一局 HUD 已出现，已先行建立自动航线")
-            battle_frames += 1
             if require_new_round:
                 clock = bot.vision.read_battle_clock_seconds(image, clock_backend)
                 if clock is not None and clock >= 15 * 60:
@@ -1682,6 +1683,20 @@ def configure_opening_autopilot(
                 tactical_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
                 if tactical_map_is_open(bot, tactical_frame):
                     open_confirmations += 1
+                elif (
+                    getattr(bot.vision, "_has_loading_start_action", None)
+                    is not None
+                    and bot.vision._has_loading_start_action(tactical_frame)
+                ):
+                    # The live HUD can appear for one transitional frame before
+                    # the ship is actually spawned.  On that pre-battle roster
+                    # M does not open the tactical map.  Do not burn all three
+                    # waypoint offsets against the roster page.
+                    setattr(bot, "_tactical_map_left_open", False)
+                    logger.info(
+                        "M 图尝试遇到战前队伍/开始战斗页；等待稳定战斗 HUD 后再导航"
+                    )
+                    return False
                 tactical_static_frames.append(tactical_frame)
                 if sample_index < 4:
                     time.sleep(0.12)
