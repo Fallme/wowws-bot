@@ -2189,7 +2189,11 @@ class Vision:
         for label in range(1, count):
             _x, _y, component_width, component_height, area = stats[label]
             if (
-                area / pixels >= 0.16
+                # The pre-battle roster button is partially translucent on
+                # some maps/scales.  At 2560x1494 its connected green fill is
+                # about 14% of this tight ROI, while live consumable glyphs
+                # remain far below the width/height checks below.
+                area / pixels >= 0.10
                 and component_width >= width * 0.55
                 and component_height >= height * 0.20
                 and component_width / max(component_height, 1) >= 2.0

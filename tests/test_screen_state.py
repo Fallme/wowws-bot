@@ -122,6 +122,26 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.LOADING,
         )
 
+    def test_translucent_prebattle_start_button_is_detected_at_2k(self):
+        """The real roster button is only about 14% of the tight ROI."""
+        from core.ui import LOADING_START_BUTTON
+
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        x1, y1, x2, y2 = LOADING_START_BUTTON.pixels(
+            image.shape[1], image.shape[0]
+        )
+        # Match the partially transparent green fill measured from the latest
+        # 2K roster capture: wide enough to be a button, but below the old
+        # 0.16 area threshold.
+        cv2.rectangle(
+            image,
+            (x1 + 15, y1 + 53),
+            (x1 + 15 + 200, y1 + 53 + 18),
+            (95, 115, 31),
+            -1,
+        )
+        self.assertTrue(self.vision._has_loading_start_action(image))
+
     def test_live_consumables_are_not_a_loading_start_action(self):
         image = cv2.imread(str(self.FIXTURE_ROOT / "live_battle.png"))
         self.assertIsNotNone(image)
