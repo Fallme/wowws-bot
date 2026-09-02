@@ -52,6 +52,18 @@ def test_loading_capture_fault_returns_to_lifecycle_instead_of_stopping_run():
     assert wait_while_loading(bot, timeout=1) is None
 
 
+def test_stop_request_cancels_autopilot_before_any_game_input():
+    events = []
+    bot = SimpleNamespace(
+        gamepad=SimpleNamespace(toggle_tactical_map=lambda: events.append("m")),
+        vision=SimpleNamespace(),
+        enable_opening_autopilot=lambda *_args, **_kwargs: events.append("enable"),
+    )
+
+    assert not configure_opening_autopilot(bot, should_stop=lambda: True)
+    assert events == []
+
+
 class FakeController:
     def __init__(self):
         self.stop_calls = 0
@@ -427,6 +439,62 @@ def test_first_battle_hud_frame_starts_engine_before_clock_and_autopilot_finish(
 
     assert controller.reassertions == 1
     assert bot._opening_motion_prestarted
+
+
+def test_loading_like_battle_frame_waits_for_player_pose_before_opening_commands():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class PrematureBattleVision:
+        def __init__(self):
+            self.states = [
+                ScreenState.LOADING,
+                ScreenState.BATTLE,
+                ScreenState.BATTLE,
+                ScreenState.BATTLE,
+            ]
+            self.pose_calls = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            return frame
+
+        def classify_screen(self, _image):
+            return self.states.pop(0) if self.states else ScreenState.BATTLE
+
+        @staticmethod
+        def find_minimap(_image):
+            return frame
+
+        def find_player_pose_on_minimap(self, _minimap):
+            self.pose_calls += 1
+            return None if self.pose_calls == 1 else object()
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return None
+
+    controller = SimpleNamespace(reassertions=0)
+
+    def reassert_full_speed():
+        controller.reassertions += 1
+
+    controller.reassert_full_speed = reassert_full_speed
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=PrematureBattleVision(),
+        gamepad=controller,
+        intervention=None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot") as configure,
+    ):
+        assert wait_for_battle(bot, timeout=2, require_new_round=True)
+
+    configure.assert_called_once_with(bot)
+    assert controller.reassertions == 1
+    assert bot.vision.pose_calls == 2
+    assert bot._opening_autopilot_attempted
 
 
 def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing():

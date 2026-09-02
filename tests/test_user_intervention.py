@@ -236,7 +236,7 @@ def test_switching_away_from_game_pauses_before_focus_can_be_stolen_back():
     assert not monitor.poll(controller, now=15.2)
 
 
-def test_mouse_activity_after_switching_away_extends_pause_and_eventually_latches():
+def test_mouse_activity_after_switching_away_never_extends_or_latches_pause():
     current_tick = [100]
     foreground = [7]
     monitor = UserInterventionMonitor(
@@ -254,14 +254,35 @@ def test_mouse_activity_after_switching_away_extends_pause_and_eventually_latche
     assert monitor.poll(controller, now=10)
     assert monitor.last_trigger == "window_switch"
 
-    # Mouse use never starts a pause, but once the user has switched away it
-    # counts as continued background activity and prevents focus theft.
-    for now in (14.0, 18.0, 22.0, 26.0, 30.0):
+    # The explicit window switch owns one five-second pause. Mouse-only use in
+    # the other app must not extend it or turn it into a manual-resume latch.
+    current_tick[0] += 10
+    assert monitor.poll(controller, now=14.0)
+    for now in (15.1, 18.0, 22.0, 26.0, 30.0):
         current_tick[0] += 10
-        assert monitor.poll(controller, now=now)
-    assert monitor.latched
-    assert monitor.last_trigger == "background_activity"
-    assert monitor.poll(controller, now=40)
+        assert not monitor.poll(controller, now=now)
+    assert not monitor.latched
+    assert monitor.last_trigger == "window_switch"
+
+
+def test_any_tick_from_a_long_automation_batch_is_not_user_input():
+    current_tick = [1000]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: True,
+        foreground_reader=lambda: 7,
+    )
+    controller = SimpleNamespace(
+        last_injected_tick_ms=1400,
+        recent_injected_key_ticks_ms=(1100, 1200, 1300, 1400),
+    )
+    monitor.reset()
+
+    current_tick[0] = 1200
+    assert not monitor.poll(controller, now=10)
+    assert not monitor.latched
 
 
 def test_mouse_activity_inside_game_still_does_not_extend_expired_keyboard_pause():

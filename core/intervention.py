@@ -15,6 +15,12 @@ import time
 # player keypress for nearly half a second: doing so made manual intervention
 # occasionally miss its first key and let the bot steal focus back.
 AUTOMATION_TICK_TOLERANCE_MS = 120
+# GetAsyncKeyState's transition bit can become visible a little after the
+# keybd_event call that produced it.  Limit the late-drain window to the game
+# foreground and to a recently acknowledged automation batch.  This prevents
+# the bot's own W/Q/E/M edges from being paired with a later mouse event and
+# mislabeled as a human keypress.
+AUTOMATION_KEY_SETTLE_SECONDS = 0.75
 logger = logging.getLogger("intervention")
 
 
@@ -64,9 +70,9 @@ class UserInterventionMonitor:
     """Observe real keyboard input without mistaking our own injections.
 
     ``GetLastInputInfo`` is system-wide. Keyboard activity therefore pauses
-    automation even after the user has switched to another window; otherwise
-    the five-second timer expires while the user is still typing and the game
-    immediately steals focus back. Native injected ticks are still ignored.
+    automation even after the user has switched to another window. An explicit
+    foreground switch also starts one pause window, while mouse-only activity
+    is ignored. Native injected ticks are ignored.
     """
 
     def __init__(
@@ -101,12 +107,14 @@ class UserInterventionMonitor:
         self.web_paused = False
         self.resumed_from_web = False
         self._last_foreground: int | None = None
+        self._automation_keyboard_quiet_until = 0.0
         self.last_trigger = ""
 
     def reset(self):
         self._last_seen_tick = self._input_tick_reader()
         self._keyboard_activity_reader()
         self._last_foreground = self._foreground_reader()
+        self._automation_keyboard_quiet_until = 0.0
         self.pause_until = 0.0
         self.intervention_started_at = None
         self.last_user_input_at = None
@@ -161,6 +169,25 @@ class UserInterventionMonitor:
         value = getattr(controller, "last_injected_tick_ms", None)
         return None if value is None else int(value)
 
+    @staticmethod
+    def _automation_ticks(controller) -> tuple[int, ...]:
+        values = getattr(controller, "recent_injected_key_ticks_ms", None)
+        if not values:
+            tick = UserInterventionMonitor._automation_tick(controller)
+            return () if tick is None else (tick,)
+        try:
+            return tuple(int(value) for value in values)
+        except (TypeError, ValueError):
+            return ()
+
+    @classmethod
+    def _matches_automation_tick(cls, controller, current_tick: int) -> bool:
+        return any(
+            _tick_distance(current_tick, injected_tick)
+            <= AUTOMATION_TICK_TOLERANCE_MS
+            for injected_tick in cls._automation_ticks(controller)
+        )
+
     def acknowledge_automation(self, controller=None) -> None:
         """Consume state left by a known automation keyboard dispatch.
 
@@ -174,18 +201,21 @@ class UserInterventionMonitor:
         never enters the pause state.
         """
         current_tick = self._input_tick_reader()
-        injected_tick = self._automation_tick(controller)
+        injected_ticks = self._automation_ticks(controller)
         # Do not drain a real key that happened after the bot dispatch. The
         # controller observer calls this immediately, so a wider distance is
         # evidence that LASTINPUTINFO now belongs to another input source.
         if (
-            injected_tick is not None
-            and _tick_distance(current_tick, injected_tick)
-            > AUTOMATION_TICK_TOLERANCE_MS
+            injected_ticks
+            and not self._matches_automation_tick(controller, current_tick)
         ):
             return
         self._last_seen_tick = current_tick
         self._keyboard_activity_reader()
+        if injected_ticks:
+            self._automation_keyboard_quiet_until = (
+                time.monotonic() + AUTOMATION_KEY_SETTLE_SECONDS
+            )
         current_foreground = self._foreground_reader()
         if current_foreground:
             self._last_foreground = current_foreground
@@ -230,29 +260,22 @@ class UserInterventionMonitor:
                 self.intervention_started_at = None
                 self.last_user_input_at = None
             return now < self.pause_until
-        # Mouse activity never starts a pause by itself.  Once the user has
-        # switched away or pressed a key, however, mouse activity in that other
-        # application extends the same quiet window.  Otherwise the game steals
-        # focus back after five seconds while the user is still actively using
-        # the browser with the mouse.
+        # Mouse movement/clicks are never user-intervention signals.  Window
+        # switching is handled independently above, and only a subsequent
+        # keyboard event may extend that pause or make it latch.
         if not self._keyboard_activity_reader():
-            if (
-                self.intervention_started_at is not None
-                and current_foreground not in (0, self.hwnd)
-            ):
-                self._note_user_intervention(
-                    now,
-                    trigger="background_activity",
-                )
             return self.latched or now < self.pause_until
 
-        injected_tick = self._automation_tick(controller)
-        is_automation = (
-            injected_tick is not None
-            and _tick_distance(current_tick, injected_tick)
-            <= AUTOMATION_TICK_TOLERANCE_MS
+        is_automation = self._matches_automation_tick(controller, current_tick)
+        # The async transition bit for a known injected key can arrive after
+        # its exact LASTINPUTINFO tick has already been replaced by mouse
+        # motion.  Drain that delayed edge only while the game remains in the
+        # foreground; a genuine Alt+Tab is still caught by window_switch.
+        is_late_automation = (
+            current_foreground == self.hwnd
+            and time.monotonic() <= self._automation_keyboard_quiet_until
         )
-        if not is_automation:
+        if not is_automation and not is_late_automation:
             self._note_user_intervention(now, trigger="keyboard")
         return self.latched or now < self.pause_until
 

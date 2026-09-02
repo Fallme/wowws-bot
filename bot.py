@@ -2057,8 +2057,8 @@ class BattleBot:
         pause_source = (
             "网页手动暂停"
             if web_paused
-            else "用户切屏/后台操作"
-            if trigger in {"window_switch", "background_activity"}
+            else "用户切屏"
+            if trigger == "window_switch"
             else "用户键盘介入"
         )
         self.last_movement_reason = (
@@ -2090,7 +2090,7 @@ class BattleBot:
             )
         if latched and not was_latched and not web_paused:
             logger.warning(
-                "[USER] 持续切屏/键盘/后台操作达到 %.0f 秒，已锁定暂停；等待网页点击继续",
+                "[USER] 持续切屏/键盘操作达到 %.0f 秒，已锁定暂停；等待网页点击继续",
                 float(getattr(self.intervention, "latch_seconds", 20.0)),
             )
 

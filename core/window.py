@@ -22,6 +22,7 @@ DEFAULT_GAME_PROCESS_NAMES = frozenset(
     }
 )
 _INTERACTION_PAUSE_GUARD = None
+_AUTOMATION_INPUT_OBSERVER = None
 
 
 def configured_game_process_names() -> frozenset[str]:
@@ -132,6 +133,27 @@ def set_interaction_pause_guard(guard=None) -> None:
     """
     global _INTERACTION_PAUSE_GUARD
     _INTERACTION_PAUSE_GUARD = guard
+
+
+def set_automation_input_observer(observer=None) -> None:
+    """Observe successful low-level UI input owned by the automation.
+
+    Port and result-screen clicks bypass ``KeyboardController``.  Without this
+    acknowledgement, their mouse LASTINPUTINFO tick could be combined with a
+    delayed automated key transition and falsely pause the whole lifecycle.
+    """
+    global _AUTOMATION_INPUT_OBSERVER
+    _AUTOMATION_INPUT_OBSERVER = observer
+
+
+def _acknowledge_automation_input() -> None:
+    observer = _AUTOMATION_INPUT_OBSERVER
+    if observer is None:
+        return
+    try:
+        observer()
+    except Exception:
+        logger.exception("自动点击监听回执失败；保留已完成的游戏点击")
 
 
 def _interaction_paused() -> bool:
@@ -474,6 +496,7 @@ def physical_click(
     if not _get_physical_cursor_pos(user32, original):
         return False
 
+    clicked = False
     try:
         # Captured frames and OCR boxes are physical client pixels. Legacy
         # absolute mouse_event movement is DPI-virtualized when Codex/the web
@@ -536,9 +559,15 @@ def physical_click(
         time.sleep(0.05)
         user32.mouse_event(up_flag, 0, 0, 0, 0)
         time.sleep(0.1)
+        clicked = True
         return True
     finally:
         _set_physical_cursor_pos(user32, original.x, original.y)
+        if clicked:
+            # Cursor restoration is the final synthetic mouse event.  Drain
+            # keyboard transitions only after it, so the restored-position
+            # LASTINPUTINFO tick cannot inherit an older W/Q/E/M edge.
+            _acknowledge_automation_input()
 
 
 def window_message_click(
@@ -592,6 +621,7 @@ def window_message_click(
         win32gui.PostMessage(hwnd, down_message, button_mask, lparam)
         time.sleep(0.05 + max(0.0, extra_delay))
         win32gui.PostMessage(hwnd, up_message, 0, lparam)
+        _acknowledge_automation_input()
         logger.info(
             "已通过窗口消息派发点击: hwnd=%s client=(%s,%s)",
             hwnd,
@@ -614,6 +644,7 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
     original = ctypes.wintypes.POINT()
     if not _get_physical_cursor_pos(user32, original):
         return False
+    scrolled = False
     try:
         if not _set_physical_cursor_pos(user32, screen_x, screen_y):
             return False
@@ -641,9 +672,12 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
             0,
         )
         time.sleep(0.35)
+        scrolled = True
         return True
     finally:
         _set_physical_cursor_pos(user32, original.x, original.y)
+        if scrolled:
+            _acknowledge_automation_input()
 
 
 def click_center(hwnd):

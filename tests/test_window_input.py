@@ -78,6 +78,20 @@ def test_physical_click_prefers_unvirtualized_cursor_apis(monkeypatch):
     assert user32.events.count(win32con.MOUSEEVENTF_LEFTUP) == 1
 
 
+def test_successful_physical_click_acknowledges_automation_input(monkeypatch):
+    user32 = PhysicalCursorUser32()
+    acknowledgements = []
+    monkeypatch.setattr(window.ctypes.windll, "user32", user32)
+    monkeypatch.setattr(window.time, "sleep", lambda _seconds: None)
+    window.set_automation_input_observer(lambda: acknowledgements.append(True))
+    try:
+        assert window.physical_click(998, 976)
+    finally:
+        window.set_automation_input_observer(None)
+
+    assert acknowledgements == [True]
+
+
 def test_physical_scroll_uses_same_unvirtualized_coordinates(monkeypatch):
     user32 = PhysicalCursorUser32()
     monkeypatch.setattr(window.ctypes.windll, "user32", user32)

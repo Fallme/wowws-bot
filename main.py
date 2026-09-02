@@ -29,6 +29,7 @@ from core.window import (
     is_game_window,
     maximize_game_window,
     physical_click,
+    set_automation_input_observer,
     set_interaction_pause_guard,
     window_message_click,
 )
@@ -879,6 +880,35 @@ def wait_for_battle(
                 and not opening_attempted
                 and hasattr(bot, "gamepad")
             ):
+                find_minimap = getattr(bot.vision, "find_minimap", None)
+                find_player_pose = getattr(
+                    bot.vision,
+                    "find_player_pose_on_minimap",
+                    None,
+                )
+                opening_pose_ready = True
+                if callable(find_minimap) and callable(find_player_pose):
+                    try:
+                        minimap = find_minimap(image)
+                        opening_pose_ready = bool(
+                            minimap is not None
+                            and find_player_pose(minimap) is not None
+                        )
+                    except Exception:
+                        opening_pose_ready = False
+                        logger.debug(
+                            "开局小地图玩家箭头预检失败，等待后续帧",
+                            exc_info=True,
+                        )
+                if not opening_pose_ready:
+                    # A broad HUD colour match during roster/loading must not
+                    # consume this round's only M-map setup.  The real player
+                    # arrow is the positive evidence that ship controls and
+                    # the tactical map are ready to accept input.
+                    logger.debug("战斗外观已出现但玩家箭头未就绪，暂缓开局输入")
+                    battle_frames = 0
+                    clock_frames = 0
+                    continue
                 # Start movement on the first reliable post-loading HUD frame.
                 # Clock OCR can take several seconds on its first GPU call, so
                 # start the engine immediately, then establish native
@@ -897,7 +927,15 @@ def wait_for_battle(
                 except RuntimeError as error:
                     logger.info("开局全速指令被暂停/前台互锁撤销: %s", error)
                 setattr(bot, "_opening_autopilot_attempted", True)
-                if configure_opening_autopilot(bot):
+                opening_configured = (
+                    configure_opening_autopilot(bot)
+                    if should_stop is None
+                    else configure_opening_autopilot(
+                        bot,
+                        should_stop=should_stop,
+                    )
+                )
+                if opening_configured:
                     setattr(bot, "_opening_autopilot_preconfigured", True)
                     logger.info("新一局 HUD 已出现，已先行建立自动航线")
             battle_frames += 1
@@ -1131,12 +1169,26 @@ def run_battle(
             # A recovered battle must use the same opening rule as a freshly
             # detected battle: establish native autopilot first, then let the
             # Q/E controller take over only after the game route ends.
-            autopilot_set = configure_opening_autopilot(bot)
+            autopilot_set = (
+                configure_opening_autopilot(bot)
+                if should_stop is None
+                else configure_opening_autopilot(
+                    bot,
+                    should_stop=should_stop,
+                )
+            )
     else:
         autopilot_set = (
             False
             if opening_autopilot_attempted
-            else configure_opening_autopilot(bot)
+            else (
+                configure_opening_autopilot(bot)
+                if should_stop is None
+                else configure_opening_autopilot(
+                    bot,
+                    should_stop=should_stop,
+                )
+            )
         )
 
     if not autopilot_set and intervention is not None and (
@@ -1495,11 +1547,21 @@ def _save_navigation_debug(bot: BattleBot, label: str, image) -> None:
         logger.debug("保存自动航行诊断截图失败", exc_info=True)
 
 
-def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bool:
+def configure_opening_autopilot(
+    bot: BattleBot,
+    *,
+    retrying: bool = False,
+    should_stop=None,
+) -> bool:
     """Set and positively verify one native tactical-map waypoint."""
     toggle_map = getattr(bot.gamepad, "toggle_tactical_map", None)
     enable = getattr(bot, "enable_opening_autopilot", None)
     if toggle_map is None or enable is None or not hasattr(bot, "vision"):
+        return False
+    if should_stop is not None and should_stop():
+        logger.info("终止请求已到达，取消开局自动航行配置")
+        return False
+    if operation_paused(bot):
         return False
     if not normalize_tactical_map_overlay(bot):
         return False
@@ -1533,6 +1595,11 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             ),
         )
         for pose_attempt in range(pose_attempts):
+            if should_stop is not None and should_stop():
+                logger.info("终止请求已到达，不再等待小地图玩家箭头")
+                return False
+            if operation_paused(bot):
+                return False
             minimap = bot.vision.find_minimap(image)
             if minimap is not None:
                 pose = bot.vision.find_player_pose_on_minimap(minimap)
@@ -1572,6 +1639,11 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
 
         for route_attempt in range(3):
             attempt_number = route_attempt + 1
+            if should_stop is not None and should_stop():
+                logger.info("终止请求已到达，取消剩余自动航行尝试")
+                return False
+            if operation_paused(bot):
+                return False
             if route_attempt and not normalize_tactical_map_overlay(bot):
                 logger.warning("第 %s/3 次自动驾驶重试前无法安全关闭 M 图", attempt_number)
                 return False
@@ -1603,6 +1675,10 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             tactical_static_frames = []
             open_confirmations = 0
             for sample_index in range(5):
+                if should_stop is not None and should_stop():
+                    return False
+                if operation_paused(bot):
+                    return False
                 tactical_frame = bot.vision.grab(bot.hwnd, allow_stale=True)
                 if tactical_map_is_open(bot, tactical_frame):
                     open_confirmations += 1
@@ -1678,6 +1754,10 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
             confirmation_frame = verification
             if not confirmed:
                 for confirmation_attempt in range(4):
+                    if should_stop is not None and should_stop():
+                        return False
+                    if operation_paused(bot):
+                        return False
                     if autopilot_reader(confirmation_frame, backend):
                         confirmed = True
                         break
@@ -2223,8 +2303,8 @@ def wait_for_web_resume(
     source = (
         "网页手动暂停"
         if web_paused
-        else "用户切屏/后台操作"
-        if trigger in {"window_switch", "background_activity"}
+        else "用户切屏"
+        if trigger == "window_switch"
         else "用户键盘介入"
     )
     logger.info("[USER] %s；冻结自动流程并保留舰船操纵状态", source)
@@ -2257,7 +2337,7 @@ def wait_for_web_resume(
                 )
             )
             resume_source = (
-                "网页点击继续" if resumed_by_web else "连续5秒无新的后台操作"
+                "网页点击继续" if resumed_by_web else "连续5秒无新的切屏或键盘操作"
             )
             if (
                 bot is not None
@@ -2413,6 +2493,9 @@ def run():
     # multi-attempt focus/click operation.  Every side effect in core.window
     # now consults the live keyboard/Web intervention state itself.
     set_interaction_pause_guard(lambda: operation_paused(bot))
+    set_automation_input_observer(
+        lambda: bot.intervention.acknowledge_automation()
+    )
     reward_reader = ResultRewardReader(bot.distance_reader.backend)
     # The pause monitor must exist before the first maximize/foreground action.
     # Web pause or keyboard intervention during Steam/login therefore leaves

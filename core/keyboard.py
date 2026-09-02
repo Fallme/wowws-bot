@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+from collections import deque
 from dataclasses import dataclass
 import logging
 import time
@@ -79,15 +80,23 @@ class SendInputBackend:
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
         self.last_injected_tick_ms: int | None = None
+        # Keep every keyboard edge in the current command, not just the final
+        # one.  A full-speed resynchronization spans several hundred
+        # milliseconds; LASTINPUTINFO may expose any one of those edges while
+        # the observer is draining the completed batch.
+        self.recent_injected_key_ticks_ms = deque(maxlen=64)
 
-    def _mark_injected(self):
-        self.last_injected_tick_ms = int(self.kernel32.GetTickCount())
+    def _mark_injected(self, *, keyboard: bool = False):
+        tick = int(self.kernel32.GetTickCount())
+        self.last_injected_tick_ms = tick
+        if keyboard:
+            self.recent_injected_key_ticks_ms.append(tick)
 
     def _send_key(self, key: str, *, key_up: bool):
         virtual_key = VK[key]
         flags = KEYEVENTF_KEYUP if key_up else 0
         self.user32.keybd_event(virtual_key, 0, flags, 0)
-        self._mark_injected()
+        self._mark_injected(keyboard=True)
 
     def key_down(self, key: str):
         self._send_key(key, key_up=False)
@@ -371,6 +380,10 @@ class KeyboardController:
     @property
     def last_injected_tick_ms(self):
         return getattr(self.device, "last_injected_tick_ms", None)
+
+    @property
+    def recent_injected_key_ticks_ms(self):
+        return tuple(getattr(self.device, "recent_injected_key_ticks_ms", ()))
 
     def pause_automation(self):
         """Keep the current telegraph and Q/E rudder notch unchanged."""
