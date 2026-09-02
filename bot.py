@@ -350,6 +350,10 @@ class BattleBot:
         self._flood_samples = deque(maxlen=5)
         self._autopilot_hud_samples = deque(maxlen=3)
         self._autopilot_zero_speed_since: float | None = None
+        # Set on the first control frame after the M-map click.  The game can
+        # spend several seconds spawning the ship and rendering its minimap;
+        # low speed during that hand-off is not a native-route failure.
+        self._native_autopilot_started_at: float | None = None
         self._island_samples = deque(maxlen=5)
         self._island_avoidance_until = 0.0
         self._island_avoidance_rudder = 0.0
@@ -489,6 +493,7 @@ class BattleBot:
         self._flood_samples.clear()
         self._autopilot_hud_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._native_autopilot_started_at = None
         self._island_samples.clear()
         self._island_avoidance_until = 0.0
         self._island_avoidance_rudder = 0.0
@@ -770,7 +775,29 @@ class BattleBot:
             pose = pose_finder(tactical_map) if pose_finder is not None else None
             player = None if pose is None else pose.position
             zone_finder = getattr(self.vision, "find_capture_zones", None)
-            zones = zone_finder(tactical_map, player=player) if zone_finder else []
+            zone_backend = getattr(
+                getattr(self.distance_reader, "backend", None),
+                "recognize",
+                None,
+            )
+            zone_backend = (
+                getattr(self.distance_reader, "backend", None)
+                if zone_backend is not None
+                else None
+            )
+            if zone_finder:
+                try:
+                    zones = zone_finder(
+                        tactical_map,
+                        player=player,
+                        ocr_backend=zone_backend,
+                    )
+                except TypeError:
+                    # Keep compatibility with small test/custom vision
+                    # adapters that still expose the two-argument method.
+                    zones = zone_finder(tactical_map, player=player)
+            else:
+                zones = []
             confirmed_zones = self._confirmed_static_layer(
                 self._zone_layer_candidates,
                 self._zone_layer_signature(zones, tactical_map.shape),
@@ -837,6 +864,7 @@ class BattleBot:
         self.native_autopilot_abandoned = False
         self._autopilot_hud_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._native_autopilot_started_at = None
         self.last_movement_command = None
         self.last_movement_reason = (
             f"游戏自动航行已设定至{self.opening_autopilot_target}"
@@ -899,6 +927,7 @@ class BattleBot:
         self._native_autopilot_confirmed = False
         self.opening_autopilot_target_normalized = None
         self._autopilot_zero_speed_since = None
+        self._native_autopilot_started_at = None
         self.generic_center_route_active = True
         self._last_movement_mode = None
         self.last_movement_reason = reason or "通用驾驶接管，驶向地图中央"
@@ -1298,11 +1327,30 @@ class BattleBot:
                             "find_capture_zones",
                             None,
                         )
-                        detected_zones = (
-                            zone_finder(minimap, player=player)
-                            if zone_finder is not None
-                            else []
-                        )
+                        if zone_finder is not None:
+                            zone_backend = getattr(
+                                getattr(self.distance_reader, "backend", None),
+                                "recognize",
+                                None,
+                            )
+                            zone_backend = (
+                                getattr(self.distance_reader, "backend", None)
+                                if zone_backend is not None
+                                else None
+                            )
+                            try:
+                                detected_zones = zone_finder(
+                                    minimap,
+                                    player=player,
+                                    ocr_backend=zone_backend,
+                                )
+                            except TypeError:
+                                detected_zones = zone_finder(
+                                    minimap,
+                                    player=player,
+                                )
+                        else:
+                            detected_zones = []
                         display_zones = list(detected_zones)
                         if detected_zones:
                             confirmed_zones = self._confirmed_static_layer(
@@ -2077,6 +2125,12 @@ class BattleBot:
             return
 
         if self.opening_autopilot_active:
+            if self._native_autopilot_started_at is None:
+                self._native_autopilot_started_at = now
+            route_age = max(
+                0.0,
+                now - float(self._native_autopilot_started_at),
+            )
             arrived = bool(
                 self.opening_autopilot_target_normalized is not None
                 and analysis.minimap_player_normalized is not None
@@ -2112,7 +2166,18 @@ class BattleBot:
                     )
                 )
             ):
-                if self._autopilot_zero_speed_since is None:
+                minimum_route_seconds = max(
+                    0.0,
+                    float(
+                        self.strategy.get(
+                            "opening_autopilot_minimum_seconds", 0.0
+                        )
+                    ),
+                )
+                if (
+                    self._autopilot_zero_speed_since is None
+                    and route_age >= minimum_route_seconds
+                ):
                     self._autopilot_zero_speed_since = now
                 zero_speed_timeout = max(
                     3.0,
@@ -2122,8 +2187,15 @@ class BattleBot:
                         )
                     ),
                 )
-                stalled_seconds = now - self._autopilot_zero_speed_since
-                if stalled_seconds >= zero_speed_timeout:
+                stalled_seconds = (
+                    0.0
+                    if self._autopilot_zero_speed_since is None
+                    else now - self._autopilot_zero_speed_since
+                )
+                if (
+                    self._autopilot_zero_speed_since is not None
+                    and stalled_seconds >= zero_speed_timeout
+                ):
                     self.feedback.reset()
                     self.movement_verified = False
                     self.request_autopilot_retry(

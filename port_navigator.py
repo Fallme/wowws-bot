@@ -221,6 +221,14 @@ def click_battle(hwnd=None, image=None, backend=None):
         else find_battle_button(hwnd, image)
     )
     if position is None:
+        # The header text can be hidden for one or two frames while the port
+        # artwork/card animation settles. The caller has already positively
+        # classified PORT; use the guarded coloured button geometry rather
+        # than rejecting an already selected ship on a transient OCR miss.
+        position = find_battle_button(hwnd, image)
+        if position is not None:
+            logger.info("加入战斗文字暂不可读，使用已确认颜色按钮坐标: local=%s", position)
+    if position is None:
         logger.warning("未识别到“加入战斗”文字按钮")
         return False
     logger.info("定位“加入战斗”: local=%s", position)
@@ -2040,6 +2048,36 @@ def select_requested_ship(
             image,
             selection_backend,
         )
+        if current_selected_key is None and hwnd:
+            # The right-side detail card fades in independently of the port
+            # background. Give it two fresh game-window frames before
+            # touching the carousel; otherwise a selected Pommern/Napoli is
+            # mistaken for an unknown ship and the safe action interlock
+            # rejects the whole run.
+            for retry in range(2):
+                if _operation_paused(should_abort):
+                    return False
+                time.sleep(0.25)
+                try:
+                    refreshed = _capture(hwnd)
+                except CaptureFault:
+                    continue
+                if vision.classify_screen(refreshed) != ScreenState.PORT:
+                    continue
+                image = refreshed
+                current_selected_key, confidence, source = detect_selected_ship(
+                    image,
+                    selection_backend,
+                )
+                if current_selected_key is not None:
+                    logger.info(
+                        "右上角舰船卡片第 %s 次刷新后恢复识别: %s confidence=%.3f source=%s",
+                        retry + 1,
+                        current_selected_key,
+                        confidence,
+                        source,
+                    )
+                    break
         if current_selected_key == ship_key:
             logger.info(
                 "右上角舰船卡片已是目标舰船: %s confidence=%.3f source=%s；"
@@ -2075,11 +2113,46 @@ def select_requested_ship(
         if battle_hud_visible:
             logger.warning("选船互锁：当前画面仍有战斗 HUD，禁止港口选船操作")
             return False
-        if port_battle_action_point(
-            image,
-            selection_backend,
-        ) is None:
-            logger.warning("选船互锁：未识别到港口“加入战斗”文字，禁止滚动或点击舰船")
+        action_point = port_battle_action_point(image, selection_backend)
+        if action_point is None:
+            action_point = find_battle_button(hwnd, image)
+            if action_point is not None:
+                logger.info(
+                    "选船互锁：加入战斗文字暂不可读，颜色按钮已确认: local=%s",
+                    action_point,
+                )
+        # A port frame can be captured during the header animation before the
+        # action button is painted. Retry fresh game-window frames briefly;
+        # never scroll the carousel until the positive PORT + action evidence
+        # is available, but do not reject a correctly selected ship forever.
+        if action_point is None and hwnd:
+            for retry in range(3):
+                if _operation_paused(should_abort):
+                    return False
+                time.sleep(0.25)
+                try:
+                    image = _capture(hwnd)
+                except CaptureFault:
+                    continue
+                try:
+                    if vision.classify_screen(image) != ScreenState.PORT:
+                        continue
+                except Exception:
+                    continue
+                action_point = port_battle_action_point(image, selection_backend)
+                if action_point is None:
+                    action_point = find_battle_button(hwnd, image)
+                if action_point is not None:
+                    logger.info(
+                        "选船互锁：第 %s 次刷新后确认加入战斗按钮: local=%s",
+                        retry + 1,
+                        action_point,
+                    )
+                    break
+        if action_point is None:
+            logger.warning(
+                "选船互锁：连续刷新仍未确认港口加入战斗按钮，禁止滚动或点击舰船"
+            )
             return False
     if is_custom:
         return _select_custom_ship(

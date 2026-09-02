@@ -1519,7 +1519,20 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
         # a few seconds avoids falling back to Q/E just because the marker was
         # one frame late, while the surrounding battle interlock still aborts
         # immediately on a scene change or user pause.
-        for pose_attempt in range(16):
+        # Loading/roster transitions can leave the lower-right minimap
+        # rendered before the white ship arrow. At 2K the real capture/OCR
+        # cycle is ~0.6 s, so 28 samples cover roughly 15-18 s without ever
+        # clicking a guessed centre point. This is still an opening-only wait;
+        # no M-map retry is performed after the route has been handed off.
+        pose_attempts = max(
+            8,
+            int(
+                getattr(bot, "strategy", {}).get(
+                    "opening_autopilot_pose_attempts", 28
+                )
+            ),
+        )
+        for pose_attempt in range(pose_attempts):
             minimap = bot.vision.find_minimap(image)
             if minimap is not None:
                 pose = bot.vision.find_player_pose_on_minimap(minimap)
@@ -1529,7 +1542,7 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                         pose.position[1] / max(minimap.shape[0], 1),
                     )
                     break
-            if pose_attempt < 15:
+            if pose_attempt < pose_attempts - 1:
                 time.sleep(0.25)
                 image = bot.vision.grab(bot.hwnd, allow_stale=True)
                 if (
@@ -1540,7 +1553,8 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                 height, width = image.shape[:2]
         if player_normalized is None:
             logger.warning(
-                "连续16帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管"
+                "连续%s帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管",
+                pose_attempts,
             )
             return False
         if bool(getattr(bot, "_tactical_map_attempted_this_battle", False)):

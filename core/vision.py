@@ -247,7 +247,72 @@ class Vision:
         dot = heading_x * target_x + heading_y * target_y
         return max(-1.0, min(math.atan2(cross, dot) / math.pi, 1.0))
 
-    def find_capture_zones(self, minimap, player=None):
+    @staticmethod
+    def _capture_zone_ocr_label(minimap, zone, backend):
+        """Read the A/B/C/D glyph from the centre of one capture ring.
+
+        Hough circles give accurate geometry but their spatial ordering is not
+        the game's label ordering on staggered maps.  The diamond letter is
+        small, so OCR is restricted to a square around the circle centre and
+        enlarged once; this excludes the map's A-J row/column grid labels and
+        nearby ship names.
+        """
+        if backend is None or minimap is None or minimap.size == 0:
+            return ""
+        height, width = minimap.shape[:2]
+        center_x, center_y = (int(zone.center[0]), int(zone.center[1]))
+        half = max(12, int(round(float(zone.radius) * 0.62)))
+        x1, y1 = max(0, center_x - half), max(0, center_y - half)
+        x2, y2 = min(width, center_x + half + 1), min(height, center_y + half + 1)
+        crop = minimap[y1:y2, x1:x2]
+        if crop.size == 0:
+            return ""
+        # A single enlargement is enough for both the 2K minimap and the
+        # rectified tactical map. Avoid multiple OCR passes in every control
+        # frame; static geometry is sampled only during the opening window.
+        enlarged = cv2.resize(crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        try:
+            tokens = backend.recognize(enlarged) or ()
+        except Exception:
+            logger.debug("占领点字母 OCR 失败", exc_info=True)
+            return ""
+        best = (0.0, "")
+        for token in tokens:
+            text = str(getattr(token, "text", "") or "").strip().upper()
+            if text not in {"A", "B", "C", "D"}:
+                continue
+            confidence = float(getattr(token, "confidence", 0.0) or 0.0)
+            box = getattr(token, "box", ()) or ()
+            points = np.asarray(box, dtype=np.float32)
+            if points.shape != (4, 2):
+                continue
+            # Reject any accidental grid/name token that happens to be a
+            # single Latin character but lies far from this ring's centre.
+            token_center = points.mean(axis=0) / 2.0
+            crop_center = np.asarray(crop.shape[1::-1], dtype=np.float32) / 2.0
+            if float(np.linalg.norm(token_center - crop_center)) > half * 0.55:
+                continue
+            if confidence > best[0]:
+                best = (confidence, text)
+        return best[1]
+
+    @classmethod
+    def _apply_capture_zone_ocr_labels(cls, minimap, zones, backend):
+        """Replace inferred labels only when every visible ring is confirmed."""
+        if backend is None or not zones:
+            return list(zones)
+        labels = [cls._capture_zone_ocr_label(minimap, zone, backend) for zone in zones]
+        # Partial OCR must not create a mixture of true and guessed letters;
+        # retain the deterministic geometric fallback until a complete set is
+        # available. This also keeps the static-layer vote stable across fades.
+        if len(set(labels)) != len(labels) or not all(labels):
+            return list(zones)
+        return [
+            CaptureZone(zone.center, zone.radius, label, zone.state)
+            for zone, label in zip(zones, labels)
+        ]
+
+    def find_capture_zones(self, minimap, player=None, ocr_backend=None):
         """Return plausible capture circles visible on the minimap.
 
         ``player`` is optional, but when supplied it lets us reject the large
@@ -387,7 +452,9 @@ class Vision:
                         ],
                     )
         if best_formation is not None:
-            return best_formation[1]
+            return self._apply_capture_zone_ocr_labels(
+                minimap, best_formation[1], ocr_backend
+            )
 
         # Some maps use a triangular or otherwise staggered point layout.
         # Dynamically cluster the equally sized high-confidence circles rather
@@ -426,7 +493,7 @@ class Vision:
             _score, group = min(uniform_groups, key=lambda item: item[0])
             zones = [zone for _rank, zone in group]
             zones.sort(key=lambda zone: (zone.center[0], zone.center[1]))
-            return [
+            zones = [
                 CaptureZone(
                     zone.center,
                     zone.radius,
@@ -435,6 +502,9 @@ class Vision:
                 )
                 for index, zone in enumerate(zones)
             ]
+            return self._apply_capture_zone_ocr_labels(
+                minimap, zones, ocr_backend
+            )
 
         # Non-three-point maps retain a conservative fallback.  Exclude any
         # circle centred on or enclosing the player so a range ring can never
@@ -458,7 +528,9 @@ class Vision:
             )
             if candidate_span < scale * 0.36:
                 return []
-        return candidates
+        return self._apply_capture_zone_ocr_labels(
+            minimap, candidates, ocr_backend
+        )
 
     def find_nearest_capture_zone(self, minimap, player):
         """Find the nearest neutral/hostile lettered capture point.
