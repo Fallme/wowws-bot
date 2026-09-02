@@ -1514,7 +1514,12 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
         # briefly covered by loading/friendly labels.  If it still cannot be
         # found, fail over to closed-loop minimap steering instead of clicking
         # the geometric centre and creating the short route reported by users.
-        for pose_attempt in range(3):
+        # The first HUD frame often arrives before the minimap ship marker is
+        # rendered (especially after a port/roster transition).  Sampling for
+        # a few seconds avoids falling back to Q/E just because the marker was
+        # one frame late, while the surrounding battle interlock still aborts
+        # immediately on a scene change or user pause.
+        for pose_attempt in range(16):
             minimap = bot.vision.find_minimap(image)
             if minimap is not None:
                 pose = bot.vision.find_player_pose_on_minimap(minimap)
@@ -1524,8 +1529,8 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                         pose.position[1] / max(minimap.shape[0], 1),
                     )
                     break
-            if pose_attempt < 2:
-                time.sleep(0.15)
+            if pose_attempt < 15:
+                time.sleep(0.25)
                 image = bot.vision.grab(bot.hwnd, allow_stale=True)
                 if (
                     classify_battle_continuity_screen(bot, image)
@@ -1535,7 +1540,7 @@ def configure_opening_autopilot(bot: BattleBot, *, retrying: bool = False) -> bo
                 height, width = image.shape[:2]
         if player_normalized is None:
             logger.warning(
-                "连续三帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管"
+                "连续16帧未定位小地图白色玩家箭头；拒绝设置错误短航点，交由通用驾驶接管"
             )
             return False
         if bool(getattr(bot, "_tactical_map_attempted_this_battle", False)):
