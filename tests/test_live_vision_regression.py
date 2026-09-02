@@ -329,6 +329,29 @@ def test_player_range_ring_beats_dense_yellow_clutter():
     assert pose.position[1] == pytest.approx(player[1], abs=3)
 
 
+def test_player_arrow_silhouette_beats_capture_glyph_in_stronger_ring():
+    minimap = np.full((650, 690, 3), 35, dtype=np.uint8)
+    player = (350, 69)
+    # The opening player ring is partly obscured by labels at spawn.
+    cv2.ellipse(minimap, player, (72, 72), 0, 20, 330, (0, 180, 210), 2)
+    cv2.fillConvexPoly(
+        minimap,
+        np.array([[350, 60], [343, 78], [357, 78]], dtype=np.int32),
+        (245, 245, 245),
+    )
+
+    # Reproduce the stronger circular evidence around a non-arrow map glyph.
+    decoy = (383, 381)
+    cv2.circle(minimap, decoy, 72, (0, 180, 210), 3)
+    cv2.rectangle(minimap, (379, 374), (387, 388), (245, 245, 245), -1)
+
+    pose = Vision().find_player_pose_on_minimap(minimap)
+
+    assert pose is not None
+    assert pose.position[0] == pytest.approx(player[0], abs=3)
+    assert pose.position[1] == pytest.approx(player[1], abs=3)
+
+
 def test_live_island_signal_detects_terrain_in_the_corrected_bow_direction(live_frame):
     vision = Vision()
     minimap = vision.find_minimap(live_frame)

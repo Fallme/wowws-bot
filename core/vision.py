@@ -709,8 +709,22 @@ class Vision:
             length = math.hypot(direction_x, direction_y)
             if length < 2:
                 continue
+            fill_ratio = float(area) / max(float(w * h), 1.0)
+            # The live player marker is a filled three-point navigation arrow.
+            # Capture letters, ship-class glyphs and range labels can sit in
+            # stronger yellow circles and win the old ring-only ranking.  Give
+            # the arrow silhouette priority, while retaining the older ring
+            # fallback for unusual UI scales where antialiasing adds a vertex.
+            arrow_silhouette = bool(
+                vertices == 3
+                and area >= scale * scale * 0.00014
+                and area <= max(150.0, scale * scale * 0.00042)
+                and max(w, h) <= max(22.0, scale * 0.04)
+                and 0.28 <= fill_ratio <= 0.62
+            )
             candidates.append(
                 (
+                    arrow_silhouette,
                     ring_coverage,
                     ring_score,
                     center_x,
@@ -721,21 +735,25 @@ class Vision:
             )
         if not candidates:
             return None
-        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+        silhouette_candidates = [
+            candidate for candidate in candidates if candidate[0]
+        ]
+        ranked = silhouette_candidates or candidates
+        ranked.sort(key=lambda candidate: (candidate[1], candidate[2]), reverse=True)
         # Only portions of the range circle can be visible behind islands or
         # capture overlays.  Twelve occupied sectors still describe a ring;
         # requiring eighteen made the live white arrow disappear precisely
         # when the ship approached an island.
         minimum_coverage = 12
         minimum_score = max(32, int(scale * scale * 0.00024))
-        if candidates[0][0] < minimum_coverage or candidates[0][1] < minimum_score:
+        if ranked[0][1] < minimum_coverage or ranked[0][2] < minimum_score:
             return None
-        if len(candidates) > 1 and candidates[0][0] < candidates[1][0] * 1.08:
+        if len(ranked) > 1 and ranked[0][1] < ranked[1][1] * 1.08:
             return None
-        best = candidates[0]
+        best = ranked[0]
         return PlayerPose(
-            position=(best[2], best[3]),
-            heading=(best[4], best[5]),
+            position=(best[3], best[4]),
+            heading=(best[5], best[6]),
         )
 
     @staticmethod
