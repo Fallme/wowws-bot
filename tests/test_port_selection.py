@@ -49,6 +49,7 @@ class PortSelectionTests(unittest.TestCase):
             detect_port_mode,
             ensure_requested_mode,
             find_custom_ship_card,
+            find_builtin_ship_card,
             find_ship_card,
             is_custom_ship_selected,
             is_requested_ship_selected,
@@ -58,6 +59,7 @@ class PortSelectionTests(unittest.TestCase):
             port_exit_confirmation_no_action_point,
             select_requested_ship,
             selected_ship_scores,
+            _verify_builtin_ship_after_click,
         )
 
         cls.OcrToken = OcrToken
@@ -70,6 +72,7 @@ class PortSelectionTests(unittest.TestCase):
         cls.detect_port_mode = staticmethod(detect_port_mode)
         cls.ensure_requested_mode = staticmethod(ensure_requested_mode)
         cls.find_custom_ship_card = staticmethod(find_custom_ship_card)
+        cls.find_builtin_ship_card = staticmethod(find_builtin_ship_card)
         cls.find_ship_card = staticmethod(find_ship_card)
         cls.is_custom_ship_selected = staticmethod(is_custom_ship_selected)
         cls.is_requested_ship_selected = staticmethod(is_requested_ship_selected)
@@ -83,6 +86,9 @@ class PortSelectionTests(unittest.TestCase):
         )
         cls.select_requested_ship = staticmethod(select_requested_ship)
         cls.selected_ship_scores = staticmethod(selected_ship_scores)
+        cls.verify_builtin_ship_after_click = staticmethod(
+            _verify_builtin_ship_after_click
+        )
 
     def backend(self, *tokens):
         class Backend:
@@ -269,6 +275,73 @@ class PortSelectionTests(unittest.TestCase):
             self.assertGreater(score, 0.68)
             self.assertTrue(0 <= x < image.shape[1])
             self.assertTrue(int(image.shape[0] * 0.73) <= y < image.shape[0])
+
+    def test_builtin_ship_card_uses_exact_ocr_when_template_is_dimmed(self):
+        image = np.full((1440, 2560, 3), 35, dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.49,
+                ((820, 150), (970, 150), (970, 185), (820, 185)),
+            )
+        )
+
+        match = self.find_builtin_ship_card(
+            image,
+            "napoli",
+            backend,
+            minimum_ocr_confidence=0.45,
+        )
+
+        self.assertIsNotNone(match)
+        (x, y), confidence = match
+        self.assertEqual((x, y), (895, 1157))
+        self.assertAlmostEqual(confidence, 0.49)
+
+    def test_selected_ship_accepts_exact_low_confidence_ocr_in_detail_panel(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.50,
+                ((100, 80), (260, 80), (260, 115), (100, 115)),
+            )
+        )
+
+        self.assertEqual(
+            self.detect_selected_ship(image, backend=backend),
+            ("napoli", 0.50, "ocr_low_confidence"),
+        )
+
+    def test_ship_switch_verification_reads_right_upper_card_after_click(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "那不勒斯",
+                0.50,
+                ((100, 80), (260, 80), (260, 115), (100, 115)),
+            )
+        )
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+
+                return ScreenState.PORT
+
+        with (
+            patch("port_navigator._capture", side_effect=[image, image]),
+            patch("port_navigator.time.sleep", return_value=None),
+        ):
+            verified = self.verify_builtin_ship_after_click(
+                1,
+                "napoli",
+                backend,
+                vision=PortVision(),
+            )
+
+        self.assertEqual(verified, (True, 0.50, "ocr_low_confidence"))
 
     def test_rejects_unknown_ship(self):
         image = np.zeros((1440, 2560, 3), dtype=np.uint8)

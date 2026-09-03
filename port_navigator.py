@@ -1485,6 +1485,78 @@ def find_custom_ship_card(image, full_name, backend=None, minimum_confidence=0.6
     return point, confidence
 
 
+def find_builtin_ship_card(
+    image,
+    ship_key,
+    backend=None,
+    *,
+    minimum_score=0.55,
+    minimum_ocr_confidence=0.45,
+):
+    """Locate a built-in ship card with template matching plus exact OCR.
+
+    Gold-mask templates are fast, but the game may dim/recolour a card while
+    the carousel is animating (Napoli is especially prone to this).  In that
+    case an exact OCR match in the lower carousel is safer than rejecting a
+    visible target or clicking a loose template correlation.
+    """
+    match = find_ship_card(image, ship_key, minimum_score=minimum_score)
+    if match is not None or backend is None:
+        return match
+    aliases = BUILTIN_SHIP_OCR_NAMES.get((ship_key or "").strip().lower(), ())
+    if not aliases:
+        return None
+    height = image.shape[0]
+    search_top = int(height * 0.70)
+    crop = image[search_top:height, :]
+    try:
+        candidates = _ocr_line_candidates(
+            backend.recognize(crop),
+            minimum_confidence=minimum_ocr_confidence,
+        )
+    except Exception:
+        logger.warning("舰船卡片 OCR 兜底失败: %s", ship_key, exc_info=True)
+        return None
+    normalized_aliases = {_normalize_ship_name(alias) for alias in aliases}
+    best = None
+    for candidate in candidates:
+        text = candidate["text"]
+        if text not in normalized_aliases and not any(
+            text == prefix + alias
+            for prefix in SHIP_TIER_PREFIXES
+            for alias in normalized_aliases
+        ):
+            continue
+        match = (
+            float(candidate["confidence"]),
+            candidate["box"],
+            text,
+        )
+        if best is None or match[0] > best[0]:
+            best = match
+    if best is None:
+        logger.warning(
+            "舰船卡片 %s 模板不足且 OCR 未命中 (template_threshold=%.2f)",
+            ship_key,
+            minimum_score,
+        )
+        return None
+    confidence, box, raw_text = best
+    x1, y1, x2, y2 = box
+    name_y = search_top + int((y1 + y2) / 2)
+    point = (
+        int((x1 + x2) / 2),
+        max(search_top, name_y - int(height * 0.012)),
+    )
+    logger.info(
+        "舰船卡片 OCR 兜底命中: requested=%s recognized=%s confidence=%.3f",
+        ship_key,
+        raw_text,
+        confidence,
+    )
+    return point, confidence
+
+
 def is_custom_ship_selected(image, full_name, backend=None, minimum_confidence=0.60):
     """Strictly verify the selected ship name in the upper-right detail panel."""
     backend = backend or RapidOcrBackend()
@@ -1629,7 +1701,11 @@ def ensure_selected_ship_commander(
         if ship_key == CUSTOM_SHIP_KEY:
             match = find_custom_ship_card(image, custom_name or "", backend)
         else:
-            match = find_ship_card(image, ship_key)
+            match = find_builtin_ship_card(
+                image,
+                ship_key,
+                backend,
+            )
         if match is None:
             point = _LAST_SELECTED_CARD_POINT
             if point is None:
@@ -1790,9 +1866,11 @@ def detect_selected_ship(
             int(height * 0.035) : int(height * 0.25),
             int(width * 0.68) : width,
         ]
+        raw_tokens = ()
         try:
+            raw_tokens = tuple(backend.recognize(detail) or ())
             candidates = _ocr_line_candidates(
-                backend.recognize(detail),
+                raw_tokens,
                 minimum_confidence=minimum_ocr_confidence,
             )
         except Exception:
@@ -1818,6 +1896,35 @@ def detect_selected_ship(
                 raw_text,
             )
             return ship_key, confidence, "ocr"
+
+        # During the port carousel animation the title can be dimmed enough
+        # for RapidOCR to report ~0.45-0.67 confidence. Accept only an exact
+        # built-in alias in this tightly scoped upper-right panel.
+        if raw_tokens:
+            low_confidence = max(0.42, min(float(minimum_ocr_confidence), 0.45))
+            low_candidates = _ocr_line_candidates(
+                raw_tokens,
+                minimum_confidence=low_confidence,
+            )
+            for candidate in low_candidates:
+                text = candidate["text"]
+                confidence = float(candidate["confidence"])
+                for low_ship_key, aliases in BUILTIN_SHIP_OCR_NAMES.items():
+                    normalized_aliases = {
+                        _normalize_ship_name(alias) for alias in aliases
+                    }
+                    if text in normalized_aliases or any(
+                        text == prefix + alias
+                        for prefix in SHIP_TIER_PREFIXES
+                        for alias in normalized_aliases
+                    ):
+                        logger.info(
+                            "右上角舰船卡片识别: ship=%s source=ocr_low_confidence confidence=%.3f text=%s",
+                            low_ship_key,
+                            confidence,
+                            text,
+                        )
+                        return low_ship_key, confidence, "ocr_low_confidence"
 
     scores = selected_ship_scores(image)
     if not scores:
@@ -1864,6 +1971,70 @@ def is_requested_ship_selected(
         source,
     )
     return selected_key == ship_key
+
+
+def _verify_builtin_ship_after_click(
+    hwnd,
+    ship_key,
+    backend,
+    *,
+    vision=None,
+    should_abort=None,
+    attempts=6,
+    stable_samples=2,
+):
+    """Verify a built-in ship only after the carousel click was dispatched.
+
+    The detail card animates independently of the carousel. Require two
+    consecutive right-upper-card observations of the requested ship so a
+    stale frame cannot be mistaken for a successful switch.
+    """
+    consecutive = 0
+    last_confidence = 0.0
+    last_source = "not_checked"
+    for attempt in range(max(1, int(attempts))):
+        if _operation_paused(should_abort):
+            return False, last_confidence, "paused"
+        try:
+            image = _capture(hwnd)
+        except CaptureFault:
+            consecutive = 0
+            continue
+        if vision is not None:
+            try:
+                if vision.classify_screen(image) != ScreenState.PORT:
+                    logger.warning(
+                        "点击切船后画面已离开港口，拒绝确认舰船: %s",
+                        ship_key,
+                    )
+                    consecutive = 0
+                    continue
+            except Exception:
+                logger.debug("点击切船后港口状态复核失败", exc_info=True)
+        selected, confidence, source = detect_selected_ship(
+            image,
+            backend,
+        )
+        last_confidence = confidence
+        last_source = source
+        logger.info(
+            "点击切船后右上角复核 (%s/%s): selected=%s target=%s confidence=%.3f source=%s",
+            attempt + 1,
+            max(1, int(attempts)),
+            selected or "unknown",
+            ship_key,
+            confidence,
+            source,
+        )
+        if selected == ship_key:
+            consecutive += 1
+            if consecutive >= max(1, int(stable_samples)):
+                return True, confidence, source
+        else:
+            consecutive = 0
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(0.30)
+    return False, last_confidence, last_source
 
 
 def _confirm_custom_ship_after_click(
@@ -2163,7 +2334,11 @@ def select_requested_ship(
             max_scrolls=max(0, int(custom_max_scrolls)),
             should_abort=should_abort,
         )
-    match = find_ship_card(image, ship_key)
+    match = find_builtin_ship_card(
+        image,
+        ship_key,
+        selection_backend,
+    )
     if match is None and hwnd:
         rect = get_client_rect(hwnd)
         if not _rewind_ship_carousel(hwnd, rect, should_abort=should_abort):
@@ -2178,7 +2353,11 @@ def select_requested_ship(
         if selected_key == ship_key:
             _remember_selected_ship(ship_key)
             return True
-        match = find_ship_card(image, ship_key)
+        match = find_builtin_ship_card(
+            image,
+            ship_key,
+            selection_backend,
+        )
         # A single direction sweep avoids revisiting cards and never leaves the
         # requested ship just outside a reverse-search boundary.
         for attempt in range(18):
@@ -2204,16 +2383,22 @@ def select_requested_ship(
             if selected_key == ship_key:
                 _remember_selected_ship(ship_key)
                 return True
-            match = find_ship_card(image, ship_key)
+            match = find_builtin_ship_card(
+                image,
+                ship_key,
+                selection_backend,
+            )
             if match is not None:
                 break
     if match is None:
+        # A persisted last-selected value is only a hint for diagnostics. It
+        # must never authorize this run without a fresh click and right-upper
+        # detail-card confirmation.
         if current_selected_key is None and _last_confirmed_ship() == ship_key:
             logger.warning(
-                "滚动搜索后舰名区域仍暂不可读，沿用上次确认舰船: %s",
+                "滚动搜索后舰名区域仍暂不可读；忽略上次确认舰船 %s，未发出切船点击",
                 ship_key,
             )
-            return True
         return False
     point, score = match
     logger.info("按截图定位舰船 %s: local=%s score=%.3f", ship_key, point, score)
@@ -2221,15 +2406,22 @@ def select_requested_ship(
         return False
     global _LAST_SELECTED_CARD_POINT
     _LAST_SELECTED_CARD_POINT = tuple(point)
+    logger.info("已发出切船点击，开始读取右上角当前船卡复核: %s", ship_key)
     time.sleep(1.8)
     if _operation_paused(should_abort):
         return False
-    selected_key, confidence, source = detect_selected_ship(
-        _capture(hwnd),
+    verified, confidence, source = _verify_builtin_ship_after_click(
+        hwnd,
+        ship_key,
         selection_backend,
+        vision=vision,
+        should_abort=should_abort,
     )
-    if selected_key != ship_key:
-        logger.warning("舰船选择复核失败: %s", ship_key)
+    if not verified:
+        logger.warning(
+            "舰船选择复核失败（点击后右上角未连续确认）: %s",
+            ship_key,
+        )
         return False
     logger.info(
         "舰船选择复核成功: %s confidence=%.3f source=%s",
