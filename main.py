@@ -5,7 +5,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from bot import BattleBot
@@ -46,6 +46,7 @@ from port_navigator import (
     is_early_exit_confirmation_page,
     is_battle_survey_page,
     is_port_exit_confirmation_page,
+    port_battle_action_point,
     queue_next_battle,
     is_daily_reward_page,
     select_mode_from_screen,
@@ -288,9 +289,6 @@ def ensure_bound_game_foreground(bot: BattleBot) -> bool:
         return False
     current = int(getattr(bot, "hwnd", 0) or 0)
     if ensure_game_window_foreground(current):
-        # Returning from another app uses the game's normal maximized state;
-        # ShowWindow does not drag or reposition the window.
-        maximize_game_window(current)
         return True
     if not refresh_game_window(bot):
         return False
@@ -779,7 +777,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
             backend=getattr(getattr(bot, "distance_reader", None), "backend", None),
             should_abort=port_action_paused,
         ):
-            logger.warning("目标舰船缺少指挥官且自动召回失败")
+            logger.warning("目标舰船指挥官状态未完成复核或召回；等待重新识别")
             return False
         if not ensure_requested_mode(
             bot.hwnd,
@@ -875,6 +873,20 @@ def wait_for_battle(
                 battle_frames = 0
                 clock_frames = 0
                 continue
+            loading_action_detector = getattr(
+                bot.vision,
+                "_has_loading_start_action",
+                None,
+            )
+            if callable(loading_action_detector) and loading_action_detector(image):
+                # The roster/start-battle page can retain minimap-shaped and
+                # HUD-shaped decoration. It is still a loading phase: W/M/Esc
+                # are all forbidden until that action disappears on a fresh
+                # frame.
+                battle_frames = 0
+                clock_frames = 0
+                logger.debug("战斗外观仍带加载页开始按钮，暂不发送开局指令")
+                continue
             battle_frames += 1
             if (
                 require_new_round
@@ -903,14 +915,18 @@ def wait_for_battle(
                             exc_info=True,
                         )
                 if not opening_pose_ready:
-                    # A broad HUD colour match during roster/loading must not
-                    # consume this round's only M-map setup.  The real player
-                    # arrow is the positive evidence that ship controls and
-                    # the tactical map are ready to accept input.
-                    logger.debug("战斗外观已出现但玩家箭头未就绪，暂缓开局输入")
-                    battle_frames = 0
-                    clock_frames = 0
-                    continue
+                    # Pose availability is not the battle identity. Give the
+                    # marker a short grace period, then hand a stable HUD to
+                    # the battle controller without consuming its M-map setup.
+                    # The loading/start-action guard above remains mandatory.
+                    if battle_frames < 4:
+                        logger.debug("战斗 HUD 已出现，短暂等待玩家箭头，不重置场景确认")
+                        continue
+                    logger.warning(
+                        "战斗 HUD 已连续4帧确认，但玩家箭头暂不可用；"
+                        "结束入局等待，由战斗控制继续定位，不消耗 M 图尝试"
+                    )
+                    return True
                 # Start movement on the first reliable post-loading HUD frame.
                 # Clock OCR can take several seconds on its first GPU call, so
                 # start the engine immediately, then establish native
@@ -1247,6 +1263,22 @@ def run_battle(
         if quick_battle
         else None
     )
+    # A normal battle must also have an absolute upper bound.  If the scene
+    # classifier keeps reporting BATTLE after the match ended (result-page OCR
+    # never stabilises, a sunk ship is misread as alive, or the battle-HUD
+    # interlock misfires) the loop below would otherwise never return and the
+    # soft round/time limits would be deferred forever.
+    battle_strategy = getattr(bot, "strategy", None) or {}
+    max_battle_seconds = (
+        float(battle_strategy.get("max_battle_seconds", 2700.0))
+        if isinstance(battle_strategy, dict)
+        else 2700.0
+    )
+    battle_deadline = (
+        None
+        if quick_battle
+        else quick_started_at + max(60.0, max_battle_seconds)
+    )
     non_battle_frames = 0
     pause_observed = False
     while True:
@@ -1257,6 +1289,12 @@ def run_battle(
         if quick_deadline is not None and now >= quick_deadline:
             logger.info("快速战斗已运行五分钟，退出本局回港；不统计收益")
             return "quick_timeout"
+        if battle_deadline is not None and now >= battle_deadline:
+            logger.warning(
+                "战斗超过最长时限（%.0f 秒）仍未确认结束，强制结束本局",
+                max_battle_seconds,
+            )
+            return "battle_timeout"
         intervention = getattr(bot, "intervention", None)
         # Observe real keyboard input before any foreground switch. Otherwise
         # the first user keystroke can race with SetForegroundWindow and the
@@ -1353,8 +1391,10 @@ def run_battle(
             tick_result == "waiting"
             and last_analysis is not None
             and not bool(getattr(last_analysis, "in_battle", False))
-            and float(getattr(last_analysis, "health", 1.0)) > 0.01
         ):
+            # Cached zero HP persists after sinking, including on the survey
+            # overlay. Scene recovery must work for sunk ships as well; it
+            # does not close/count the round or authorize a return-to-port.
             non_battle_frames += 1
             if non_battle_frames >= 3:
                 logger.warning(
@@ -1693,6 +1733,8 @@ def configure_opening_autopilot(
                     # M does not open the tactical map.  Do not burn all three
                     # waypoint offsets against the roster page.
                     setattr(bot, "_tactical_map_left_open", False)
+                    setattr(bot, "_tactical_map_attempted_this_battle", False)
+                    setattr(bot, "_opening_autopilot_attempted", False)
                     logger.info(
                         "M 图尝试遇到战前队伍/开始战斗页；等待稳定战斗 HUD 后再导航"
                     )
@@ -1856,6 +1898,12 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
         "ship_xp": {},
         "free_xp": {},
     }
+    outcome_votes = {}
+
+    def confirmed_outcome():
+        confirmed = [name for name, count in outcome_votes.items() if count >= 2]
+        return confirmed[0] if len(confirmed) == 1 else "unknown"
+
     for attempt in range(max(1, attempts)):
         if operation_paused(bot):
             logger.info("[USER] 结算读取暂停，不切窗口、不继续 OCR")
@@ -1901,6 +1949,8 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
             last_state = ScreenState.BATTLE
         if not reward_surface:
             result_frames = 0
+            if not page_confirmed:
+                outcome_votes.clear()
             if attempt >= 1 and last_state in {ScreenState.BATTLE, ScreenState.PORT}:
                 break
             continue
@@ -1915,6 +1965,8 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
             # rewards instead of stopping the whole automation run.
             logger.warning("结算收益 OCR 暂时失败，继续读取后续帧: %s", error)
             continue
+        if rewards.outcome in {"victory", "defeat"}:
+            outcome_votes[rewards.outcome] = outcome_votes.get(rewards.outcome, 0) + 1
         if rewards.recognized or not fallback.recognized:
             fallback = rewards
         if page_confirmed:
@@ -1941,6 +1993,22 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
                 if confirmed:
                     consensus[field] = max(confirmed)[1]
             if len(consensus) == 3:
+                debug_dir = getattr(bot, "_debug_dir", None)
+                save_debug = getattr(bot.vision, "save_debug_frame", None)
+                if debug_dir is not None and save_debug is not None:
+                    save_debug(
+                        Path(debug_dir)
+                        / f"result_confirmed_{time.strftime('%H%M%S')}.png",
+                        image,
+                    )
+                logger.info(
+                    "结算 OCR 三列共识: values=%s raw=%s confidence=%s outcome=%s outcome_votes=%s",
+                    consensus,
+                    rewards.raw_text,
+                    rewards.confidence,
+                    confirmed_outcome(),
+                    outcome_votes,
+                )
                 return (
                     True,
                     BattleRewards(
@@ -1951,7 +2019,7 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
                         provider=rewards.provider,
                         confidence=rewards.confidence,
                         raw_text=rewards.raw_text,
-                        outcome=rewards.outcome,
+                        outcome=confirmed_outcome(),
                     ),
                     last_state,
                 )
@@ -1969,7 +2037,9 @@ def collect_battle_rewards(bot, reader: ResultRewardReader, attempts: int = 18):
                 / f"result_unrecognized_{time.strftime('%H%M%S')}.png",
                 image,
             )
-    return page_confirmed, fallback, last_state
+    if page_confirmed:
+        logger.info("结算胜负确认: outcome=%s votes=%s", confirmed_outcome(), outcome_votes)
+    return page_confirmed, replace(fallback, outcome=confirmed_outcome()), last_state
 
 
 def dismiss_battle_overlay(
@@ -2019,6 +2089,7 @@ def dismiss_battle_overlay(
 
 def return_to_port(bot: BattleBot, attempts: int = 5):
     logger.info("等待结算并返回港口")
+    unknown_escape_attempts = 0
     for attempt in range(1, attempts + 1):
         if operation_paused(bot):
             logger.info("[USER] 回港流程暂停，不切窗口、不发送 Esc")
@@ -2105,10 +2176,40 @@ def return_to_port(bot: BattleBot, attempts: int = 5):
             dismiss_battle_overlay(bot, state)
             return False
         else:
-            # Esc in a port-looking transition opens the client's quit-game
-            # confirmation. Unknown pages remain observation-only; every
-            # supported overlay has its own positive OCR/visual gate.
-            logger.info("未知页面缺少可验证操作，不发送 Esc；稍后重新识别")
+            # A leftover battle-type selector page is classified UNKNOWN (it
+            # has no join button), so the generic recovery never closes it and
+            # the loop can spin forever on the same selector.  Detect it here
+            # and Esc back to port, where selection starts over.
+            try:
+                if in_battle_type_selector(image, backend=backend):
+                    logger.info("识别到战斗模式选择页残留，发送 Esc 返回港口")
+                    if not operation_paused(bot) and ensure_capture_foreground(bot):
+                        escape = getattr(getattr(bot, "gamepad", None), "escape", None)
+                        if escape is not None:
+                            escape()
+                            acknowledge_automation_input(bot)
+                            time.sleep(0.8)
+                    continue
+            except Exception:
+                logger.debug("战斗模式选择页识别失败", exc_info=True)
+            # The user may land on an event/news/modal page that is not in the
+            # preset classifier. Use a bounded escape ladder, reclassifying
+            # after every key. If this was actually port, the resulting quit
+            # confirmation is positively detected above and cancelled with
+            # its verified “否” action instead of blindly pressing again.
+            if state == ScreenState.UNKNOWN and unknown_escape_attempts < 3:
+                escape = getattr(getattr(bot, "gamepad", None), "escape", None)
+                if escape is not None and ensure_capture_foreground(bot):
+                    unknown_escape_attempts += 1
+                    logger.warning(
+                        "未识别页面，发送 Esc 尝试返回港口 (%s/3)；下一帧重新识别",
+                        unknown_escape_attempts,
+                    )
+                    escape()
+                    acknowledge_automation_input(bot)
+                    time.sleep(0.8)
+                    continue
+            logger.info("未知页面已完成有限 Esc 兜底；保持识别且不再继续盲按")
         time.sleep(3)
     logger.warning("未能确认已返回港口；未执行盲点操作")
     return False
@@ -2180,11 +2281,28 @@ def recover_current_scene(
             # have transitioned or the bright battle HUD may have fooled the
             # broad port detector, but neither authorizes carousel clicks.
             # Only a confirmed settlement page clears the round lock.
-            logger.warning(
-                "本局尚未确认结算，忽略 %s 判定并禁止进入港口/选船流程",
-                state.value,
-            )
-            state = ScreenState.UNKNOWN
+            # A stable, OCR-confirmed ``加入战斗`` button is positive evidence
+            # that the game really returned to the port. This can happen when
+            # the result/survey transition is missed during a pause or focus
+            # loss. Keep the old fail-closed behaviour for colour-only port
+            # guesses, but do not deadlock forever on a real actionable port.
+            port_action = None
+            if state == ScreenState.PORT and backend is not None:
+                try:
+                    port_action = port_battle_action_point(image, backend)
+                except Exception:
+                    logger.debug("恢复时港口加入战斗 OCR 检查失败", exc_info=True)
+            if port_action is None:
+                logger.warning(
+                    "本局尚未确认结算，忽略 %s 判定并禁止进入港口/选船流程",
+                    state.value,
+                )
+                state = ScreenState.UNKNOWN
+            else:
+                logger.warning(
+                    "未读到结算页，但已连续恢复到 OCR 确认的港口加入战斗按钮；"
+                    "允许从当前港口继续，旧局收益/胜负保持未知",
+                )
 
         if state == ScreenState.UNKNOWN:
             previous_state = ScreenState.UNKNOWN
@@ -2220,13 +2338,26 @@ def dismiss_current_battle_survey(bot: BattleBot) -> bool:
         logger.info("评价页关闭前暂时无法取得画面: %s", error)
         return False
     backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
-    return dismiss_battle_survey(
+    dispatched = dismiss_battle_survey(
         bot.hwnd,
         image,
         backend=backend,
         should_abort=lambda: operation_paused(bot),
         escape_action=getattr(getattr(bot, "gamepad", None), "escape", None),
     )
+    if not dispatched:
+        return False
+    time.sleep(0.5)
+    if operation_paused(bot) or not ensure_capture_foreground(bot):
+        return False
+    try:
+        refreshed = bot.vision.grab(bot.hwnd, allow_stale=True)
+    except CaptureFault:
+        return False
+    if is_battle_survey_page(refreshed, backend=backend):
+        logger.info("评价页关闭指令已派发，但页面仍在；下一循环重新确认后重试")
+        return False
+    return classify_runtime_screen(bot, refreshed) != ScreenState.UNKNOWN
 
 
 def recover_after_battle_fault(
@@ -2320,6 +2451,8 @@ def wait_for_web_resume(
         if web_paused
         else "用户切屏"
         if trigger == "window_switch"
+        else "切屏后的鼠标操作"
+        if trigger == "background_mouse"
         else "用户键盘介入"
     )
     logger.info("[USER] %s；冻结自动流程并保留舰船操纵状态", source)
@@ -2352,7 +2485,9 @@ def wait_for_web_resume(
                 )
             )
             resume_source = (
-                "网页点击继续" if resumed_by_web else "连续5秒无新的切屏或键盘操作"
+                "网页点击继续"
+                if resumed_by_web
+                else "连续5秒无新的切屏、键盘或后台鼠标操作"
             )
             if (
                 bot is not None
@@ -2405,10 +2540,10 @@ def wait_for_web_resume(
             and intervention.latched
         ):
             latch_reported = True
-            logger.warning("[USER] 持续键盘介入达到20秒，已锁定暂停并等待网页继续")
+            logger.warning("[USER] 持续用户操作达到20秒，已锁定暂停并等待网页继续")
             reporter.update(
                 "paused",
-                "持续键盘介入达到20秒，需在网页点击继续",
+                "持续用户操作达到20秒，需在网页点击继续",
                 paused_by_user=True,
                 manual_intervention_latched=True,
                 movement_mode="manual_pause",
@@ -2672,8 +2807,17 @@ def run():
     completed_rounds = 0
     current_round = 0
     port_configured = False
+    # Ship selection is a task-level setup, not a per-round action.  Once the
+    # first battle has been positively entered, keep the confirmed ship locked
+    # and let later rounds use the same selected card from port without
+    # scrolling the carousel again.  This also prevents a transient result/
+    # loading classification from sending the workflow back into ship search.
+    ship_locked = False
     preparation_failures = 0
     battle_recovery_failures = 0
+    battle_timeout_count = 0
+    quick_closure_failures = 0
+    daily_reward_failures = 0
     # Once matchmaking/loading/battle has been committed, PORT is not allowed
     # to start selection again until settlement positively closes this round.
     round_in_progress = False
@@ -2771,6 +2915,7 @@ def run():
                 round_result_seen = False
                 round_entry_pending = False
                 round_in_progress = True
+                ship_locked = True
                 setattr(bot, "_round_control_initialized", False)
                 current_round = completed_rounds + 1
                 logger.info(
@@ -2849,6 +2994,7 @@ def run():
                     round_entry_pending = False
                     round_in_progress = True
                 prepared = True
+                ship_locked = True
                 resuming_this_battle = bool(
                     getattr(bot, "_round_control_initialized", False)
                 )
@@ -2878,6 +3024,7 @@ def run():
                 if prepared:
                     round_entry_pending = False
                     round_in_progress = True
+                    ship_locked = True
             elif current_scene == ScreenState.DAILY_REWARD:
                 logger.info("当前处于每日奖励页：领取后回港并重新开始准备")
                 backend = getattr(
@@ -2890,7 +3037,35 @@ def run():
                     confirm_action=getattr(bot.gamepad, "confirm", None),
                     close_action=getattr(bot.gamepad, "escape", None),
                 ):
+                    daily_reward_failures = 0
                     time.sleep(1.0)
+                else:
+                    daily_reward_failures += 1
+                    logger.warning(
+                        "每日奖励本次未能确认领取 (%s/%s)；保留页面等待重试",
+                        daily_reward_failures,
+                        3,
+                    )
+                    if daily_reward_failures >= 3:
+                        # A permanently unclickable reward page must not stall
+                        # the whole plan.  Esc leaves it unclaimed but keeps
+                        # the task alive; the failure stays visible in logs.
+                        logger.warning(
+                            "每日奖励连续 3 次无法领取，强制关闭页面并继续任务"
+                        )
+                        if not operation_paused(bot):
+                            escape = getattr(bot.gamepad, "escape", None)
+                            if escape is not None:
+                                try:
+                                    escape()
+                                    acknowledge_automation_input(bot)
+                                    time.sleep(0.8)
+                                except Exception:
+                                    logger.warning(
+                                        "每日奖励强制关闭失败，保留页面由下一轮重试",
+                                        exc_info=True,
+                                    )
+                        daily_reward_failures = 0
                 return_to_port(bot, attempts=4)
                 port_configured = False
                 continue
@@ -2982,10 +3157,12 @@ def run():
                         )
                         return 0
                     continue
-                # In the port we must always validate the selected ship and
-                # battle mode before joining.  Do not retain a stale success
-                # flag from a prior round.
-                configured_this_attempt = True
+                # Select/configure the ship only once per task.  After a
+                # confirmed battle entry the ship lock is authoritative for
+                # later rounds; the port path then only starts the next match.
+                configured_this_attempt = not ship_locked
+                if not configured_this_attempt:
+                    logger.info("本任务舰船已锁定：本轮港口只进入战斗，不重新选船或滚动舰船栏")
                 try:
                     battle_queued = prepare_battle(
                         bot,
@@ -3011,6 +3188,7 @@ def run():
                 if prepared:
                     round_entry_pending = False
                     round_in_progress = True
+                    ship_locked = True
             else:
                 if round_in_progress or round_entry_pending:
                     logger.warning(
@@ -3051,12 +3229,14 @@ def run():
                     round_entry_pending = False
                     round_in_progress = True
                     round_result_seen = False
+                    ship_locked = True
                     logger.info("准备恢复确认已在战斗中，下一循环直接接管")
                     preparation_failures = 0
                     continue
                 if recovered_state == ScreenState.LOADING:
-                    round_entry_pending = False
-                    round_in_progress = True
+                    # Loading is not round identity.  A queue can be cancelled
+                    # or a reconnect can fall back to port; only stable battle
+                    # HUD evidence is allowed to acquire the active-round lock.
                     logger.info("准备恢复确认正在加载，继续等待战斗 HUD")
                     preparation_failures = 0
                     reporter.update(
@@ -3077,6 +3257,10 @@ def run():
                                 getattr(bot, "_round_control_initialized", False)
                             ),
                         ):
+                            round_entry_pending = False
+                            round_in_progress = True
+                            round_result_seen = False
+                            ship_locked = True
                             logger.info("加载恢复已确认 HUD，下一循环直接进入战斗")
                             continue
                     except (SafetyFault, CaptureFault) as error:
@@ -3423,6 +3607,46 @@ def run():
                 if battle_finished:
                     battle_recovery_failures = 0
 
+            if battle_finished == "battle_timeout":
+                # The watchdog ended a battle that never produced a confirmed
+                # result page.  Force a port return without counting the round
+                # and keep the plan running; after repeated timeouts stop the
+                # task instead of looping the same stuck match forever.
+                battle_timeout_count += 1
+                reporter.update(
+                    "returning",
+                    "战斗超过最长时限，正在强制返回港口；本局不计数",
+                    current_round=current_round,
+                    completed_rounds=completed_rounds,
+                    rewards_status="skipped",
+                    rewards_round=0,
+                    last_rewards={},
+                )
+                closure_confirmed = return_to_port(bot, attempts=6)
+                if closure_confirmed:
+                    battle_timeout_count = 0
+                    round_in_progress = False
+                    round_entry_pending = False
+                    round_result_seen = False
+                    setattr(bot, "_round_control_initialized", False)
+                    port_configured = False
+                    logger.info("战斗超时保护：已返回港口，本局不计数，继续执行计划")
+                    continue
+                if battle_timeout_count >= 2:
+                    logger.error(
+                        "战斗连续 %s 次超时且无法返回港口，终止任务防止无限循环",
+                        battle_timeout_count,
+                    )
+                    raise RuntimeError(
+                        "战斗连续超时且无法返回港口，已安全终止任务"
+                    )
+                logger.warning(
+                    "战斗超时后回港尚未确认（%s/%s），重新识别场景",
+                    battle_timeout_count,
+                    2,
+                )
+                continue
+
             if battle_finished in QUICK_BATTLE_COMPLETION_REASONS:
                 # Quick mode has explicit closure paths and never enters reward
                 # OCR: timeout/HP=0 -> two-step forced port exit; natural result
@@ -3479,8 +3703,12 @@ def run():
                         ScreenState.PORT,
                     }
                 if not closure_confirmed:
+                    quick_closure_failures += 1
                     logger.warning(
-                        "快速战斗尚未确认离开当前对局，本局不计数并重新判断场景"
+                        "快速战斗尚未确认离开当前对局，本局不计数并重新判断场景 "
+                        "(%s/%s)",
+                        quick_closure_failures,
+                        3,
                     )
                     reporter.update(
                         "recovering",
@@ -3491,12 +3719,17 @@ def run():
                         rewards_round=0,
                         last_rewards={},
                     )
+                    if quick_closure_failures >= 3:
+                        raise RuntimeError(
+                            "快速战斗连续 3 次无法确认离开本局，已安全终止任务"
+                        )
                     continue
                 completed_rounds = count_quick_battle_for_plan(
                     completed_rounds,
                     battle_finished,
                     closure_confirmed=True,
                 )
+                quick_closure_failures = 0
                 finalize_round_diagnostics(
                     bot,
                     current_round,
@@ -3574,6 +3807,7 @@ def run():
                     ):
                         round_entry_pending = False
                         round_in_progress = True
+                        ship_locked = True
                         continue
                     logger.warning("快速续局已点击，但新一局 HUD 尚未确认；重新识别")
                 continue
@@ -3650,6 +3884,13 @@ def run():
                 if post_battle_state == ScreenState.BATTLE:
                     round_result_seen = False
                     logger.info("战斗仍在进行，下一循环继续当前战斗")
+                    # collect_battle_rewards closed the async OCR service while
+                    # the settlement page was still not confirmed; this same
+                    # battle re-enters without bot.reset(), so rebuild it or the
+                    # next combat tick submits to a shutdown executor.
+                    rebuild = getattr(bot, "rebuild_distance_ocr", None)
+                    if rebuild is not None:
+                        rebuild()
                 else:
                     logger.warning("异常/未知页面优先尝试返回港口")
                     return_to_port(bot)
@@ -3728,8 +3969,25 @@ def run():
                     current_round=current_round,
                     completed_rounds=completed_rounds,
                 )
-                return_to_port(bot)
-                time.sleep(2)
+                returned_to_port = return_to_port(bot, attempts=5)
+                if not returned_to_port:
+                    time.sleep(2)
+                    returned_to_port = return_to_port(bot, attempts=5)
+                if not returned_to_port:
+                    reporter.update(
+                        "failed",
+                        "计划局数已完成，但连续两次未能确认返回港口",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        error="plan_complete_port_unconfirmed",
+                        movement_mode="idle",
+                        movement_reason="已释放控制；等待人工确认当前页面",
+                        paused_by_user=False,
+                        manual_intervention_active=False,
+                        manual_intervention_latched=False,
+                    )
+                    logger.error("计划完成后连续两次未确认返回港口，不再误报完成")
+                    return 1
                 reporter.update(
                     "completed",
                     "运行计划已完成",
@@ -3806,6 +4064,7 @@ def run():
                 if recovered_state == ScreenState.BATTLE:
                     round_entry_pending = False
                     round_in_progress = True
+                    ship_locked = True
                     logger.info("下一局 HUD 已确认，下一循环重新确认场景后接管")
                 elif recovered_state == ScreenState.RESULTS:
                     round_entry_pending = False

@@ -100,10 +100,35 @@ def test_battle_entry_never_bypasses_no_commander_warning():
         assert not port_navigator._observe_battle_entry(
             7,
             NoCommanderVision(),
-            samples=1,
+            samples=2,
+            interval=0,
         )
 
     click_region.assert_not_called()
+
+
+def test_loading_state_wins_over_false_no_commander_shape():
+    loading = np.full((1000, 1600, 3), 20, dtype=np.uint8)
+
+    class LoadingVision:
+        @staticmethod
+        def in_no_commander_confirmation(_image):
+            return True
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.LOADING
+
+    with (
+        patch("port_navigator._capture", return_value=loading),
+        patch("port_navigator.time.sleep", return_value=None),
+    ):
+        assert port_navigator._observe_battle_entry(
+            7,
+            LoadingVision(),
+            samples=1,
+            interval=0,
+        )
 
 
 def test_confirm_no_commander_is_a_read_only_fail_closed_guard():
@@ -209,7 +234,7 @@ def test_no_commander_recall_requires_card_and_menu_text_before_click():
             "port_navigator.is_selected_ship_without_commander",
             side_effect=[True, False],
         ),
-        patch("port_navigator.find_ship_card", return_value=((400, 850), 0.95)),
+        patch("port_navigator.find_ship_card_without_commander", return_value=(400, 850)),
         patch("port_navigator._right_click_local", return_value=True) as right_click,
         patch(
             "port_navigator._find_recall_commander_action",
@@ -247,3 +272,61 @@ def test_no_commander_recall_rejects_wrong_selected_ship():
     no_commander.assert_not_called()
     right_click.assert_not_called()
     click.assert_not_called()
+
+
+def test_commander_recall_requires_both_no_commander_indicators_even_with_open_menu():
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    with (
+        patch("port_navigator._capture", return_value=frame),
+        patch("port_navigator.is_requested_ship_selected", return_value=True),
+        patch("port_navigator.is_selected_ship_without_commander", return_value=True),
+        patch("port_navigator.find_ship_card_without_commander", return_value=None),
+        patch("port_navigator._find_recall_commander_action", return_value=(360, 760)),
+        patch("port_navigator._right_click_local") as right_click,
+        patch("port_navigator._click_local") as click,
+    ):
+        assert not port_navigator.ensure_selected_ship_commander(7, "napoli")
+    right_click.assert_not_called()
+    click.assert_not_called()
+
+
+def test_ship_with_commander_does_not_inspect_other_carousel_warnings():
+    with (
+        patch("port_navigator._capture", return_value=np.zeros((1000, 1600, 3), dtype=np.uint8)),
+        patch("port_navigator.is_requested_ship_selected", return_value=True),
+        patch("port_navigator.is_selected_ship_without_commander", return_value=False),
+        patch("port_navigator.find_ship_card_without_commander") as card,
+        patch("port_navigator._right_click_local") as right_click,
+    ):
+        assert port_navigator.ensure_selected_ship_commander(7, "napoli")
+    card.assert_not_called()
+    right_click.assert_not_called()
+
+
+def test_carousel_warning_belongs_to_named_card_at_multiple_ui_scales():
+    for scale in (0.75, 1.0, 1.5):
+        def token(text, x, y, width, confidence=0.98):
+            box = tuple((int(a * scale), int(b * scale)) for a, b in (
+                (x, y), (x + width, y), (x + width, y + 14), (x, y + 14)
+            ))
+            return OcrToken(text, confidence, box)
+
+        class Backend:
+            tokens = [
+                token("没有指挥官", 40, 70, 85),
+                token("波美拉尼亚", 120, 87, 85),
+                token("那不勒斯", 350, 87, 65),
+            ]
+
+            def recognize(self, image):
+                return self.tokens
+
+        frame = np.zeros((int(1000 * scale), int(1600 * scale), 3), dtype=np.uint8)
+        backend = Backend()
+        assert port_navigator.find_ship_card_without_commander(frame, "pommern", None, backend)
+        assert port_navigator.find_ship_card_without_commander(frame, "napoli", None, backend) is None
+        backend.tokens.append(token("无指挥官", 265, 70, 70))
+        assert port_navigator.find_ship_card_without_commander(frame, "napoli", None, backend)
+        assert port_navigator.find_ship_card_without_commander(frame, "custom", "那不勒斯", backend)
+        backend.tokens[-1] = token("无指挥官", 265, 70, 70, confidence=0.40)
+        assert port_navigator.find_ship_card_without_commander(frame, "napoli", None, backend) is None

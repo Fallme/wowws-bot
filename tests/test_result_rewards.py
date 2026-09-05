@@ -74,6 +74,19 @@ def test_result_reward_reader_rejects_missing_credit_value():
     assert not rewards.recognized
 
 
+def test_defeat_headline_ocr_overrides_gold_ship_text_and_background():
+    from types import SimpleNamespace
+    image = np.zeros((900, 1600, 3), dtype=np.uint8)
+    image[100:200, 100:480] = (50, 190, 250)
+    backend = SimpleNamespace(recognize=lambda _: [
+        OcrToken("失败！", .99, ((150, 100), (290, 100), (290, 160), (150, 160))),
+        OcrToken("胜利", .99, ((150, 220), (180, 220), (180, 232), (150, 232))),
+    ])
+    assert ResultRewardReader.read_outcome(image, backend) == "defeat"
+    backend.recognize = lambda _: []
+    assert ResultRewardReader.read_outcome(image, backend) == "unknown"
+
+
 def test_result_reward_reader_rejects_clipped_one_digit_credit_fragment():
     class ClippedBackend:
         def __init__(self):
@@ -284,3 +297,53 @@ def test_numeric_reward_ocr_retries_enhanced_crop_after_missing_original():
     assert value == 198_363
     assert confidence >= 0.90
     assert reader.backend.calls == 2
+
+
+def test_free_xp_does_not_join_star_icon_read_as_two():
+    class IconPrefixBackend:
+        execution_provider = "CUDAExecutionProvider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("145", 0.99, ((10, 0),)), OcrToken("360", 0.98, ((80, 0),))],
+                [OcrToken("1", 0.98, ((10, 0),)), OcrToken("719", 0.97, ((40, 0),))],
+                [OcrToken("2", 0.91, ((5, 0),)), OcrToken("295☆", 0.97, ((35, 0),))],
+            )
+            value = values[self.calls]
+            self.calls += 1
+            return value
+
+    rewards = ResultRewardReader(IconPrefixBackend()).read(
+        np.full((1494, 2560, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.ship_xp == 1_719
+    assert rewards.free_xp == 295
+
+
+def test_free_xp_repairs_icon_merged_into_one_token():
+    class MergedIconBackend:
+        execution_provider = "CUDAExecutionProvider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            values = (
+                [OcrToken("132 776", 0.99, ((10, 0),))],
+                [OcrToken("1 425", 0.98, ((10, 0),))],
+                [OcrToken("2295☆", 0.96, ((10, 0),))],
+            )
+            value = values[self.calls]
+            self.calls += 1
+            return value
+
+    rewards = ResultRewardReader(MergedIconBackend()).read(
+        np.full((1494, 2560, 3), 80, dtype=np.uint8)
+    )
+
+    assert rewards.ship_xp == 1_425
+    assert rewards.free_xp == 295

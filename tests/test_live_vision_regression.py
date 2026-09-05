@@ -4,7 +4,12 @@ import pytest
 from pathlib import Path
 
 from core.ocr import OcrToken, RapidOcrBackend
-from core.ui import NO_COMMANDER_CONFIRM_BUTTON
+from core.ui import (
+    FIRE_DIAL_ROI,
+    FIRE_SHIP_ROI,
+    FIRE_STATUS_ROI,
+    NO_COMMANDER_CONFIRM_BUTTON,
+)
 from core.vision import PlayerPose, Vision
 
 
@@ -352,6 +357,37 @@ def test_player_arrow_silhouette_beats_capture_glyph_in_stronger_ring():
     assert pose.position[1] == pytest.approx(player[1], abs=3)
 
 
+@pytest.mark.parametrize("width", [1920, 2560, 3840])
+def test_live_arrow_without_yellow_range_ring(width):
+    image = cv2.imread(str(Path(__file__).parent / "fixtures" / "autopilot_no_yellow_ring.png"))
+    assert image is not None
+    image = cv2.resize(image, (width, round(image.shape[0] * width / image.shape[1])))
+    vision = Vision(screen_capture=object())
+    minimap = vision.find_minimap(image)
+    pose = vision.find_player_pose_on_minimap(minimap)
+    assert pose is not None
+    assert pose.position[0] / minimap.shape[1] == pytest.approx(177 / 691, abs=0.008)
+    assert pose.position[1] / minimap.shape[0] == pytest.approx(88 / 650, abs=0.008)
+    assert pose.heading[1] > 0.9
+
+
+def test_two_white_arrows_without_range_evidence_are_ambiguous():
+    minimap = np.full((650, 690, 3), 35, dtype=np.uint8)
+    for x in (200, 400):
+        cv2.fillConvexPoly(minimap, np.array([[x, 100], [x - 7, 118], [x + 7, 118]]), (245, 245, 245))
+    assert Vision(screen_capture=object()).find_player_pose_on_minimap(minimap) is None
+
+
+@pytest.mark.parametrize("color", [(140, 210, 140), (245, 245, 245)])
+def test_no_ring_fallback_rejects_colored_arrow_and_white_rectangle(color):
+    minimap = np.full((650, 690, 3), 35, dtype=np.uint8)
+    if color == (245, 245, 245):
+        cv2.rectangle(minimap, (200, 100), (214, 118), color, -1)
+    else:
+        cv2.fillConvexPoly(minimap, np.array([[207, 100], [200, 118], [214, 118]]), color)
+    assert Vision(screen_capture=object()).find_player_pose_on_minimap(minimap) is None
+
+
 def test_live_island_signal_detects_terrain_in_the_corrected_bow_direction(live_frame):
     vision = Vision()
     minimap = vision.find_minimap(live_frame)
@@ -565,6 +601,24 @@ def test_autopilot_status_uses_ocr_text_box_colour_not_broad_green_hud():
     assert Vision.read_autopilot_enabled_text(image, Backend())
 
 
+def test_autopilot_status_reports_unreadable_separately_from_absent():
+    image = np.zeros((1600, 2560, 3), dtype=np.uint8)
+
+    class FailingBackend:
+        @staticmethod
+        def recognize(_image):
+            raise RuntimeError("ocr unavailable")
+
+    class EmptyBackend:
+        @staticmethod
+        def recognize(_image):
+            return []
+
+    assert Vision.read_autopilot_enabled_text(image, None) is None
+    assert Vision.read_autopilot_enabled_text(image, FailingBackend()) is None
+    assert Vision.read_autopilot_enabled_text(image, EmptyBackend()) is False
+
+
 def test_no_commander_detector_requires_confirm_button():
     image = np.full((1000, 1600, 3), 75, dtype=np.uint8)
     image[360:660, 480:1120] = 40
@@ -577,32 +631,166 @@ def test_no_commander_detector_requires_confirm_button():
     assert not Vision().in_no_commander_confirmation(image)
 
 
-def test_fire_requires_both_ship_model_and_consumable_status_anchors():
+FIRE_FIXTURES = [
+    "fire_dual_anchor.jpg",
+    "fire_live_siberia.jpg",
+    "fire_live_1080p.jpg",
+    "fire_live_2k.jpg",
+]
+
+
+def _draw_fire_droplet(image, cx, cy, stem_color=(0, 90, 160), blob_color=(0, 128, 255)):
+    """Draw the HUD flame marker: pin stem + round head with a darker core.
+
+    Both tones stay inside the orange mask (H < 40, S/V >= 110), so the
+    component develops a value gradient instead of the flat profile of a
+    solid dot, and the fill/wh geometry matches the droplet gates.
+    """
+    cv2.rectangle(image, (cx - 4, cy - 16), (cx + 4, cy - 4), stem_color, -1)
+    cv2.circle(image, (cx, cy + 2), 9, blob_color, -1)
+
+
+@pytest.mark.parametrize("name", FIRE_FIXTURES)
+def test_fire_detected_across_resolutions(name):
+    """Real burning-ship frames: dial marker and viewport droplets must both
+    confirm, and is_on_fire must follow the dial anchor."""
+    fire = cv2.imread(str(Path("tests") / "fixtures" / name))
+    assert fire is not None
+    vision = Vision()
+    assert vision.fire_anchor_bits(fire) == (True, True)
+    assert vision.is_on_fire(fire)
+
+
+def test_fire_rejects_centre_screen_orange_fragments():
     image = np.zeros((1600, 2560, 3), dtype=np.uint8)
-    # Old centre-screen false positive: two orange target/tracer fragments.
+    # Two orange target/tracer fragments near the middle of the viewport.
     image[790:810, 1260:1280] = (0, 145, 255)
     image[820:840, 1300:1320] = (0, 145, 255)
     assert not Vision().is_on_fire(image)
 
+
+def test_fire_dial_marker_alone_does_not_confirm_fire():
+    """A dial-only droplet is diagnostic evidence, not enough to spend R."""
+    image = np.full((1600, 2560, 3), 200, dtype=np.uint8)
+    cx = int(2560 * (FIRE_DIAL_ROI.left + FIRE_DIAL_ROI.right) / 2)
+    cy = int(1600 * (FIRE_DIAL_ROI.top + FIRE_DIAL_ROI.bottom) / 2)
+    _draw_fire_droplet(image, cx, cy)
+    dial, ship = Vision().fire_anchor_bits(image)
+    assert dial
+    assert not ship
+    assert not Vision().is_on_fire(image)
+
+
+def test_fire_status_countdown_card_confirms_fire_without_dial_anchor():
+    image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+    x1, y1, _x2, _y2 = FIRE_STATUS_ROI.pixels(2560, 1494)
+    # Representative red condition card above the consumable row.
+    cv2.rectangle(image, (x1 + 35, y1 + 35), (x1 + 82, y1 + 82), (0, 55, 190), -1)
+    cv2.circle(image, (x1 + 50, y1 + 58), 7, (15, 15, 15), -1)
+    cv2.circle(image, (x1 + 68, y1 + 58), 7, (15, 15, 15), -1)
+
+    vision = Vision()
+    assert vision.fire_anchor_bits(image) == (False, False)
+    assert vision.fire_status_icon_visible(image)
+    assert vision.is_on_fire(image)
+
+
+def test_red_tracer_through_status_strip_does_not_confirm_fire():
+    image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+    x1, y1, x2, y2 = FIRE_STATUS_ROI.pixels(2560, 1494)
+    cv2.line(image, (x1, y2 - 5), (x2, y1 + 5), (0, 40, 220), 3)
+
+    assert not Vision().fire_status_icon_visible(image)
+    assert not Vision().is_on_fire(image)
+
+
+def test_fire_dial_anchor_rejects_solid_round_marker():
+    """A solid orange dot on the dial plate is a module dot, not a flame
+    droplet: bounding-box fill ~pi/4 and zero value gradient fail the
+    droplet gates even on a bright plate (so the ring check is not what
+    rejects it)."""
+    image = np.full((1600, 2560, 3), 200, dtype=np.uint8)
+    cx = int(2560 * (FIRE_DIAL_ROI.left + FIRE_DIAL_ROI.right) / 2)
+    cy = int(1600 * (FIRE_DIAL_ROI.top + FIRE_DIAL_ROI.bottom) / 2)
+    cv2.circle(image, (cx, cy), 12, (0, 165, 255), -1)
+    dial, _ship = Vision().fire_anchor_bits(image)
+    assert not dial
+
+
+def test_fire_dial_anchor_rejects_consumable_diamond_badge():
+    """Diamond consumable-slot badges are dull orange (mean S ~125): they
+    must not pass the vivid-droplet saturation gate.  The diamond geometry
+    (fill 0.5) and the two-tone value gradient are deliberately within the
+    droplet envelope so rejection comes from S_MIN alone."""
+    image = np.full((1600, 2560, 3), 200, dtype=np.uint8)
+    cx = int(2560 * (FIRE_DIAL_ROI.left + FIRE_DIAL_ROI.right) / 2)
+    cy = int(1600 * (FIRE_DIAL_ROI.top + FIRE_DIAL_ROI.bottom) / 2)
+    cv2.fillPoly(
+        image,
+        [np.array([[cx, cy - 16], [cx + 16, cy], [cx, cy + 16], [cx - 16, cy]])],
+        (100, 150, 200),
+    )
+    cv2.fillPoly(
+        image,
+        [np.array([[cx, cy], [cx + 16, cy], [cx, cy + 16], [cx - 16, cy]])],
+        (55, 82, 110),
+    )
+    dial, _ship = Vision().fire_anchor_bits(image)
+    assert not dial
+
+
+def test_fire_dial_anchor_rejects_text_glyph_row():
+    """Port scoreboard/carousel digits can pass every single-blob gate but
+    line up in a uniform-pitch row: has_text_row must reject all of them."""
+    image = np.full((1600, 2560, 3), 200, dtype=np.uint8)
+    y = int(1600 * FIRE_DIAL_ROI.top) + 8
+    for i, cx in enumerate(range(60, 60 + 3 * 40, 40)):
+        _draw_fire_droplet(image, cx, y + 16)
+    dial, _ship = Vision().fire_anchor_bits(image)
+    assert not dial
+
+
+def test_fire_ship_anchor_ignores_minimap_and_feed_markers():
+    """Minimap fire markers, capture-point icons and damage-feed crosses
+    live right of the ship ROI edge (x >= 0.75); even a perfect droplet
+    there must not confirm the viewport anchor."""
+    image = np.zeros((1600, 2560, 3), dtype=np.uint8)
+    _draw_fire_droplet(image, int(2560 * 0.79), int(1600 * 0.75))
+    dial, ship = Vision().fire_anchor_bits(image)
+    assert not dial
+    assert not ship
+
+
+def test_fire_anchor_bits_report_which_anchor_is_missing():
+    """fire_anchor_bits must tell callers which HUD anchor failed, so live
+    diagnostics can distinguish a missing dial marker from missing viewport
+    flames."""
     fire = cv2.imread(str(Path("tests") / "fixtures" / "fire_dual_anchor.jpg"))
     assert fire is not None
     vision = Vision()
-    assert vision.is_on_fire(fire)
-
     height, width = fire.shape[:2]
-    without_left_anchor = fire.copy()
-    without_left_anchor[
-        int(height * 0.865) : int(height * 0.930),
-        int(width * 0.025) : int(width * 0.105),
-    ] = 0
-    assert not vision.is_on_fire(without_left_anchor)
 
-    without_center_anchor = fire.copy()
-    without_center_anchor[
-        int(height * 0.815) : int(height * 0.905),
-        int(width * 0.470) : int(width * 0.540),
+    assert vision.fire_anchor_bits(fire) == (True, True)
+
+    no_dial = fire.copy()
+    no_dial[
+        int(height * FIRE_DIAL_ROI.top) : int(height * FIRE_DIAL_ROI.bottom),
+        int(width * FIRE_DIAL_ROI.left) : int(width * FIRE_DIAL_ROI.right),
     ] = 0
-    assert not vision.is_on_fire(without_center_anchor)
+    assert vision.fire_anchor_bits(no_dial) == (False, True)
+    assert not vision.is_on_fire(no_dial)
+
+    no_ship = fire.copy()
+    no_ship[
+        int(height * FIRE_SHIP_ROI.top) : int(height * FIRE_SHIP_ROI.bottom),
+        int(width * FIRE_SHIP_ROI.left) : int(width * FIRE_SHIP_ROI.right),
+    ] = 0
+    assert vision.fire_anchor_bits(no_ship) == (True, False)
+
+    assert vision.fire_anchor_bits(np.zeros((90, 160, 3), np.uint8)) == (
+        False,
+        False,
+    )
 
 
 def test_flooding_requires_blue_icons_below_health_and_above_consumables():

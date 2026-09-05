@@ -80,6 +80,7 @@ class SendInputBackend:
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
         self.last_injected_tick_ms: int | None = None
+        self.injection_generation = 0
         # Keep every keyboard edge in the current command, not just the final
         # one.  A full-speed resynchronization spans several hundred
         # milliseconds; LASTINPUTINFO may expose any one of those edges while
@@ -89,6 +90,7 @@ class SendInputBackend:
     def _mark_injected(self, *, keyboard: bool = False):
         tick = int(self.kernel32.GetTickCount())
         self.last_injected_tick_ms = tick
+        self.injection_generation += 1
         if keyboard:
             self.recent_injected_key_ticks_ms.append(tick)
 
@@ -148,6 +150,7 @@ class KeyboardController:
         self.dispatch_count = 0
         self._automation_observer = None
         self._last_observed_injected_tick_ms: int | None = None
+        self._last_observed_injection_generation: int | None = None
 
     @staticmethod
     def _clamp(value: float) -> float:
@@ -176,11 +179,18 @@ class KeyboardController:
             rudder_notch=self._rudder_notch,
         )
         injected_tick = self.last_injected_tick_ms
-        if (
-            injected_tick is not None
+        injection_generation = getattr(self.device, "injection_generation", None)
+        has_new_injection = (
+            injection_generation is not None
+            and injection_generation != self._last_observed_injection_generation
+        ) or (
+            injection_generation is None
+            and injected_tick is not None
             and injected_tick != self._last_observed_injected_tick_ms
-        ):
+        )
+        if injected_tick is not None and has_new_injection:
             self._last_observed_injected_tick_ms = injected_tick
+            self._last_observed_injection_generation = injection_generation
             observer = self._automation_observer
             if observer is not None:
                 try:

@@ -147,10 +147,15 @@ def running_game_requires_elevation(
         * max(0, item[2][3] - item[2][1]),
     )
     process_id = ctypes.wintypes.DWORD()
-    ctypes.windll.user32.GetWindowThreadProcessId(
-        int(hwnd),
-        ctypes.byref(process_id),
+    user32 = ctypes.windll.user32
+    get_thread_window = user32.GetWindowThreadProcessId
+    # Without explicit argtypes the 64-bit HWND would be truncated to 32 bits.
+    get_thread_window.argtypes = (
+        ctypes.wintypes.HWND,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
     )
+    get_thread_window.restype = ctypes.wintypes.DWORD
+    get_thread_window(int(hwnd), ctypes.byref(process_id))
     return elevation_reader(int(process_id.value or 0)) is True
 
 
@@ -642,7 +647,9 @@ class ControlStore:
                     rewards_recognized, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(run_id, round_no) DO UPDATE SET
-                     outcome=excluded.outcome,
+                     outcome=CASE WHEN excluded.outcome = 'unknown'
+                                  THEN battle_history.outcome
+                                  ELSE excluded.outcome END,
                      credits=excluded.credits,
                      ship_xp=excluded.ship_xp,
                      free_xp=excluded.free_xp,
@@ -1153,6 +1160,12 @@ class ControlHandler(SimpleHTTPRequestHandler):
 
     def log_message(self, format, *args):
         return
+
+    def end_headers(self):
+        # This is a local live-control surface. Do not keep an older app.js in
+        # browser cache: Start must always change into Pause/Continue at once.
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        super().end_headers()
 
     def _json(self, payload, status=HTTPStatus.OK):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -79,6 +79,27 @@ def test_completed_native_dispatch_notifies_automation_observer_once():
     assert observed == [controller]
 
 
+def test_same_millisecond_native_dispatches_each_notify_observer():
+    class SameTickBackend(RecordingBackend):
+        last_injected_tick_ms = None
+        injection_generation = 0
+
+        def tap(self, key):
+            super().tap(key)
+            self.last_injected_tick_ms = 100
+            self.injection_generation += 1
+
+    backend = SameTickBackend()
+    controller = KeyboardController(backend)
+    observed = []
+    controller.set_automation_observer(observed.append)
+
+    controller.full_speed()
+    controller.damage_control()
+
+    assert observed == [controller, controller]
+
+
 @pytest.mark.parametrize("actual_notch", range(-4, 5))
 def test_reduction_never_crosses_stop_when_cached_and_actual_telegraph_disagree(
     actual_notch,

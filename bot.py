@@ -14,6 +14,7 @@ from core.events import EventBus, JsonlEventRecorder
 from core.input import create_input_controller
 from core.feedback import MovementFeedbackMonitor, SafetyFault
 from core.intervention import UserInterventionMonitor
+from core.survival import HealthLossTracker
 from core.ocr import (
     DistanceOcrService,
     DistanceTrackFilter,
@@ -97,6 +98,7 @@ class BattleAnalysis:
     speed_knots: float | None = None
     autopilot_enabled: bool = False
     autopilot_confirmed: bool = False
+    autopilot_hud_visible: bool | None = None
     rudder_indicator: str = "neutral"
     player_pose_cached: bool = False
 
@@ -339,6 +341,7 @@ class BattleBot:
         self.battle_start_time = 0.0
         self._cached_health = 1.0
         self._health_ocr_valid = False
+        self._health_loss_tracker = HealthLossTracker()
         self._cached_speed_knots: float | None = None
         self._cached_speed_observed_at = 0.0
         self._cached_player_pose_normalized: tuple[float, float] | None = None
@@ -347,8 +350,11 @@ class BattleBot:
         self._cached_reload = False
         self._torpedo_samples = deque(maxlen=3)
         self._fire_samples = deque(maxlen=2)
+        self._last_fire_anchors = (False, False)
+        self._last_fire_status_anchor = False
         self._flood_samples = deque(maxlen=5)
         self._autopilot_hud_samples = deque(maxlen=3)
+        self._autopilot_hud_absent_since: float | None = None
         # A single white minimap glyph must never end the native route.  The
         # arrival decision is made only after several physically plausible,
         # fresh player-arrow samples agree that the waypoint was reached.
@@ -486,6 +492,7 @@ class BattleBot:
         self.battle_start_time = now
         self._cached_health = 1.0
         self._health_ocr_valid = False
+        self._health_loss_tracker.reset()
         self._cached_speed_knots = None
         self._cached_speed_observed_at = 0.0
         self._cached_player_pose_normalized = None
@@ -494,8 +501,10 @@ class BattleBot:
         self._cached_reload = False
         self._torpedo_samples.clear()
         self._fire_samples.clear()
+        self._last_fire_status_anchor = False
         self._flood_samples.clear()
         self._autopilot_hud_samples.clear()
+        self._autopilot_hud_absent_since = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
         self._native_autopilot_started_at = None
@@ -525,6 +534,13 @@ class BattleBot:
             self._static_map_source = ""
             self._island_layer_candidates.clear()
             self._zone_layer_candidates.clear()
+            # This is a fresh battle, even when the lifecycle first sees it
+            # directly on the HUD (for example after Continue Battle from the
+            # results page).  Do not carry the previous match's bounded M-map
+            # attempt into the new one.  Preconfigured opening autopilot keeps
+            # ``preserve_static_map=True`` and therefore retains this guard for
+            # the same battle.
+            self._tactical_map_attempted_this_battle = False
         elif self._battle_capture_zone_layout:
             # Pixel coordinates belong to the previous framebuffer crop.
             # Re-materialize them from the frozen normalized layout so a
@@ -577,10 +593,22 @@ class BattleBot:
         # controller's timestamp; reset here used to erase intervention that
         # arrived while a new battle was being recognized.
         if self._distance_ocr_async:
-            self.distance_ocr_service.close()
-            self.distance_ocr_service = DistanceOcrService(self.distance_reader)
+            self.rebuild_distance_ocr()
         if not preserve_movement:
             self.gamepad.stop()
+
+    def rebuild_distance_ocr(self):
+        """Replace the async OCR service after its executor was shut down.
+
+        ``collect_battle_rewards`` closes the service while a settlement page
+        may still turn out to be unconfirmed.  When the battle then continues
+        on a later loop the combat code re-enters without ``reset()``, so the
+        service must be rebuilt here or ``executor.submit`` raises on a
+        shutdown pool and aborts the whole run.
+        """
+        if self.distance_ocr_service is not None:
+            self.distance_ocr_service.close()
+            self.distance_ocr_service = DistanceOcrService(self.distance_reader)
 
     @staticmethod
     def _island_layer_signature(islands) -> tuple:
@@ -868,6 +896,7 @@ class BattleBot:
         self.autopilot_retry_pending = False
         self.native_autopilot_abandoned = False
         self._autopilot_hud_samples.clear()
+        self._autopilot_hud_absent_since = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
         self._native_autopilot_started_at = None
@@ -922,6 +951,7 @@ class BattleBot:
                     and candidate.name.startswith("run_")
                     and resolved.parent == root
                     and resolved != current
+                    and (candidate / "completed.json").is_file()
                 ):
                     shutil.rmtree(resolved)
         self._round_diagnostics_completed = True
@@ -934,6 +964,7 @@ class BattleBot:
         self.opening_autopilot_target_normalized = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._autopilot_hud_absent_since = None
         self._native_autopilot_started_at = None
         self.generic_center_route_active = True
         self._last_movement_mode = None
@@ -950,6 +981,7 @@ class BattleBot:
         self._native_autopilot_confirmed = False
         self.generic_center_route_active = False
         self._autopilot_zero_speed_since = None
+        self._autopilot_hud_absent_since = None
         self.autopilot_retry_pending = True
         # The game's green route indicator can remain visible after a manual
         # forward/neutral takeover.  Never let that stale HUD re-arm native
@@ -1195,7 +1227,7 @@ class BattleBot:
             # The old masks confused consumables and decoration for E rudder
             # and then cancelled otherwise valid native routes.
             analysis.autopilot_enabled = bool(self.opening_autopilot_active)
-            if self.opening_autopilot_active and not self._native_autopilot_confirmed:
+            if self.opening_autopilot_active:
                 text_reader = getattr(
                     self.vision,
                     "read_autopilot_enabled_text",
@@ -1203,10 +1235,18 @@ class BattleBot:
                 )
                 backend = getattr(self.distance_reader, "backend", None)
                 if text_reader is not None and self.tick % 3 == 0:
-                    self._native_autopilot_confirmed = bool(
-                        text_reader(image, backend)
-                    )
-                    if self._native_autopilot_confirmed:
+                    hud_visible = text_reader(image, backend)
+                    analysis.autopilot_hud_visible = hud_visible
+                    # ``None`` means OCR/capture was unreadable, not that the
+                    # game's route indicator positively disappeared.  Never
+                    # let an unavailable OCR backend cancel a valid route.
+                    if hud_visible is not None:
+                        self._autopilot_hud_samples.append(bool(hud_visible))
+                    if hud_visible is True and not self._native_autopilot_confirmed:
+                        self._native_autopilot_confirmed = True
+                        self._autopilot_hud_samples.clear()
+                        self._autopilot_hud_samples.append(True)
+                        self._autopilot_hud_absent_since = None
                         logger.info(
                             "[SYSTEM] 左下角已识别“自动驾驶启用”，原生航线确认成功"
                         )
@@ -1779,11 +1819,40 @@ class BattleBot:
         # Health is calculated exclusively from the numeric ``current/max``
         # readout.  Never estimate it from the padded colour bar: on this HUD a
         # visually full bar occupies only about 88.8% of the old crop.
+        if self.tick % 3 == 0:
+            self._health_loss_tracker.observe(health, observed_at)
         if health is not None:
             health = max(0.0, min(float(health), 1.0))
             self._cached_health = health
             self._health_ocr_valid = True
-        self._fire_samples.append(bool(self.vision.is_on_fire(image)))
+        # Decompose the fire HUD into its two anchors for diagnostics only
+        # when the vision adapter uses the stock detector wholesale;
+        # subclasses that override either hook (tests, custom adapters) must
+        # keep their own semantics.
+        fire_bits = getattr(type(self.vision), "fire_anchor_bits", None)
+        on_fire = getattr(type(self.vision), "is_on_fire", None)
+        stock_bits = getattr(Vision, "fire_anchor_bits", None)
+        stock_fire = getattr(Vision, "is_on_fire", None)
+        if fire_bits is stock_bits and on_fire is stock_fire:
+            dial_anchor, ship_anchor = fire_bits(self.vision, image)
+            self._last_fire_anchors = (bool(dial_anchor), bool(ship_anchor))
+            self._last_fire_status_anchor = bool(
+                self.vision.fire_status_icon_visible(image)
+            )
+        else:
+            # Lightweight adapters may only expose the combined detector.
+            combined = bool(self.vision.is_on_fire(image))
+            self._last_fire_anchors = (combined, combined)
+            self._last_fire_status_anchor = combined
+        # A dial-only orange droplet is not sufficient in live frames: HUD
+        # decorations have repeatedly produced that exact false positive at
+        # full health. Require both independent anchors before spending R.
+        self._fire_samples.append(
+            bool(
+                self._last_fire_status_anchor
+                or all(self._last_fire_anchors)
+            )
+        )
         analysis.on_fire = (
             len(self._fire_samples) == self._fire_samples.maxlen
             and all(self._fire_samples)
@@ -2085,6 +2154,7 @@ class BattleBot:
 
     def mark_manual_pause(self):
         """Expose an already-observed keyboard/Web pause without input."""
+        self._health_loss_tracker.reset()
         was_active = self._manual_intervention_active
         was_latched = self._manual_intervention_latched
         web_paused = bool(getattr(self.intervention, "web_paused", False))
@@ -2095,6 +2165,8 @@ class BattleBot:
             if web_paused
             else "用户切屏"
             if trigger == "window_switch"
+            else "切屏后的鼠标操作"
+            if trigger == "background_mouse"
             else "用户键盘介入"
         )
         self.last_movement_reason = (
@@ -2119,14 +2191,14 @@ class BattleBot:
                 if web_paused
                 else (
                     f"连续 {float(getattr(self.intervention, 'pause_seconds', 5.0)):.0f} "
-                    "秒无新键盘操作后自动恢复，"
+                    "秒无新的切屏、键盘或后台鼠标操作后自动恢复，"
                     f"持续操作满 {float(getattr(self.intervention, 'latch_seconds', 20.0)):.0f} "
                     "秒将锁定暂停"
                 ),
             )
         if latched and not was_latched and not web_paused:
             logger.warning(
-                "[USER] 持续切屏/键盘操作达到 %.0f 秒，已锁定暂停；等待网页点击继续",
+                "[USER] 持续切屏/键盘/后台鼠标操作达到 %.0f 秒，已锁定暂停；等待网页点击继续",
                 float(getattr(self.intervention, "latch_seconds", 20.0)),
             )
 
@@ -2144,7 +2216,7 @@ class BattleBot:
                 if getattr(self.intervention, "resumed_from_web", False)
                 else (
                     f"连续 {float(getattr(self.intervention, 'pause_seconds', 5.0)):.0f} "
-                    "秒无新的键盘操作"
+                    "秒无新的切屏、键盘或后台鼠标操作"
                 )
             )
             logger.info("[SYSTEM] %s，重新识别当前战斗状态并恢复控制", source)
@@ -2167,24 +2239,6 @@ class BattleBot:
                 0.0,
                 now - float(self._native_autopilot_started_at),
             )
-            if self._native_autopilot_confirmed:
-                # Once the game's lower-left status has positively confirmed
-                # the native route, it exclusively owns engine and rudder.
-                # Position, terrain, enemy and stuck heuristics are telemetry
-                # only: none of them may emit W/Q/E or cancel the route.  This
-                # prevents a transient minimap glyph/zero-speed sample from
-                # turning into an avoidance command roughly 30 seconds later.
-                self._autopilot_arrival_samples.clear()
-                self._autopilot_zero_speed_since = None
-                self.last_movement_command = None
-                self.last_movement_reason = (
-                    f"游戏自动航行至{self.opening_autopilot_target}；"
-                    "已确认原生自动驾驶，禁止W/Q/E、避山及脱困接管"
-                )
-                if self._last_movement_mode != "autopilot_route":
-                    logger.info("[SYSTEM] %s", self.last_movement_reason)
-                self._last_movement_mode = "autopilot_route"
-                return
             near_target = bool(
                 self.opening_autopilot_target_normalized is not None
                 and analysis.minimap_player_normalized is not None
@@ -2211,6 +2265,72 @@ class BattleBot:
                 logger.info(
                     "[SYSTEM] 自动航行已抵达航点；下一帧由小地图Q/E接管"
                 )
+                return
+            if self._native_autopilot_confirmed:
+                route_status_lost = bool(
+                    len(self._autopilot_hud_samples)
+                    == self._autopilot_hud_samples.maxlen
+                    and not any(self._autopilot_hud_samples)
+                )
+                if route_status_lost:
+                    if self._autopilot_hud_absent_since is None:
+                        self._autopilot_hud_absent_since = now
+                        logger.info(
+                            "[SYSTEM] 自动驾驶文字暂未识别；保持原生航线，不发送W/Q/E"
+                        )
+                    low_speed = bool(
+                        analysis.speed_knots is not None
+                        and analysis.speed_knots
+                        <= float(
+                            self.strategy.get(
+                                "autopilot_stall_speed_knots",
+                                self.strategy.get("stuck_low_speed_knots", 1.5),
+                            )
+                        )
+                    )
+                    missing_timeout = max(
+                        6.0,
+                        float(
+                            self.strategy.get(
+                                "autopilot_hud_missing_takeover_seconds", 10.0
+                            )
+                        ),
+                    )
+                    if (
+                        low_speed
+                        and now - self._autopilot_hud_absent_since
+                        >= missing_timeout
+                    ):
+                        missing_seconds = now - self._autopilot_hud_absent_since
+                        self._autopilot_hud_samples.clear()
+                        self.feedback.reset()
+                        self.movement_verified = False
+                        self.request_autopilot_retry(
+                            "自动驾驶文字持续消失且舰船已低速，扶正后由小地图Q/E接管"
+                        )
+                        logger.warning(
+                            "[SYSTEM] 自动驾驶文字消失且持续低速 %.1f 秒；切换小地图闭环，本局不再打开M地图",
+                            missing_seconds,
+                        )
+                        return
+                else:
+                    self._autopilot_hud_absent_since = None
+                # Once the game's lower-left status has positively confirmed
+                # the native route, it exclusively owns engine and rudder.
+                # Terrain, enemy and stuck heuristics are telemetry only. Only
+                # a stable arrival, or missing HUD plus sustained low speed,
+                # may emit W/Q/E or cancel the route. This
+                # prevents a transient minimap glyph/zero-speed sample from
+                # turning into an avoidance command roughly 30 seconds later.
+                self._autopilot_zero_speed_since = None
+                self.last_movement_command = None
+                self.last_movement_reason = (
+                    f"游戏自动航行至{self.opening_autopilot_target}；"
+                    "已确认原生自动驾驶，禁止W/Q/E、避山及脱困接管"
+                )
+                if self._last_movement_mode != "autopilot_route":
+                    logger.info("[SYSTEM] %s", self.last_movement_reason)
+                self._last_movement_mode = "autopilot_route"
                 return
             # The route click is provisional. Use the independent lower-left
             # numeric speed anchor to reject a stale route early. Without this
@@ -2471,8 +2591,10 @@ class BattleBot:
         damage_control_cooldown = float(
             self.strategy.get("damage_control_cooldown_seconds", 80.0)
         )
+        sustained_damage = self._health_loss_tracker.sustained_loss(now)
         if (
-            (analysis.on_fire or analysis.flooding)
+            (analysis.on_fire or analysis.flooding or sustained_damage)
+            and not (analysis.health_recognized and analysis.health <= 0)
             and now - self.last_damage_control >= damage_control_cooldown
             and hasattr(self.gamepad, "damage_control")
         ):
@@ -2481,13 +2603,16 @@ class BattleBot:
                 return False
             self.gamepad.damage_control()
             self.last_damage_control = now
+            self._health_loss_tracker.reset()
             logger.info(
                 "检测到%s，使用 R 损害管制",
                 "着火/漏水"
                 if analysis.on_fire and analysis.flooding
                 else "着火"
                 if analysis.on_fire
-                else "漏水",
+                else "漏水"
+                if analysis.flooding
+                else "连续4次新鲜血量读数出现3次下降（疑似持续伤害）",
             )
 
         other_cooldown = float(
@@ -2498,9 +2623,21 @@ class BattleBot:
         )
         consumable_cycle = getattr(self.gamepad, "use_other_consumables", None)
         fallback_heal = getattr(self.gamepad, "heal", None)
+        other_health_threshold = min(
+            0.99,
+            max(
+                0.01,
+                float(
+                    self.strategy.get(
+                        "other_consumable_health_threshold",
+                        0.80,
+                    )
+                ),
+            ),
+        )
         if (
             analysis.health_recognized
-            and 0 < analysis.health < 0.995
+            and 0 < analysis.health <= other_health_threshold
             and now - self.last_heal >= other_cooldown
             and (consumable_cycle is not None or fallback_heal is not None)
         ):
@@ -2514,8 +2651,9 @@ class BattleBot:
             self.last_heal = now
             self.heal_used += 1
             logger.info(
-                "生命值 %.0f%%，尝试其他消耗品 T/U/Y；%.0f 秒后可再次尝试",
+                "生命值 %.0f%%（阈值 %.0f%%），尝试其他消耗品 T/U/Y；%.0f 秒后可再次尝试",
                 analysis.health * 100,
+                other_health_threshold * 100,
                 other_cooldown,
             )
 
@@ -2566,6 +2704,9 @@ class BattleBot:
             health_recognized=analysis.health_recognized,
             on_fire=analysis.on_fire,
             flooding=analysis.flooding,
+            fire_anchor_dial=self._last_fire_anchors[0],
+            fire_anchor_ship=self._last_fire_anchors[1],
+            fire_anchor_status=self._last_fire_status_anchor,
             enemies=max(len(analysis.enemies), analysis.minimap_enemy_count),
             target_track_id=analysis.target_track_id,
             # Keep the public/control distance aligned with movement logic.

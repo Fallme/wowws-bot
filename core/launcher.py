@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
-import string
 import subprocess
 import winreg
 
@@ -179,11 +179,21 @@ def find_wgc_executable() -> Path | None:
     return _first_file(candidates)
 
 
-def _available_drive_roots():
-    for letter in string.ascii_uppercase:
-        root = Path(f"{letter}:\\")
-        if root.exists():
-            yield root
+def _fixed_drive_roots():
+    """Yield mounted local fixed drives (C:\, D:\ ...).
+
+    Probing every letter with Path.exists() can block forever when a stale
+    device letter is present (e.g. a disconnected USB drive that still has a
+    mount point), so enumerate only drives Windows reports as mounted.
+    """
+    DRIVE_FIXED = 3
+    bits = ctypes.windll.kernel32.GetLogicalDrives()
+    for offset in range(26):
+        if not bits & (1 << offset):
+            continue
+        letter = f"{chr(ord('A') + offset)}:\\"
+        if ctypes.windll.kernel32.GetDriveTypeW(letter) == DRIVE_FIXED:
+            yield Path(letter)
 
 
 def _game_executable_candidates(game_root: Path):
@@ -223,7 +233,7 @@ def find_wgc_game_executable(*, search_roots=None) -> Path | None:
         if icon is not None:
             game_roots.append(icon.parent)
 
-    roots = list(search_roots) if search_roots is not None else list(_available_drive_roots())
+    roots = list(search_roots) if search_roots is not None else list(_fixed_drive_roots())
     relative_roots = (
         Path("Games") / "World_of_Warships",
         Path("Games") / "World of Warships",

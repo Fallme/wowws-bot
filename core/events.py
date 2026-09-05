@@ -103,13 +103,17 @@ def read_events(source: Path) -> list[RuntimeEvent]:
         for line in stream:
             if not line.strip():
                 continue
-            raw = json.loads(line)
-            events.append(
-                RuntimeEvent(
-                    sequence=int(raw["sequence"]),
-                    topic=str(raw["topic"]),
-                    emitted_at=float(raw["emitted_at"]),
-                    payload=dict(raw.get("payload") or {}),
+            try:
+                raw = json.loads(line)
+                events.append(
+                    RuntimeEvent(
+                        sequence=int(raw["sequence"]),
+                        topic=str(raw["topic"]),
+                        emitted_at=float(raw["emitted_at"]),
+                        payload=dict(raw.get("payload") or {}),
+                    )
                 )
-            )
+            except (ValueError, TypeError, KeyError, AttributeError):
+                # A single damaged trailing record must not abort offline replay.
+                continue
     return events

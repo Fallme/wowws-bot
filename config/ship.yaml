@@ -80,6 +80,7 @@ pommern:
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段
     other_consumable_cooldown_seconds: 30
+    other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
     heal_max_uses: 3                # 兼容旧配置
     torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
     torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
@@ -158,6 +159,7 @@ napoli:
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段
     other_consumable_cooldown_seconds: 30
+    other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
     heal_max_uses: 3                # 兼容旧配置
     auto_smoke: true
     main_gun_shoot_threshold: 0.8

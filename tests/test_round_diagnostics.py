@@ -9,6 +9,10 @@ def test_completed_round_keeps_matching_frames_events_and_log_then_prunes_old(tm
     old = root / "run_20000101_000000"
     old.mkdir(parents=True)
     (old / "full_0000.png").write_bytes(b"old")
+    (old / "completed.json").write_text("{}", encoding="utf-8")
+    active = root / "run_20000101_000001"
+    active.mkdir(parents=True)
+    (active / "round.log").write_text("still recording", encoding="utf-8")
     monkeypatch.setattr(bot_module, "DEFAULT_DEBUG_ROOT", root)
 
     gamepad = SimpleNamespace(stop=lambda: None)
@@ -26,5 +30,6 @@ def test_completed_round_keeps_matching_frames_events_and_log_then_prunes_old(tm
     assert (current / "round.log").exists()
     assert (current / "completed.json").exists()
     assert not old.exists()
+    assert (active / "round.log").read_text(encoding="utf-8") == "still recording"
     assert bot.complete_round_diagnostics(3) == current
     bot.stop(release_input=False)

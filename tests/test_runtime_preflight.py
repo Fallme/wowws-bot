@@ -497,6 +497,91 @@ def test_loading_like_battle_frame_waits_for_player_pose_before_opening_commands
     assert bot._opening_autopilot_attempted
 
 
+def test_missing_pose_does_not_deadlock_confirmed_battle_or_consume_map_attempt():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class MissingPoseVision:
+        frames = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            self.frames += 1
+            return frame
+
+        def classify_screen(self, _image):
+            return ScreenState.LOADING if self.frames == 1 else ScreenState.BATTLE
+
+        def find_minimap(self, _image):
+            return frame
+
+        def find_player_pose_on_minimap(self, _minimap):
+            return None
+
+        def read_battle_clock_seconds(self, _image, _backend):
+            return None
+
+    bot = SimpleNamespace(hwnd=1, vision=MissingPoseVision(), gamepad=SimpleNamespace(), intervention=None)
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot") as configure,
+    ):
+        assert wait_for_battle(bot, timeout=2, require_new_round=True)
+    assert bot.vision.frames == 5
+    assert not getattr(bot, "_opening_autopilot_attempted", False)
+    assert not getattr(bot, "_tactical_map_attempted_this_battle", False)
+    configure.assert_not_called()
+
+
+def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class RosterVision:
+        def __init__(self):
+            self.frame_index = 0
+
+        def grab(self, _hwnd, *, allow_stale=False):
+            self.frame_index += 1
+            return frame
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        def _has_loading_start_action(self, _image):
+            return self.frame_index <= 2
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return None
+
+    controller = SimpleNamespace(reassertions=0)
+
+    def reassert_full_speed():
+        controller.reassertions += 1
+
+    controller.reassert_full_speed = reassert_full_speed
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=RosterVision(),
+        gamepad=controller,
+        intervention=None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=False) as configure,
+    ):
+        assert wait_for_battle(
+            bot,
+            timeout=2,
+            require_new_round=True,
+            loading_already_seen=True,
+        )
+
+    assert controller.reassertions == 1
+    configure.assert_called_once_with(bot)
+
+
 def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing():
     class ClocklessBattleVision:
         @staticmethod
@@ -923,6 +1008,74 @@ def test_quick_battle_death_immediately_requests_next_round():
         patch("main.time.monotonic", side_effect=[0.0, 1.0]),
     ):
         assert run_battle(SunkBot(), quick_battle=True) == "quick_death"
+
+
+def test_normal_battle_hard_deadline_ends_stuck_match():
+    """A normal match whose result page never stabilises (HUD interlock,
+    sunk-ship misread, OCR loop) must still exit after max_battle_seconds."""
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class StuckBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+        strategy = {"max_battle_seconds": 120.0}
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def combat_tick():
+            raise AssertionError("超过硬性时限后不应再发送战斗指令")
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.monotonic", side_effect=[0.0, 121.0]),
+    ):
+        assert run_battle(StuckBot()) == "battle_timeout"
+
+
+def test_normal_battle_deadline_defaults_to_45_minutes():
+    """Without a strategy override the watchdog still bounds the match."""
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class DefaultBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def combat_tick():
+            raise AssertionError("超过默认硬性时限后不应再发送战斗指令")
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.monotonic", side_effect=[0.0, 2701.0]),
+    ):
+        assert run_battle(DefaultBot()) == "battle_timeout"
 
 
 def test_keyboard_pause_skips_capture_focus_and_all_followup_commands():

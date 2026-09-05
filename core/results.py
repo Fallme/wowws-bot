@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import logging
 import re
 
 import cv2
@@ -15,6 +16,9 @@ from core.ocr import (
     numeric_ocr_fallback_variants,
 )
 from core.ui import RelativeRegion
+
+
+logger = logging.getLogger("results")
 
 
 RESULT_REWARD_REGIONS = {
@@ -95,17 +99,17 @@ class ResultRewardReader:
     MINIMUM_CREDITS = 1_000
 
     @staticmethod
-    def read_outcome(image) -> str:
+    def read_outcome(image, backend=None) -> str:
         """Classify the large result headline without trusting reward OCR.
 
-        Victory is rendered gold and defeat red in the upper-left result
-        headline.  Looking only there avoids mixing it with team colours,
-        ship badges or the three reward figures.  An uncertain frame remains
-        ``unknown`` rather than writing a wrong outcome to history.
+        Production uses large headline OCR; colour-only mode is retained for
+        legacy diagnostic callers that do not supply an OCR backend.
         """
         if image is None or image.size == 0:
             return "unknown"
         height, width = image.shape[:2]
+        if backend is not None:
+            return ResultRewardReader._read_outcome_text(image, backend)
         crop = image[
             int(height * 0.055) : int(height * 0.29),
             int(width * 0.035) : int(width * 0.31),
@@ -126,6 +130,34 @@ class ResultRewardReader:
         if red_pixels >= minimum and red_pixels > gold_pixels * 1.35:
             return "defeat"
         return "unknown"
+
+    @staticmethod
+    def _read_outcome_text(image, backend) -> str:
+        """Require an unambiguous large result headline, regardless of colour."""
+        height, width = image.shape[:2]
+        if backend is not None:
+            # Read only large headline text. Colour alone can mistake a gold
+            # player/ship name or scenery for victory on a defeat screen.
+            headline = image[int(height * 0.055):int(height * 0.34),
+                             int(width * 0.035):int(width * 0.60)]
+            try:
+                outcomes = set()
+                for token in backend.recognize(headline) or ():
+                    if token.confidence < 0.75 or not token.box:
+                        continue
+                    ys = [point[1] for point in token.box]
+                    if max(ys) - min(ys) < height * 0.022:
+                        continue
+                    text = re.sub(r"[\W_]+", "", token.text).casefold()
+                    if text in {"胜利", "勝利", "victory"}:
+                        outcomes.add("victory")
+                    elif text in {"失败", "失敗", "战败", "戰敗", "defeat"}:
+                        outcomes.add("defeat")
+                if len(outcomes) == 1:
+                    return outcomes.pop()
+            except Exception:
+                logger.debug("胜负标题 OCR 暂不可用", exc_info=True)
+            return "unknown"
 
     @staticmethod
     def _read_port_outcome(image) -> str:
@@ -237,6 +269,7 @@ class ResultRewardReader:
         maximum: int,
         *,
         grouped_thousands: bool = False,
+        discard_leading_icon_digit: bool = False,
     ):
         tokens = sorted(self.backend.recognize(crop), key=self._token_x)
         numeric_tokens = [
@@ -245,6 +278,16 @@ class ResultRewardReader:
         ]
         numeric_tokens = [item for item in numeric_tokens if item[1]]
         numeric_tokens = self._deduplicate_numeric_tokens(numeric_tokens)
+        if (
+            discard_leading_icon_digit
+            and len(numeric_tokens) >= 2
+            and numeric_tokens[0][1] == "2"
+            and len(numeric_tokens[1][1]) == 3
+        ):
+            # The green free-XP star is intermittently recognized as a
+            # standalone ``2``. It sits immediately before the real value, so
+            # generic thousands grouping used to turn ``2 | 295`` into 2295.
+            numeric_tokens = numeric_tokens[1:]
         used_tokens = []
         pieces = []
         if grouped_thousands and numeric_tokens:
@@ -294,6 +337,7 @@ class ResultRewardReader:
         maximum: int,
         *,
         grouped_thousands: bool = False,
+        discard_leading_icon_digit: bool = False,
         minimum_expected: int = 1,
     ):
         height, width = image.shape[:2]
@@ -303,6 +347,7 @@ class ResultRewardReader:
             crop,
             maximum,
             grouped_thousands=grouped_thousands,
+            discard_leading_icon_digit=discard_leading_icon_digit,
         )
         if first[0] >= minimum_expected or not isinstance(
             self.backend, RapidOcrBackend
@@ -317,6 +362,7 @@ class ResultRewardReader:
                 variant,
                 maximum,
                 grouped_thousands=grouped_thousands,
+                discard_leading_icon_digit=discard_leading_icon_digit,
             )
             candidates.append(candidate)
             if candidate[0] >= minimum_expected and candidate[1] >= 0.80:
@@ -325,6 +371,29 @@ class ResultRewardReader:
         if not valid:
             return first
         return max(valid, key=lambda candidate: (candidate[1], len(str(candidate[0]))))
+
+    @staticmethod
+    def _repair_free_xp_icon_prefix(ship_xp: int, free_xp: int) -> int:
+        """Remove a merged star-as-2 prefix when reward ratios corroborate it."""
+        ship_xp = max(0, int(ship_xp or 0))
+        free_xp = max(0, int(free_xp or 0))
+        text = str(free_xp)
+        if ship_xp <= 0 or len(text) != 4 or not text.startswith("2"):
+            return free_xp
+        candidate = int(text[1:])
+        if (
+            free_xp >= ship_xp * 0.80
+            and candidate > 0
+            and 0.02 <= candidate / ship_xp <= 0.50
+        ):
+            logger.warning(
+                "全局经验疑似粘连星形图标: %s -> %s (舰船经验=%s)",
+                free_xp,
+                candidate,
+                ship_xp,
+            )
+            return candidate
+        return free_xp
 
     def _read_regions(self, image, regions) -> BattleRewards:
         values = {}
@@ -336,11 +405,16 @@ class ResultRewardReader:
                 region,
                 self.LIMITS[name],
                 grouped_thousands=True,
+                discard_leading_icon_digit=(name == "free_xp"),
                 minimum_expected=(self.MINIMUM_CREDITS if name == "credits" else 1),
             )
             values[name] = value
             confidence[name] = round(score, 4)
             raw_text[name] = raw
+        values["free_xp"] = self._repair_free_xp_icon_prefix(
+            values["ship_xp"],
+            values["free_xp"],
+        )
         recognized = values["credits"] >= self.MINIMUM_CREDITS and (
             values["ship_xp"] > 0 or values["free_xp"] > 0
         )
@@ -352,7 +426,7 @@ class ResultRewardReader:
             ),
             confidence=confidence,
             raw_text=raw_text,
-            outcome=self.read_outcome(image),
+            outcome=self.read_outcome(image, self.backend),
         )
 
     @staticmethod

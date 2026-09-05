@@ -16,6 +16,9 @@ from core.ocr import RapidOcrBackend, numeric_ocr_fallback_variants
 from core.ui import (
     ESCAPE_RESUME_BUTTON,
     EXIT_CONTINUE_BUTTON,
+    FIRE_DIAL_ROI,
+    FIRE_SHIP_ROI,
+    FIRE_STATUS_ROI,
     HEALTH_BAR_REGION,
     LOADING_START_BUTTON,
     MINIMAP_REGION,
@@ -140,7 +143,7 @@ class Vision:
         )
 
     @staticmethod
-    def read_autopilot_enabled_text(image, backend) -> bool:
+    def read_autopilot_enabled_text(image, backend) -> bool | None:
         """Read the exact green lower-left ``自动驾驶`` status text.
 
         The same words also exist as a neutral key hint before a route starts.
@@ -149,17 +152,17 @@ class Vision:
         minimap content that made the old broad mask report false positives.
         """
         if image is None or image.size == 0 or backend is None:
-            return False
+            return None
         height, width = image.shape[:2]
         top = int(height * 0.68)
         crop = image[top : int(height * 0.97), 0 : int(width * 0.28)]
         if crop.size == 0:
-            return False
+            return None
         try:
             tokens = backend.recognize(crop)
         except Exception:
             logger.debug("自动驾驶状态文字 OCR 失败", exc_info=True)
-            return False
+            return None
         for token in tokens:
             text = "".join(str(getattr(token, "text", "") or "").split())
             if "自动驾驶" not in text or float(
@@ -625,11 +628,12 @@ class Vision:
         return min(central, key=lambda zone: math.dist(zone.center, map_center))
 
     def find_player_pose_on_minimap(self, minimap):
-        """Find the bright player arrow using its concentric yellow range ring.
+        """Find a white player arrow, using range rings as supporting evidence.
 
         Bright islands and grid text look similar to the arrow in isolation.
-        The player's marker is the only small white polygon centered inside the
-        yellow gun-range circle, which gives a much stronger live signal.
+        A unique, filled white arrow may be used without a yellow range ring.
+        Ambiguous shapes still require circular evidence; not every ship/UI
+        configuration displays a yellow circle.
         """
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         # The player marker has a dark outline and can be semi-transparent
@@ -722,6 +726,13 @@ class Vision:
                 and max(w, h) <= max(22.0, scale * 0.04)
                 and 0.28 <= fill_ratio <= 0.62
             )
+            component = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(component, [contour - (x, y)], -1, 255, -1)
+            pixels = hsv[y:y + h, x:x + w][component > 0]
+            white_core = bool(
+                len(pixels)
+                and np.mean((pixels[:, 1] <= 60) & (pixels[:, 2] >= 200)) >= 0.60
+            )
             candidates.append(
                 (
                     arrow_silhouette,
@@ -731,6 +742,7 @@ class Vision:
                     center_y,
                     direction_x / length,
                     direction_y / length,
+                    white_core,
                 )
             )
         if not candidates:
@@ -746,7 +758,10 @@ class Vision:
         # when the ship approached an island.
         minimum_coverage = 12
         minimum_score = max(32, int(scale * scale * 0.00024))
-        if ranked[0][1] < minimum_coverage or ranked[0][2] < minimum_score:
+        unique_white_arrow = len(silhouette_candidates) == 1 and ranked[0][7]
+        if not unique_white_arrow and (
+            ranked[0][1] < minimum_coverage or ranked[0][2] < minimum_score
+        ):
             return None
         if len(ranked) > 1 and ranked[0][1] < ranked[1][1] * 1.08:
             return None
@@ -2281,16 +2296,72 @@ class Vision:
             and float(dialog.mean()) + 8 < float(outer.mean())
         )
 
-    def is_on_fire(self, image):
-        """Confirm fire from both dedicated battle-HUD indicators.
+    def fire_status_icon_visible(self, image) -> bool:
+        """Detect the compact red active-damage countdown above consumables.
 
-        The lower-left ship-condition model shows one compact flame marker per
-        active fire, while the consumable/status strip shows a wide triangular
-        fire warning.  Requiring both prevents viewport flames, shell tracers,
-        HP decoration, port icons and capture markers from triggering R.
+        The live HUD can show an unmistakable fire timer even when the small
+        speed-dial flame is washed out or hidden. Restrict the detector to the
+        fixed condition-card strip and require a solid, near-square component;
+        thin red shell tracers and targeting arcs therefore do not qualify.
         """
         if image is None or image.size == 0:
             return False
+        height, width = image.shape[:2]
+        crop = self._crop_region(image, FIRE_STATUS_ROI)
+        if crop.size == 0:
+            return False
+        pixel_scale = max((width * height) / float(2560 * 1494), 0.20)
+        linear_scale = math.sqrt(pixel_scale)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        red = cv2.inRange(
+            hsv,
+            np.array([0, 105, 70]),
+            np.array([15, 255, 255]),
+        )
+        red |= cv2.inRange(
+            hsv,
+            np.array([165, 105, 70]),
+            np.array([180, 255, 255]),
+        )
+        red = cv2.morphologyEx(
+            red,
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8),
+        )
+        count, _labels, stats, _ = cv2.connectedComponentsWithStats(
+            red,
+            connectivity=8,
+        )
+        for index in range(1, count):
+            component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            fill = area / max(component_width * component_height, 1)
+            aspect = component_width / max(component_height, 1)
+            if (
+                area >= 100.0 * pixel_scale
+                and component_width >= 18.0 * linear_scale
+                and component_height >= 18.0 * linear_scale
+                and 0.60 <= aspect <= 1.60
+                and fill >= 0.15
+            ):
+                return True
+        return False
+
+    def fire_anchor_bits(self, image):
+        """Evaluate the two independent fire HUD anchors separately.
+
+        Returns ``(dial_flames, ship_flames)`` so callers and live
+        diagnostics can tell which anchor is missing on a negative frame.
+
+        The speed-dial ship silhouette (bottom-left) shows one compact orange
+        flame-droplet marker per active fire, and the viewport ship model
+        carries the same droplet markers while its fire is close enough to be
+        resolved. Both are exposed independently so the caller can require
+        corroboration before spending damage control.
+        """
+        if image is None or image.size == 0:
+            return False, False
         height, width = image.shape[:2]
         pixel_scale = max((width * height) / float(2560 * 1436), 0.20)
         linear_scale = math.sqrt(pixel_scale)
@@ -2308,63 +2379,146 @@ class Vision:
                 np.array([0, 110, 110]),
                 np.array([40, 255, 255]),
             )
-            labels, _, stats, _ = cv2.connectedComponentsWithStats(
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(
                 orange, connectivity=8
             )
-            return [
-                (
-                    int(stats[index, cv2.CC_STAT_AREA]),
-                    int(stats[index, cv2.CC_STAT_WIDTH]),
-                    int(stats[index, cv2.CC_STAT_HEIGHT]),
+            components = []
+            for index in range(1, count):
+                x = int(stats[index, cv2.CC_STAT_LEFT])
+                y = int(stats[index, cv2.CC_STAT_TOP])
+                component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+                component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+                area = int(stats[index, cv2.CC_STAT_AREA])
+                if area < 20:
+                    continue
+                selected = hsv[labels == index]
+                saturation_mean = float(selected[:, 1].mean())
+                value_std = float(selected[:, 2].std())
+                # Mean background brightness of a dilated ring around the
+                # component.  Real dial markers sit on the bright dial plate
+                # while text glyphs sit on darker dial hardware.
+                ring_value = -1.0
+                if component_width >= 4 and component_height >= 4:
+                    component = (labels == index).astype(np.uint8)
+                    ring = (
+                        cv2.dilate(component, np.ones((7, 7), np.uint8))
+                        - component
+                    )
+                    ring_values = hsv[:, :, 2][ring > 0]
+                    if ring_values.size:
+                        ring_value = float(ring_values.mean())
+                components.append(
+                    (
+                        x,
+                        y,
+                        component_width,
+                        component_height,
+                        area,
+                        saturation_mean,
+                        value_std,
+                        ring_value,
+                    )
                 )
-                for index in range(1, labels)
-            ]
+            return components
 
-        left_flames = [
-            (area, component_width, component_height)
-            for area, component_width, component_height in orange_components(
-                0.025, 0.865, 0.105, 0.930
+        def is_droplet(component):
+            """Vivid teardrop blob with a brightness gradient.
+
+            Rejects solid round module/consumable dots (fill ~0.78, low
+            value-std), flag glyphs and arc dashes (low saturation or
+            value-std) and the map's dull hexagon/capture icons.
+            """
+            _x, _y, cw, ch, area, saturation_mean, value_std, _ring = component
+            return (
+                40.0 * pixel_scale <= area <= 520.0 * pixel_scale
+                and 0.5 <= cw / max(ch, 1) <= 1.6
+                and 0.28 <= area / max(cw * ch, 1) <= 0.70
+                and cw >= 4.0 * linear_scale
+                and ch >= 5.0 * linear_scale
+                and saturation_mean >= 140.0
+                and value_std >= 18.0
             )
-            if 95 * pixel_scale <= area <= 500 * pixel_scale
-            and 0.55
-            <= component_width / max(component_height, 1)
-            <= 1.25
-            and 7 * linear_scale <= component_height <= 32 * linear_scale
-        ]
-        center_components = orange_components(0.470, 0.815, 0.540, 0.905)
-        center_warning_bodies = [
-            (area, component_width, component_height)
-            for area, component_width, component_height in center_components
-            if 100 * pixel_scale <= area <= 1200 * pixel_scale
-            and component_width >= 12 * linear_scale
-            and component_height >= 8 * linear_scale
-        ]
-        center_warning_bars = [
-            (area, component_width, component_height)
-            for area, component_width, component_height in center_components
-            if 30 * pixel_scale <= area <= 1200 * pixel_scale
-            and component_width >= component_height * 1.30
-            and component_width >= 16 * linear_scale
-        ]
-        center_warning = bool(
-            center_warning_bodies
-            and (
-                center_warning_bars
-                or any(
-                    component_width >= component_height * 1.30
-                    for _, component_width, component_height in center_warning_bodies
-                )
-            )
+
+        def has_text_row(components):
+            """Reject a run of at least three near-identical glyphs on a row.
+
+            Port carousels/scoreboards misclassified as BATTLE show orange
+            digits that pass every droplet test but line up in a uniform-pitch
+            row.  Real fire markers scatter across the ship silhouette and
+            never align into one row of equal-sized blobs.
+            """
+            rows = {}
+            for x, y, cw, ch, *_rest in components:
+                rows.setdefault(y, []).append((x, cw, ch))
+            for _y, items in rows.items():
+                if len(items) < 3:
+                    continue
+                items.sort()
+                for i in range(len(items) - 2):
+                    base_w, base_h = items[i][1], items[i][2]
+                    group = [items[i]]
+                    for j in range(i + 1, len(items)):
+                        xj, wj, hj = items[j]
+                        if abs(hj - base_h) <= 3 and abs(wj - base_w) <= 4:
+                            group.append((xj, wj, hj))
+                    if len(group) < 3:
+                        continue
+                    ok = True
+                    pitch = None
+                    for a, b in zip(group, group[1:]):
+                        gap = b[0] - (a[0] + a[1])
+                        if gap < 0:
+                            ok = False
+                            break
+                        if pitch is None:
+                            pitch = gap
+                        elif abs(gap - pitch) > max(6, pitch * 0.5):
+                            ok = False
+                            break
+                    if ok:
+                        return True
+            return False
+
+        dial_components = orange_components(
+            FIRE_DIAL_ROI.left,
+            FIRE_DIAL_ROI.top,
+            FIRE_DIAL_ROI.right,
+            FIRE_DIAL_ROI.bottom,
         )
+        ship_components = orange_components(
+            FIRE_SHIP_ROI.left,
+            FIRE_SHIP_ROI.top,
+            FIRE_SHIP_ROI.right,
+            FIRE_SHIP_ROI.bottom,
+        )
+        dial_flames = [c for c in dial_components if is_droplet(c)]
+        ship_flames = [c for c in ship_components if is_droplet(c)]
         logger.debug(
-            "Fire HUD anchors: left=%s center_body=%s center_bar=%s",
-            left_flames,
-            center_warning_bodies,
-            center_warning_bars,
+            "Fire HUD anchors: dial=%s ship=%s",
+            dial_flames,
+            ship_flames,
         )
-        # One active fire produces one ship-model marker.  The second required
-        # anchor is the independent central warning, not a second fire stack.
-        return bool(left_flames) and center_warning
+        dial_ok = (
+            bool(dial_flames)
+            and not has_text_row(dial_flames)
+            and all(component[7] >= 75.0 for component in dial_flames)
+        )
+        ship_ok = bool(ship_flames) and not has_text_row(ship_flames)
+        return bool(dial_ok), bool(ship_ok)
+
+    def is_on_fire(self, image):
+        """Confirm fire from the damage card or two independent flame anchors.
+
+        A dial-only marker has produced live false positives at full health,
+        while viewport flames may be the only visible model evidence. The
+        compact red condition card is authoritative; without it, require the
+        two legacy flame anchors to agree.
+        """
+        dial_flames, ship_flames = self.fire_anchor_bits(image)
+        return bool(
+            self.fire_status_icon_visible(image)
+            or (dial_flames and ship_flames)
+        )
 
     def is_flooding(self, image):
         """Detect the blue flooding icon directly below the numeric HP HUD."""

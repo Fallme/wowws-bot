@@ -97,17 +97,55 @@ def test_real_daily_reward_screenshot_selects_collect_button():
 
 def test_daily_reward_click_is_dispatched_only_after_ocr_confirmation():
     image = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    claim_tokens = [
+        token("每日登录奖励", 0.95, 620, 60, 980, 125),
+        token("领取", 0.93, 720, 780, 880, 850),
+    ]
+    backend = SequenceBackend([claim_tokens, []])
+    events = []
+
+    with (
+        patch("port_navigator._click_local", return_value=True) as click,
+        patch("port_navigator._capture", return_value=image),
+        patch("port_navigator.ensure_game_window_foreground", return_value=True),
+        patch("port_navigator.time.sleep", return_value=None),
+    ):
+        assert claim_daily_reward(
+            1,
+            image,
+            backend=backend,
+            close_action=lambda: events.append("esc"),
+        )
+
+    click.assert_called_once_with(1, (800, 815))
+    assert events == ["esc"]
+
+
+def test_daily_reward_keeps_page_open_when_recapture_fails():
+    """A failed verification capture must not close an unconfirmed reward."""
+    image = np.zeros((1000, 1600, 3), dtype=np.uint8)
     backend = StaticBackend(
         [
             token("每日登录奖励", 0.95, 620, 60, 980, 125),
             token("领取", 0.93, 720, 780, 880, 850),
         ]
     )
+    events = []
 
-    with patch("port_navigator._click_local", return_value=True) as click:
-        assert claim_daily_reward(1, image, backend=backend)
+    with (
+        patch("port_navigator._click_local", return_value=True),
+        patch("port_navigator._capture", side_effect=RuntimeError("capture failed")),
+        patch("port_navigator.ensure_game_window_foreground", return_value=True),
+        patch("port_navigator.time.sleep", return_value=None),
+    ):
+        assert not claim_daily_reward(
+            1,
+            image,
+            backend=backend,
+            close_action=lambda: events.append("esc"),
+        )
 
-    click.assert_called_once_with(1, (800, 815))
+    assert events == []
 
 
 def test_daily_reward_claim_is_verified_then_closed_with_escape():

@@ -1,4 +1,4 @@
-"""Pause automated battle input briefly when the player uses the keyboard."""
+"""Pause automated battle input when the player takes over the computer."""
 
 from __future__ import annotations
 
@@ -39,7 +39,53 @@ def _last_input_tick() -> int:
 
 
 def _foreground_window() -> int:
-    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    # The default ctypes conversion would truncate the 64-bit HWND to 32 bits.
+    user32 = ctypes.windll.user32
+    get_foreground = user32.GetForegroundWindow
+    get_foreground.restype = ctypes.wintypes.HWND
+    return int(get_foreground() or 0)
+
+
+def _same_game_surface(target: int, foreground: int) -> bool:
+    """Treat child/owned DirectX surfaces from the game process as foreground.
+
+    World of Warships can replace or foreground a render child without the
+    player switching applications. Exact HWND comparison turns that internal
+    transition into a false user pause, so compare root windows and process
+    ownership as well.
+    """
+    target = int(target or 0)
+    foreground = int(foreground or 0)
+    if not target or not foreground:
+        return False
+    if target == foreground:
+        return True
+    try:
+        user32 = ctypes.windll.user32
+        get_ancestor = user32.GetAncestor
+        get_ancestor.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.UINT)
+        get_ancestor.restype = ctypes.wintypes.HWND
+        foreground_root = int(get_ancestor(foreground, 2) or 0)
+        target_root = int(get_ancestor(target, 2) or 0)
+        if foreground_root and target_root and foreground_root == target_root:
+            return True
+
+        get_pid = user32.GetWindowThreadProcessId
+        get_pid.argtypes = (
+            ctypes.wintypes.HWND,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+        )
+        get_pid.restype = ctypes.wintypes.DWORD
+        target_pid = ctypes.wintypes.DWORD(0)
+        foreground_pid = ctypes.wintypes.DWORD(0)
+        get_pid(target, ctypes.byref(target_pid))
+        get_pid(foreground, ctypes.byref(foreground_pid))
+        return bool(
+            target_pid.value
+            and target_pid.value == foreground_pid.value
+        )
+    except Exception:
+        return False
 
 
 def _keyboard_activity() -> bool:
@@ -67,12 +113,13 @@ def _tick_distance(left: int, right: int) -> int:
 
 
 class UserInterventionMonitor:
-    """Observe real keyboard input without mistaking our own injections.
+    """Observe real user input without mistaking our own injections.
 
     ``GetLastInputInfo`` is system-wide. Keyboard activity therefore pauses
     automation even after the user has switched to another window. An explicit
-    foreground switch also starts one pause window, while mouse-only activity
-    is ignored. Native injected ticks are ignored.
+    foreground switch also starts one pause window. Mouse-only activity inside
+    the game is ignored, but mouse use after switching away extends that pause
+    and can latch it. Native injected ticks are ignored.
     """
 
     def __init__(
@@ -86,6 +133,7 @@ class UserInterventionMonitor:
         input_tick_reader=None,
         keyboard_activity_reader=None,
         foreground_reader=None,
+        foreground_matcher=None,
     ):
         self.hwnd = int(hwnd or 0)
         self.pause_seconds = max(1.0, float(pause_seconds))
@@ -99,6 +147,7 @@ class UserInterventionMonitor:
             _keyboard_activity if input_tick_reader is None else lambda: True
         )
         self._foreground_reader = foreground_reader or _foreground_window
+        self._foreground_matcher = foreground_matcher or _same_game_surface
         self._last_seen_tick: int | None = None
         self.pause_until = 0.0
         self.intervention_started_at: float | None = None
@@ -109,6 +158,13 @@ class UserInterventionMonitor:
         self._last_foreground: int | None = None
         self._automation_keyboard_quiet_until = 0.0
         self.last_trigger = ""
+
+    def _is_game_foreground(self, hwnd: int | None) -> bool:
+        try:
+            return bool(self._foreground_matcher(self.hwnd, int(hwnd or 0)))
+        except Exception:
+            logger.debug("前台窗口归属判断失败", exc_info=True)
+            return int(hwnd or 0) == self.hwnd
 
     def reset(self):
         self._last_seen_tick = self._input_tick_reader()
@@ -197,8 +253,8 @@ class UserInterventionMonitor:
         at the newer mouse move while the old M transition was still pending.
         Explicitly acknowledging our key dispatch drains that transition and
         establishes a new baseline.  Real keyboard input after this call and
-        foreground switches are still observed normally; mouse-only activity
-        never enters the pause state.
+        foreground switches are still observed normally. Mouse-only activity
+        is relevant only while the user remains in another foreground app.
         """
         current_tick = self._input_tick_reader()
         injected_ticks = self._automation_ticks(controller)
@@ -239,8 +295,9 @@ class UserInterventionMonitor:
         if current_foreground:
             self._last_foreground = current_foreground
         if (
-            previous_foreground == self.hwnd
-            and current_foreground not in (0, self.hwnd)
+            self._is_game_foreground(previous_foreground)
+            and current_foreground
+            and not self._is_game_foreground(current_foreground)
         ):
             logger.info(
                 "[USER] 检测到切屏: 游戏窗口=%s，当前前台=%s；至少静默 %.0f 秒前不切回游戏",
@@ -260,10 +317,17 @@ class UserInterventionMonitor:
                 self.intervention_started_at = None
                 self.last_user_input_at = None
             return now < self.pause_until
-        # Mouse movement/clicks are never user-intervention signals.  Window
-        # switching is handled independently above, and only a subsequent
-        # keyboard event may extend that pause or make it latch.
+        # Inside the game, mouse-only activity remains harmless. Once the user
+        # has switched away, every mouse move/click is real continued activity:
+        # extend the five-second quiet window and allow 20 seconds of ongoing
+        # work in the other app to require an explicit Web Continue.
         if not self._keyboard_activity_reader():
+            if (
+                current_foreground
+                and not self._is_game_foreground(current_foreground)
+                and self.intervention_started_at is not None
+            ):
+                self._note_user_intervention(now, trigger="background_mouse")
             return self.latched or now < self.pause_until
 
         is_automation = self._matches_automation_tick(controller, current_tick)
@@ -272,7 +336,7 @@ class UserInterventionMonitor:
         # motion.  Drain that delayed edge only while the game remains in the
         # foreground; a genuine Alt+Tab is still caught by window_switch.
         is_late_automation = (
-            current_foreground == self.hwnd
+            self._is_game_foreground(current_foreground)
             and time.monotonic() <= self._automation_keyboard_quiet_until
         )
         if not is_automation and not is_late_automation:

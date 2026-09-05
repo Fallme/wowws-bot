@@ -223,7 +223,7 @@ def _set_physical_cursor_pos(user32, x: int, y: int) -> bool:
 def _foreground_matches(hwnd) -> bool:
     """Treat a foreground child/owned game surface as the game window itself."""
     try:
-        foreground = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        foreground = int(win32gui.GetForegroundWindow() or 0)
         if foreground == int(hwnd):
             return True
         if not foreground:
@@ -266,7 +266,7 @@ def activate_window(hwnd):
         # game input queues is the documented activation route.  This changes
         # activation only: it never posts a mouse event or changes geometry.
         user32 = ctypes.windll.user32
-        foreground = int(user32.GetForegroundWindow() or 0)
+        foreground = int(win32gui.GetForegroundWindow() or 0)
         # GetCurrentThreadId is exported by kernel32, not user32.  Calling it
         # through user32 raised AttributeError and aborted every foreground
         # activation before SetForegroundWindow could run.

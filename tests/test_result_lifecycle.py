@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -53,6 +54,34 @@ def test_round_commits_only_after_consecutive_result_frames():
     assert confirmed
     assert state == ScreenState.RESULTS
     assert rewards.ship_xp == 1_143
+
+
+def test_confirmed_defeat_survives_final_unknown_ocr_frame():
+    from dataclasses import replace
+    reader = FixedRewardReader()
+    reward = reader.read(None)
+    outcomes = iter(["defeat", "defeat", "unknown"])
+    reader.read = lambda _: replace(reward, outcome=next(outcomes))
+    with patch("main.time.sleep"):
+        confirmed, rewards, state = collect_battle_rewards(
+            make_bot([ScreenState.RESULTS] * 3), reader, attempts=3,
+        )
+    assert confirmed
+    assert rewards.outcome == "defeat"
+
+
+def test_one_defeat_reading_is_not_enough_to_count_a_loss():
+    from dataclasses import replace
+    reader = FixedRewardReader()
+    reward = reader.read(None)
+    outcomes = iter(["unknown", "defeat", "unknown"])
+    reader.read = lambda _: replace(reward, outcome=next(outcomes))
+    with patch("main.time.sleep"):
+        confirmed, rewards, _ = collect_battle_rewards(
+            make_bot([ScreenState.RESULTS] * 3), reader, attempts=3,
+        )
+    assert confirmed
+    assert rewards.outcome == "unknown"
 
 
 def test_single_false_result_frame_does_not_commit_round():
@@ -145,3 +174,101 @@ def test_reward_ocr_failure_does_not_abort_confirmed_result_lifecycle():
     assert confirmed
     assert not rewards.recognized
     assert state == ScreenState.RESULTS
+
+
+def test_return_to_port_escapes_leftover_battle_type_selector():
+    """A residual battle-type selector is classified UNKNOWN and would spin
+    forever; return_to_port must close it with Esc and re-check the scene."""
+    image = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class Gamepad:
+        escapes = 0
+
+        def escape(self):
+            self.escapes += 1
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SimpleNamespace(grab=lambda *_a, **_k: image),
+        last_analysis=None,
+        gamepad=Gamepad(),
+        distance_reader=SimpleNamespace(backend=Mock()),
+    )
+
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.classify_runtime_screen", side_effect=[ScreenState.UNKNOWN, ScreenState.PORT]),
+        patch("main.operation_paused", return_value=False),
+        patch("main.in_battle_type_selector", return_value=True),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert return_to_port(bot, attempts=2)
+
+    assert bot.gamepad.escapes == 1
+
+
+def test_return_to_port_tries_escape_three_times_for_unrecognized_pages():
+    image = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class Gamepad:
+        escapes = 0
+
+        def escape(self):
+            self.escapes += 1
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SimpleNamespace(grab=lambda *_a, **_k: image),
+        last_analysis=None,
+        gamepad=Gamepad(),
+        distance_reader=SimpleNamespace(backend=Mock()),
+        intervention=None,
+    )
+
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch(
+            "main.classify_runtime_screen",
+            side_effect=[
+                ScreenState.UNKNOWN,
+                ScreenState.UNKNOWN,
+                ScreenState.UNKNOWN,
+                ScreenState.PORT,
+            ],
+        ),
+        patch("main.operation_paused", return_value=False),
+        patch("main.in_battle_type_selector", return_value=False),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert return_to_port(bot, attempts=4)
+
+    assert bot.gamepad.escapes == 3
+
+
+def test_same_battle_continuation_rebuilds_closed_distance_ocr():
+    """An unconfirmed result page can send the loop back into the same
+    battle; collect_battle_rewards already closed the async OCR service and
+    the continuation skips bot.reset(), so rebuild_distance_ocr must return
+    a service whose executor still accepts submissions."""
+    import bot as bot_module
+    from config_loader import load_ship_config
+
+    with (
+        patch.object(bot_module, "create_input_controller", return_value=Mock()),
+        patch.object(bot_module, "Vision", return_value=Mock()),
+        patch.object(bot_module, "TargetDistanceReader", return_value=Mock()),
+    ):
+        bot = bot_module.BattleBot(hwnd=1, ship_config=load_ship_config("napoli"))
+    service = bot.distance_ocr_service
+    service.close()
+    bot.rebuild_distance_ocr()
+    assert bot.distance_ocr_service is not service
+    submitted = bot.distance_ocr_service.submit(
+        np.full((10, 10, 3), 80, np.uint8),
+        [((5, 5), "probe")],
+        captured_at=0.0,
+    )
+    assert submitted
+    bot.distance_ocr_service.close()
+    bot.rebuild_distance_ocr()  # repeated close/rebuild must stay safe
+    bot.distance_ocr_service.close()

@@ -134,6 +134,36 @@ def test_active_round_rejects_stable_port_until_results_are_seen():
     assert state == ScreenState.UNKNOWN
 
 
+def test_active_round_accepts_real_port_after_result_was_missed():
+    frame = object()
+
+    class ConfirmedPortVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.PORT
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=ConfirmedPortVision(),
+        distance_reader=SimpleNamespace(backend=object()),
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.port_battle_action_point", return_value=(100, 100)),
+    ):
+        state = recover_current_scene(
+            bot,
+            attempts=2,
+            round_in_progress=True,
+        )
+
+    assert state == ScreenState.PORT
+
+
 def test_active_round_battle_hud_overrides_false_port_classification():
     class ConflictingVision:
         @staticmethod

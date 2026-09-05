@@ -221,6 +221,7 @@ def test_reset_preserving_engine_still_clears_previous_battle_navigation_state()
     bot.opening_autopilot_active = True
     bot.opening_autopilot_target = "上一局航点"
     bot.opening_autopilot_target_normalized = (0.8, 0.2)
+    bot._tactical_map_attempted_this_battle = True
     bot._tactical_map_left_open = True
     bot.generic_center_route_active = True
 
@@ -234,8 +235,24 @@ def test_reset_preserving_engine_still_clears_previous_battle_navigation_state()
     assert not bot.opening_autopilot_active
     assert bot.opening_autopilot_target == ""
     assert bot.opening_autopilot_target_normalized is None
+    assert not bot._tactical_map_attempted_this_battle
     assert not bot._tactical_map_left_open
     assert not bot.generic_center_route_active
+
+
+def test_reset_preserves_tactical_attempt_guard_for_preconfigured_same_battle():
+    bot = BattleBot(
+        1,
+        {"strategy": {}},
+        vision=object(),
+        gamepad=RecordingGamepad(),
+        distance_reader=FixtureDistanceReader(),
+    )
+    bot._tactical_map_attempted_this_battle = True
+
+    bot.reset(preserve_movement=True, preserve_static_map=True)
+
+    assert bot._tactical_map_attempted_this_battle
 
 
 def test_reset_preserves_normalized_static_map_for_same_battle_resume():
@@ -615,6 +632,29 @@ def test_confirmed_hazard_uses_damage_control_without_waiting_for_hp_drop():
     assert gamepad.damage_control_uses == 1
 
 
+def test_sustained_damage_fallback_uses_r_once_with_autopilot_and_no_fire_icon():
+    gamepad = SurvivalGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.opening_autopilot_active = True
+    now = time.monotonic()
+    bot.last_damage_control = now - 100
+    for i, hp in enumerate([1.0, .99, .98, .97]):
+        bot._health_loss_tracker.observe(hp, now + i * 3)
+        analysis = BattleAnalysis(image=None, width=2560, height=1494,
+                                  health=hp, health_recognized=True,
+                                  autopilot_enabled=True)
+        bot._execute_rules(analysis, now + i * 3)
+    assert gamepad.damage_control_uses == 1
+    assert gamepad.movements == []
+    for i, hp in enumerate([.96, .95, .94, .93]):
+        bot._health_loss_tracker.observe(hp, now + 12 + i * 3)
+        bot._execute_survival_consumables(analysis, now + 12 + i * 3)
+    assert gamepad.damage_control_uses == 1
+    bot.mark_manual_pause()
+    assert not bot._health_loss_tracker.samples
+
+
 def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
     gamepad = SurvivalGamepad()
     bot = BattleBot(
@@ -653,7 +693,7 @@ def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
     assert gamepad.movements == []
 
 
-def test_other_consumables_retry_every_thirty_seconds_while_health_is_missing():
+def test_other_consumables_wait_for_meaningful_damage_then_retry_every_thirty_seconds():
     gamepad = SurvivalGamepad()
     bot = BattleBot(
         1,
@@ -681,13 +721,15 @@ def test_other_consumables_retry_every_thirty_seconds_while_health_is_missing():
     assert bot._execute_survival_consumables(analysis_at(1.0), now)
     assert gamepad.other_consumable_uses == 0
     assert bot._execute_survival_consumables(analysis_at(0.99), now + 1)
-    assert gamepad.other_consumable_uses == 1
-    assert bot._execute_survival_consumables(analysis_at(0.70), now + 30)
-    assert gamepad.other_consumable_uses == 1
+    assert gamepad.other_consumable_uses == 0
+    assert bot._execute_survival_consumables(analysis_at(0.81), now + 30)
+    assert gamepad.other_consumable_uses == 0
     assert bot._execute_survival_consumables(analysis_at(0.70), now + 31)
-    assert gamepad.other_consumable_uses == 2
+    assert gamepad.other_consumable_uses == 1
+    assert bot._execute_survival_consumables(analysis_at(0.39), now + 60)
+    assert gamepad.other_consumable_uses == 1
     assert bot._execute_survival_consumables(analysis_at(0.39), now + 61)
-    assert gamepad.other_consumable_uses == 3
+    assert gamepad.other_consumable_uses == 2
 
 
 def test_emergency_island_command_never_reverses_from_vision_alone():
@@ -1076,7 +1118,7 @@ def test_missing_green_hud_guess_does_not_cancel_native_autopilot():
     assert not bot.generic_center_route_active
 
 
-def test_confirmed_native_autopilot_never_hands_rudder_to_qe_at_visual_target():
+def test_confirmed_native_autopilot_hands_off_only_after_stable_visual_arrival():
     gamepad = RecordingGamepad()
     bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
     bot.intervention = SimpleNamespace(poll=lambda *_args: False)
@@ -1107,11 +1149,71 @@ def test_confirmed_native_autopilot_never_hands_rudder_to_qe_at_visual_target():
     bot._execute_rules(analysis, now + 0.2)
 
     assert not bot.autopilot_retry_pending
-    assert bot.opening_autopilot_active
-    assert not bot.generic_center_route_active
+    assert not bot.opening_autopilot_active
+    assert bot.generic_center_route_active
     assert gamepad.movements == []
 
-    bot._execute_rules(analysis, now + 0.3)
+def test_confirmed_native_autopilot_hands_off_after_missing_hud_and_low_speed():
+    class TakeoverGamepad(RecordingGamepad):
+        def __init__(self):
+            super().__init__()
+            self.takeovers = 0
+
+        def takeover_from_autopilot(self):
+            self.takeovers += 1
+
+    gamepad = TakeoverGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.enable_opening_autopilot("地图中心敌方远端")
+    bot._native_autopilot_confirmed = True
+    bot._autopilot_hud_samples.extend((False, False, False))
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        in_battle=True,
+        speed_knots=0.0,
+        player_position=(100, 100),
+    )
+
+    now = time.monotonic()
+    bot._execute_rules(analysis, now)
+
+    # Missing text alone is not permission to cancel a live native route.
+    assert gamepad.takeovers == 0
+    assert bot.opening_autopilot_active
+
+    bot._execute_rules(analysis, now + 10.1)
+
+    assert gamepad.takeovers == 1
+    assert bot.autopilot_retry_pending
+    assert not bot.opening_autopilot_active
+    assert bot.native_autopilot_abandoned
+    assert "Q/E接管" in bot.last_movement_reason
+
+
+def test_confirmed_native_autopilot_ignores_missing_hud_while_ship_is_moving():
+    gamepad = RecordingGamepad()
+    bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
+    bot.intervention = SimpleNamespace(poll=lambda *_args: False)
+    bot.enable_opening_autopilot("地图中心敌方远端")
+    bot._native_autopilot_confirmed = True
+    bot._autopilot_hud_samples.extend((False, False, False))
+    analysis = BattleAnalysis(
+        image=None,
+        width=2560,
+        height=1494,
+        in_battle=True,
+        speed_knots=24.0,
+        player_position=(100, 100),
+    )
+
+    bot._execute_rules(analysis, 100.0)
+    bot._execute_rules(analysis, 130.0)
+
+    assert bot.opening_autopilot_active
+    assert not bot.autopilot_retry_pending
     assert gamepad.movements == []
 
 

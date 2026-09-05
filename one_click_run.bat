@@ -20,19 +20,27 @@ if errorlevel 1 (
 )
 
 rem 控制台已经运行时只打开网页，不重复启动服务。
-powershell -NoProfile -Command "if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { exit 0 } exit 1" >nul 2>nul
-if errorlevel 1 (
-    echo 正在启动本地控制台...
-    start "WOWS Control Panel" /min cmd /c ""%~dp0start_control_panel.bat""
-    echo 如果出现 Windows 用户账户控制提示，请选择“是”...
-    powershell -NoProfile -Command "$deadline=(Get-Date).AddSeconds(30); do { if (Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue) { exit 0 }; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); exit 1" >nul 2>nul
-    if errorlevel 1 (
-        echo 控制台尚未启动，请确认已允许管理员权限后再运行一次。
-        pause
-        exit /b 1
-    )
-)
+netstat -ano | findstr ":8765" | findstr "LISTENING" >nul 2>nul
+if errorlevel 1 goto :start_console
 
+:open_browser
 start "" "http://127.0.0.1:8765/"
 echo 控制台已打开：http://127.0.0.1:8765/
 exit /b 0
+
+:start_console
+echo 正在启动本地控制台...
+start "WOWS Control Panel" /min cmd /c ""%~dp0start_control_panel.bat""
+echo 如果出现 Windows 用户账户控制提示，请选择"是"...
+set /a tries=0
+:wait_control
+netstat -ano | findstr ":8765" | findstr "LISTENING" >nul 2>nul
+if not errorlevel 1 goto :open_browser
+set /a tries+=1
+if %tries% geq 60 goto :start_failed
+timeout /t 1 /nobreak >nul
+goto :wait_control
+:start_failed
+echo 控制台尚未启动，请确认已允许管理员权限后再运行一次。
+pause
+exit /b 1

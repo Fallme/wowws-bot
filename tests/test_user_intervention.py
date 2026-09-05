@@ -236,7 +236,32 @@ def test_switching_away_from_game_pauses_before_focus_can_be_stolen_back():
     assert not monitor.poll(controller, now=15.2)
 
 
-def test_mouse_activity_after_switching_away_never_extends_or_latches_pause():
+def test_same_process_render_child_is_not_treated_as_window_switch():
+    current_tick = [100]
+    foreground = [7]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: False,
+        foreground_reader=lambda: foreground[0],
+        foreground_matcher=lambda target, current: target == 7
+        and current in {7, 8},
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    foreground[0] = 8
+    current_tick[0] += 10
+    assert not monitor.poll(controller, now=10)
+    assert monitor.last_trigger == ""
+
+    foreground[0] = 99
+    assert monitor.poll(controller, now=10.1)
+    assert monitor.last_trigger == "window_switch"
+
+
+def test_mouse_activity_after_switching_away_extends_and_latches_pause():
     current_tick = [100]
     foreground = [7]
     monitor = UserInterventionMonitor(
@@ -254,15 +279,16 @@ def test_mouse_activity_after_switching_away_never_extends_or_latches_pause():
     assert monitor.poll(controller, now=10)
     assert monitor.last_trigger == "window_switch"
 
-    # The explicit window switch owns one five-second pause. Mouse-only use in
-    # the other app must not extend it or turn it into a manual-resume latch.
+    # After the explicit switch, mouse-only use in the other app is continued
+    # user activity and must keep pushing out the five-second quiet deadline.
     current_tick[0] += 10
     assert monitor.poll(controller, now=14.0)
-    for now in (15.1, 18.0, 22.0, 26.0, 30.0):
+    assert monitor.pause_until == 19.0
+    for now in (18.0, 22.0, 26.0, 30.0):
         current_tick[0] += 10
-        assert not monitor.poll(controller, now=now)
-    assert not monitor.latched
-    assert monitor.last_trigger == "window_switch"
+        assert monitor.poll(controller, now=now)
+    assert monitor.latched
+    assert monitor.last_trigger == "background_mouse"
 
 
 def test_any_tick_from_a_long_automation_batch_is_not_user_input():

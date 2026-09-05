@@ -58,6 +58,8 @@ html,body{height:100%;overflow:hidden}.app-shell{width:min(1640px,calc(100% - 32
    wide windows reserve most horizontal space for live navigation data. */
 .preset-card{grid-area:preset}.live-card{grid-area:live}.totals-card{grid-area:totals}
 button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.preset-card{display:flex;flex-direction:column;overflow-y:auto;overscroll-behavior:contain}
+.preset-card .action-row{position:sticky;bottom:0;z-index:6;padding:8px 0 2px;background:linear-gradient(180deg,transparent,#0b181de8 22%,#0b181d)}
 
 @media(min-width:1300px){
   .command-grid{

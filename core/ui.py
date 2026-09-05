@@ -80,3 +80,13 @@ RESULTS_REQUEUE_BUTTON = RelativeRegion(0.765, 0.895, 0.850, 0.935)
 RESULTS_CONTINUE_BUTTON = RESULTS_RETURN_TO_PORT_BUTTON
 HEALTH_BAR_REGION = RelativeRegion(0.014, 0.785, 0.1015, 0.817)
 MINIMAP_REGION = RelativeRegion(0.730, 0.565, 1.000, 1.000)
+# Fire markers appear as orange flame-droplets on the speed-dial ship
+# silhouette (bottom-left) and on the viewport ship model.  The viewport band
+# stops where the minimap begins: the minimap draws its own fire markers for
+# every burning spotted ship, which would otherwise pass every droplet test.
+FIRE_DIAL_ROI = RelativeRegion(0.020, 0.840, 0.120, 0.940)
+FIRE_SHIP_ROI = RelativeRegion(0.150, 0.550, MINIMAP_REGION.left, 0.900)
+# Active damage timers (fire, flooding or a disabled critical module) appear
+# as compact coloured cards immediately above the consumable row. This anchor
+# is much more stable than flames rendered on a distant/occluded ship model.
+FIRE_STATUS_ROI = RelativeRegion(0.440, 0.760, 0.530, 0.840)

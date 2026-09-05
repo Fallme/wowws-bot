@@ -254,6 +254,7 @@ def _observe_battle_entry(
     """
     stable_actionable_port = 0
     transition_frames = 0
+    no_commander_frames = 0
     sample_count = max(1, int(samples))
 
     for sample in range(sample_count):
@@ -271,21 +272,29 @@ def _observe_battle_entry(
             )
             return True
 
+        state = vision.classify_screen(image)
+        if state in {ScreenState.LOADING, ScreenState.BATTLE}:
+            logger.info("“加入战斗”请求已确认: current=%s", state.value)
+            return True
+
+        # Loading artwork can resemble the dark no-commander dialog. Scene
+        # classification owns the first decision, and the warning must remain
+        # visible on two UNKNOWN frames before it may cancel battle entry.
         no_commander_detector = getattr(
             vision,
             "in_no_commander_confirmation",
             lambda _image: False,
         )
-        if no_commander_detector(image):
+        no_commander_frames = (
+            no_commander_frames + 1
+            if state == ScreenState.UNKNOWN and no_commander_detector(image)
+            else 0
+        )
+        if no_commander_frames >= 2:
             logger.warning(
-                "检测到无指挥官拦截页；拒绝绕过提示进入战斗，返回港口重新复核指定舰船"
+                "连续两帧确认无指挥官拦截页；拒绝绕过提示进入战斗，返回港口重新复核指定舰船"
             )
             return False
-
-        state = vision.classify_screen(image)
-        if state in {ScreenState.LOADING, ScreenState.BATTLE}:
-            logger.info("“加入战斗”请求已确认: current=%s", state.value)
-            return True
 
         if state == ScreenState.PORT:
             transition_frames = 0
@@ -581,21 +590,22 @@ def dismiss_battle_survey(
     """Dismiss a positively identified survey without choosing a rating."""
     if _operation_paused(should_abort) or not is_battle_survey_page(image, backend):
         return False
+    if escape_action is not None:
+        if _operation_paused(should_abort):
+            return False
+        logger.info("已确认战斗评价页，按 Esc 跳过评价")
+        try:
+            if escape_action() is not False:
+                return True
+        except RuntimeError as error:
+            logger.info("评价页 Esc 暂未派发: %s", error)
     point = battle_survey_dismiss_point(image, backend)
     if point is not None:
         if _operation_paused(should_abort):
             return False
         logger.info("识别到战斗评价页，点击跳过/关闭: local=%s", point)
         return bool(_click_local(hwnd, point))
-    if escape_action is None or _operation_paused(should_abort):
-        return False
-    logger.info("识别到战斗评价页但未定位按钮，按 Esc 跳过")
-    try:
-        escape_action()
-    except RuntimeError as error:
-        logger.info("评价页 Esc 暂未派发: %s", error)
-        return False
-    return True
+    return False
 
 
 def in_battle_type_selector(image, backend=None):
@@ -837,6 +847,21 @@ def _tighten_mask(mask, padding=2):
 def _normalize_ship_name(value):
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     return "".join(character for character in normalized if character.isalnum())
+
+
+def _custom_ship_ocr_names(full_name):
+    """Return the configured name plus known in-game OCR/name variants.
+
+    The Chinese client renders the ship Zieten as ``齐滕``.  Older presets
+    (and user-entered values) commonly contain the homophonous ``齐藤``.  The
+    two strings refer to the same visible card here; accepting the pair only
+    in the custom-ship path keeps exact matching for every other ship intact.
+    """
+    wanted = _normalize_ship_name(full_name)
+    names = {wanted} if wanted else set()
+    if wanted in {"齐藤", "齐滕"}:
+        names.update({"齐藤", "齐滕"})
+    return names
 
 
 def _token_geometry(token):
@@ -1338,12 +1363,15 @@ def claim_daily_reward(
     # not accept the first mouse event even if Windows reported it dispatched.
     # Retry once with Enter, then keep the page open if it still cannot be
     # confirmed. This is safer than closing and forfeiting the reward.
-    claim_still_visible = None
+    # Default to "still visible" so a failed re-capture (or a later Esc that
+    # cannot be verified) keeps the reward page open instead of closing an
+    # unconfirmed claim and forfeiting the reward.
+    claim_still_visible = True
     try:
         refreshed = _capture(hwnd)
         claim_still_visible = daily_reward_claim_point(refreshed, backend) is not None
     except Exception:
-        logger.info("领取后暂时无法复核每日奖励页面；按已派发处理")
+        logger.info("领取后暂时无法复核每日奖励页面；保留页面等待下一轮重试")
 
     if claim_still_visible and confirm_action is not None and not used_keyboard_fallback:
         if _operation_paused(should_abort) or not ensure_game_window_foreground(hwnd):
@@ -1388,10 +1416,15 @@ def _ocr_name_matches(
     minimum_confidence=0.60,
     *,
     allow_tier_prefix=False,
+    wanted_names=None,
 ):
     """Return exact normalized OCR matches, joining adjacent split tokens."""
-    wanted = _normalize_ship_name(full_name)
-    if not wanted:
+    wanted_names = {
+        _normalize_ship_name(name)
+        for name in (wanted_names or (full_name,))
+        if _normalize_ship_name(name)
+    }
+    if not wanted_names:
         return []
     try:
         tokens = list(backend.recognize(image) or ())
@@ -1436,9 +1469,11 @@ def _ocr_name_matches(
                         break
                 combined += item["normalized"]
                 group.append(item)
-                exact_match = combined == wanted
+                exact_match = combined in wanted_names
                 tiered_match = allow_tier_prefix and any(
-                    combined == prefix + wanted for prefix in SHIP_TIER_PREFIXES
+                    combined == prefix + wanted
+                    for prefix in SHIP_TIER_PREFIXES
+                    for wanted in wanted_names
                 )
                 if exact_match or tiered_match:
                     x1 = min(member["box"][0] for member in group)
@@ -1453,7 +1488,9 @@ def _ocr_name_matches(
                         )
                     )
                     break
-                maximum_length = len(wanted) + (4 if allow_tier_prefix else 0)
+                maximum_length = max(map(len, wanted_names)) + (
+                    4 if allow_tier_prefix else 0
+                )
                 if len(combined) >= maximum_length:
                     break
     return matches
@@ -1469,6 +1506,7 @@ def find_custom_ship_card(image, full_name, backend=None, minimum_confidence=0.6
         full_name,
         backend,
         minimum_confidence,
+        wanted_names=_custom_ship_ocr_names(full_name),
     )
     if not matches:
         return None
@@ -1561,17 +1599,20 @@ def is_custom_ship_selected(image, full_name, backend=None, minimum_confidence=0
     """Strictly verify the selected ship name in the upper-right detail panel."""
     backend = backend or RapidOcrBackend()
     height = image.shape[0]
-    # RapidOCR needs the surrounding header context to detect the relatively
-    # small title glyphs reliably. A tight upper-right crop can drop a clearly
-    # visible title; the upper quarter contains no carousel cards and remains
-    # unambiguous for an exact ship-name check.
-    detail = image[: int(height * 0.25), :]
+    # Keep enough header context for small title glyphs, but exclude other
+    # ships' names elsewhere in the port and the lower commander panel.
+    width = image.shape[1]
+    detail = image[
+        int(height * 0.035) : int(height * 0.16),
+        int(width * 0.68) : width,
+    ]
     matches = _ocr_name_matches(
         detail,
         full_name,
         backend,
         minimum_confidence,
         allow_tier_prefix=True,
+        wanted_names=_custom_ship_ocr_names(full_name),
     )
     if matches:
         logger.info(
@@ -1594,7 +1635,7 @@ def is_selected_ship_without_commander(image, backend=None):
         int(height * 0.04) : int(height * 0.30),
         int(width * 0.79) : width,
     ]
-    wanted = _normalize_ship_name("没有指挥官")
+    wanted = ("没有指挥官", "无指挥官")
     try:
         tokens = list(backend.recognize(panel) or ())
     except Exception:
@@ -1602,13 +1643,63 @@ def is_selected_ship_without_commander(image, backend=None):
         return None
     for token in tokens:
         text = _normalize_ship_name(token.text)
-        if token.confidence >= 0.72 and wanted in text:
+        if token.confidence >= 0.72 and any(word in text for word in wanted):
             logger.info(
                 "右上角舰船详情确认无指挥官: confidence=%.3f",
                 token.confidence,
             )
             return True
     return False
+
+
+def find_ship_card_without_commander(image, ship_key, custom_name, backend):
+    """Locate a named carousel card and its own no-commander overlay.
+
+    Associate the overlay with the closest ship-name row below it, using
+    rendered text height so resolution and UI scaling remain independent.
+    """
+    height = image.shape[0]
+    top = int(height * 0.70)
+    if ship_key == CUSTOM_SHIP_KEY:
+        wanted = _custom_ship_ocr_names(custom_name)
+    else:
+        names = BUILTIN_SHIP_OCR_NAMES.get(ship_key, ())
+        wanted = {_normalize_ship_name(name) for name in names if name}
+    try:
+        candidates = _ocr_line_candidates(
+            backend.recognize(image[top:, :]), minimum_confidence=0.72
+        )
+    except Exception:
+        logger.warning("下方舰船卡片指挥官 OCR 失败；本轮不召回", exc_info=True)
+        return None
+    missing = [c for c in candidates if c["text"] in {"没有指挥官", "无指挥官"}]
+    labels = [
+        c for c in candidates
+        if any(ch.isalpha() for ch in c["text"])
+        and "指挥官" not in c["text"]
+    ]
+    for warning in missing:
+        wx1, wy1, wx2, wy2 = warning["box"]
+        wh = max(1.0, wy2 - wy1)
+        owners = []
+        for label in labels:
+            x1, y1, x2, y2 = label["box"]
+            scale = max(wh, y2 - y1, 1.0)
+            dy = (y1 + y2 - wy1 - wy2) / 2
+            dx = x2 - wx2
+            if 0.2 * scale <= dy <= 2.2 * scale and -scale <= dx <= 12 * scale:
+                owners.append((dy / scale + abs(dx) / scale, label))
+        if not owners:
+            continue
+        label = min(owners, key=lambda item: item[0])[1]
+        text = label["text"]
+        if text not in wanted and not any(
+            text == prefix + name for prefix in SHIP_TIER_PREFIXES for name in wanted
+        ):
+            continue
+        x1, y1, x2, y2 = label["box"]
+        return (int((x1 + x2) / 2), top + int((y1 + y2) / 2))
+    return None
 
 
 def _find_recall_commander_action(image, backend):
@@ -1649,32 +1740,30 @@ def ensure_selected_ship_commander(
 ):
     """Recall the selected ship's commander before joining matchmaking.
 
-    The operation is authorized only by three positive observations: the upper
-    right detail panel must name the requested ship, that same panel must say
-    ``没有指挥官``, and the opened context menu must contain the OCR text
-    ``召回指挥官``.  No blind right-click or menu coordinate is used.
+    Verify the selected title first, then require no-commander text in both
+    that detail panel and the requested carousel card before opening a menu.
     """
-    global _LAST_SELECTED_CARD_POINT
     backend = backend or RapidOcrBackend()
     ship_key = (ship_key or "").strip().lower()
+
+    def requested_ship_selected(frame):
+        if ship_key == CUSTOM_SHIP_KEY:
+            return bool(custom_name) and is_custom_ship_selected(frame, custom_name, backend)
+        return is_requested_ship_selected(
+            frame, ship_key, minimum_score=0.64, minimum_margin=0.08, backend=backend
+        )
+
+    def recall_confirmed():
+        if _operation_paused(should_abort):
+            return False
+        frame = _capture(hwnd)
+        return requested_ship_selected(frame) and is_selected_ship_without_commander(frame, backend) is False
+
     for attempt in range(1, max(1, int(attempts)) + 1):
         if _operation_paused(should_abort):
             return False
         image = _capture(hwnd)
-        if ship_key == CUSTOM_SHIP_KEY:
-            requested_selected = bool(custom_name) and is_custom_ship_selected(
-                image,
-                custom_name,
-                backend,
-            )
-        else:
-            requested_selected = is_requested_ship_selected(
-                image,
-                ship_key,
-                minimum_score=0.64,
-                minimum_margin=0.08,
-                backend=backend,
-            )
+        requested_selected = requested_ship_selected(image)
         if not requested_selected:
             logger.warning(
                 "拒绝召回指挥官：右上角当前舰船不是指定舰船 (%s)",
@@ -1686,36 +1775,25 @@ def ensure_selected_ship_commander(
             return False
         if not commander_missing:
             return True
+        point = find_ship_card_without_commander(
+            image, ship_key, custom_name, backend
+        )
+        if point is None:
+            logger.warning("右上角无指挥官，但下方指定舰船卡片未同步确认；等待重新识别，不召回")
+            return False
+        if _operation_paused(should_abort):
+            return False
         action = _find_recall_commander_action(image, backend)
         if action is not None:
             logger.info("检测到已打开的召回菜单，直接点击已识别文字: local=%s", action)
             if _click_local(hwnd, action):
                 time.sleep(1.2)
-                commander_missing = is_selected_ship_without_commander(
-                    _capture(hwnd), backend
-                )
-                if commander_missing is False:
+                if recall_confirmed():
                     logger.info("指挥官召回复核通过")
                     return True
             continue
-        if ship_key == CUSTOM_SHIP_KEY:
-            match = find_custom_ship_card(image, custom_name or "", backend)
-        else:
-            match = find_builtin_ship_card(
-                image,
-                ship_key,
-                backend,
-            )
-        if match is None:
-            point = _LAST_SELECTED_CARD_POINT
-            if point is None:
-                logger.warning("已确认无指挥官，但未定位当前舰船卡片")
-                return False
-            logger.info("舰名被菜单遮挡，沿用刚确认的选船卡片位置: %s", point)
-        else:
-            point = match[0]
         logger.info(
-            "当前舰船无指挥官，右键舰船卡片召回 (%s/%s): local=%s",
+            "舰名复核通过且上下两处均无指挥官，右键舰船卡片召回 (%s/%s): local=%s",
             attempt,
             attempts,
             point,
@@ -1726,22 +1804,24 @@ def ensure_selected_ship_commander(
         if _operation_paused(should_abort):
             return False
         menu = _capture(hwnd)
+        if not requested_ship_selected(menu):
+            logger.warning("召回菜单打开后舰船名称变化或未识别；取消召回")
+            return False
         action = _find_recall_commander_action(menu, backend)
         if action is None:
             logger.warning("舰船右键菜单中未识别到“召回指挥官”")
             continue
+        if _operation_paused(should_abort):
+            return False
         if not _click_local(hwnd, action):
             continue
         time.sleep(1.2)
         if _operation_paused(should_abort):
             return False
-        commander_missing = is_selected_ship_without_commander(
-            _capture(hwnd), backend
-        )
-        if commander_missing is False:
+        if recall_confirmed():
             logger.info("指挥官召回复核通过")
             return True
-        logger.warning("召回指挥官后右上角仍显示无指挥官")
+        logger.warning("召回后舰名或指挥官状态未通过复核")
     return False
 
 
@@ -1804,7 +1884,7 @@ def selected_ship_scores(image):
     """Score supported ship names in the port's upper-right detail panel."""
     height, width = image.shape[:2]
     search = image[
-        int(height * 0.025) : int(height * 0.22),
+        int(height * 0.025) : int(height * 0.16),
         int(width * 0.72) : width,
     ]
     search_mask = _gold_name_mask(search)
@@ -1844,7 +1924,7 @@ def detect_selected_ship(
     image,
     backend=None,
     *,
-    minimum_template_score=0.64,
+    minimum_template_score=0.86,
     minimum_template_margin=0.08,
     minimum_ocr_confidence=0.68,
 ):
@@ -1863,7 +1943,7 @@ def detect_selected_ship(
         # The card can grow leftward at larger UI scales, while the ship title
         # itself remains in the upper-right quadrant.
         detail = image[
-            int(height * 0.035) : int(height * 0.25),
+            int(height * 0.035) : int(height * 0.16),
             int(width * 0.68) : width,
         ]
         raw_tokens = ()
@@ -1939,10 +2019,14 @@ def detect_selected_ship(
         competitor,
     )
     if (
-        score >= minimum_template_score
+        # A ~0.65 match to the gold no-commander text used to impersonate
+        # Pommern and bypass the carousel click. Callers may tighten this
+        # threshold, but cannot weaken the identity check below this floor.
+        score >= max(0.86, minimum_template_score)
         and score - competitor >= minimum_template_margin
     ):
         return ship_key, score, "template"
+    logger.info("舰名未确认，模板 %.3f 不足以跳过切船；应定位并点击目标舰船", score)
     return None, score, "template_ambiguous"
 
 
@@ -2494,9 +2578,8 @@ def enter_battle(
 def queue_next_battle(hwnd=None, *, vision=None, backend=None, should_abort=None):
     """Queue the next battle from a positively identified result screen.
 
-    The orange button is used only after the complete result-screen colour
-    signature has been verified.  Callers can safely fall back to the existing
-    return-to-port path when this returns ``False``.
+    True also means a dispatched click is still pending verification. Keep
+    the entry lock during capture failures/pauses/transitions after that click.
     """
     vision = vision or Vision()
     if _operation_paused(should_abort):
@@ -2534,26 +2617,42 @@ def queue_next_battle(hwnd=None, *, vision=None, backend=None, should_abort=None
     # are still animating when the button first appears, so retry once instead
     # of reporting success for a click the game ignored.
     retried = False
+    no_commander_frames = 0
     for attempt in range(24):
         if _operation_paused(should_abort):
             logger.info("[USER] 等待下一局期间暂停，不再派发续局动作")
-            return False
+            return True
         time.sleep(0.25)
         try:
             confirmation = _capture(hwnd)
         except CaptureFault as error:
             logger.info("续局确认画面暂不可用，保留流程并稍后重识别: %s", error)
-            return False
+            return True
         state = vision.classify_screen(confirmation)
         if state in {ScreenState.LOADING, ScreenState.BATTLE}:
             return True
-        if state == ScreenState.PORT:
+        if state == ScreenState.PORT and backend is not None and _verified_action_point(
+            confirmation, backend, ("加入战斗",), region=PORT_BATTLE_TEXT_AREA
+        ) is not None:
             logger.info("继续战斗返回了港口，改用港口常规入口")
             return False
-        if state == ScreenState.UNKNOWN and vision.in_no_commander_confirmation(
-            confirmation
-        ):
-            logger.warning("续局遇到无指挥官拦截页；停止续局并返回港口复核指定舰船")
+        warning_visible = False
+        if state == ScreenState.UNKNOWN and vision.in_no_commander_confirmation(confirmation):
+            if backend is not None:
+                h, w = confirmation.shape[:2]
+                try:
+                    tokens = backend.recognize(confirmation[int(h*.30):int(h*.68), int(w*.25):int(w*.75)])
+                    warning_visible = any(
+                        token.confidence >= .75 and any(
+                            word in _normalize_ship_name(token.text)
+                            for word in ("没有指挥官", "无指挥官", "未分配指挥官")
+                        ) for token in tokens or ()
+                    )
+                except Exception:
+                    logger.debug("续局指挥官提示 OCR 暂不可用", exc_info=True)
+        no_commander_frames = no_commander_frames + 1 if warning_visible else 0
+        if no_commander_frames >= 2:
+            logger.warning("续局连续两帧文字确认无指挥官提示，交回场景恢复")
             return False
         if state == ScreenState.RESULTS and attempt >= 7 and not retried:
             logger.info("继续战斗按钮未生效，重新点击一次")
@@ -2563,17 +2662,17 @@ def queue_next_battle(hwnd=None, *, vision=None, backend=None, should_abort=None
                 else None
             )
             if backend is not None and retry_point is None:
-                return False
+                return True
             retry_clicked = (
                 _click_local(hwnd, retry_point)
                 if retry_point is not None
                 else _click_region(hwnd, confirmation, RESULTS_REQUEUE_BUTTON)
             )
             if not retry_clicked:
-                return False
+                return True
             retried = True
-    logger.warning("点击继续战斗后界面未发生变化")
-    return False
+    logger.warning("续局点击已派发，场景尚未确认；保持入局锁等待识别")
+    return True
 
 
 def force_quick_battle_return_to_port(
@@ -2675,6 +2774,8 @@ def handle_post_battle(
     """
     vision = vision or Vision()
     return_requested = False
+    pending_overlay = ScreenState.UNKNOWN
+    pending_overlay_frames = 0
     for _ in range(max_steps):
         if _operation_paused(should_abort):
             logger.info("[USER] 结算导航暂停，不切窗口、不点击")
@@ -2698,6 +2799,19 @@ def handle_post_battle(
             return False
         state = vision.classify_screen(image)
         logger.info("结算导航识别: %s", state.value)
+        if state in {ScreenState.EXIT_CONFIRMATION, ScreenState.ESCAPE_MENU}:
+            if state == pending_overlay:
+                pending_overlay_frames += 1
+            else:
+                pending_overlay = state
+                pending_overlay_frames = 1
+            if pending_overlay_frames < 2:
+                logger.info("覆盖层仅识别到一帧，等待复核后再点击")
+                time.sleep(0.25)
+                continue
+        else:
+            pending_overlay = ScreenState.UNKNOWN
+            pending_overlay_frames = 0
         if state == ScreenState.PORT:
             return True
         if state == ScreenState.LOADING:
@@ -2743,6 +2857,9 @@ def handle_post_battle(
             continue
         if state == ScreenState.EXIT_CONFIRMATION:
             if _operation_paused(should_abort):
+                return False
+            if not is_early_exit_confirmation_page(image, backend):
+                logger.warning("离开战斗确认框缺少 OCR 复核，拒绝固定位置点击")
                 return False
             _click_region(hwnd, image, EXIT_CONTINUE_BUTTON)
             logger.warning("检测到离开战斗确认框，已选择继续战斗")

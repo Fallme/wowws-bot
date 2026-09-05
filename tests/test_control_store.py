@@ -6,6 +6,20 @@ from control_server import ControlStore
 
 
 class ControlStoreTests(unittest.TestCase):
+    def test_defeat_count_survives_duplicate_unknown_poll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory) / "panel.db")
+            try:
+                store.create_run("loss-run", "pommern", "cooperative", "rounds", 2)
+                store.upsert_battle_result("loss-run", 1, "defeat")
+                store.upsert_battle_result("loss-run", 1, "unknown")
+                store.upsert_battle_result("loss-run", 2, "victory")
+                run = store.dashboard()["runs"][0]
+                self.assertEqual(run["defeats"], 1)
+                self.assertEqual(run["victories"], 1)
+            finally:
+                store.connection.close()
+
     def test_resource_entries_are_aggregated_per_run_and_globally(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory) / "panel.db")

@@ -348,6 +348,43 @@ class PortSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.find_ship_card(image, "unknown")
 
+    def test_no_commander_template_similarity_does_not_confirm_requested_ship(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(self.OcrToken(
+            "没有指挥官", 0.995,
+            ((100, 100), (250, 100), (250, 125), (100, 125)),
+        ))
+        with patch("port_navigator.selected_ship_scores", return_value={"pommern": 0.653, "napoli": 0.438}):
+            self.assertFalse(self.is_requested_ship_selected(
+                image, "pommern", minimum_score=0.64, minimum_margin=0.08, backend=backend,
+            ))
+
+    def test_unconfirmed_current_ship_clicks_target_before_commander_checks(self):
+        image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+        backend = self.backend(self.OcrToken(
+            "没有指挥官", 0.995,
+            ((100, 100), (250, 100), (250, 125), (100, 125)),
+        ))
+
+        class PortVision:
+            @staticmethod
+            def classify_screen(_image):
+                from core.ui import ScreenState
+                return ScreenState.PORT
+
+        with (
+            patch("port_navigator._capture", return_value=image),
+            patch("port_navigator.selected_ship_scores", return_value={"pommern": 0.653, "napoli": 0.438}),
+            patch("port_navigator.find_builtin_ship_card", return_value=((773, 1325), 0.95)),
+            patch("port_navigator._click_local", return_value=True) as click,
+            patch("port_navigator._verify_builtin_ship_after_click", return_value=(True, 0.98, "ocr")) as verify,
+            patch("port_navigator._remember_selected_ship"),
+            patch("port_navigator.time.sleep"),
+        ):
+            self.assertTrue(self.select_requested_ship(1, "pommern", PortVision(), ocr_backend=backend))
+            click.assert_called_once_with(1, (773, 1325))
+            verify.assert_called_once()
+
     def test_verifies_selected_ship_from_detail_panel(self):
         image = cv2.imread(str(self.FIXTURE_ROOT / "port_ship_selected.png"))
         scores = self.selected_ship_scores(image)
@@ -419,6 +456,28 @@ class PortSelectionTests(unittest.TestCase):
             )
         )
         self.assertIsNone(self.find_custom_ship_card(image, "大选帝侯", backend))
+
+    def test_custom_ship_accepts_zieten_chinese_name_variant(self):
+        image = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        backend = self.backend(
+            self.OcrToken(
+                "齐滕",
+                0.99,
+                ((1800, 120), (1850, 120), (1850, 150), (1800, 150)),
+            )
+        )
+        match = self.find_custom_ship_card(image, "齐藤", backend)
+        self.assertIsNotNone(match)
+        self.assertTrue(1800 <= match[0][0] <= 1850)
+
+        selected_backend = self.backend(
+            self.OcrToken(
+                "齐滕",
+                0.99,
+                ((100, 40), (150, 40), (150, 70), (100, 70)),
+            )
+        )
+        self.assertTrue(self.is_custom_ship_selected(image, "齐藤", selected_backend))
 
     def test_selected_custom_ship_accepts_tier_prefix_only(self):
         image = np.zeros((1440, 2560, 3), dtype=np.uint8)
