@@ -48,6 +48,7 @@ from port_navigator import (
     is_early_exit_confirmation_page,
     is_battle_survey_page,
     is_port_exit_confirmation_page,
+    click_loading_start_action,
     port_battle_action_point,
     queue_next_battle,
     is_daily_reward_page,
@@ -937,6 +938,9 @@ def wait_for_battle(
     last_clock = None
     clock_backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
     opening_attempted = False
+    loading_start_seen_at = None
+    loading_start_last_click_at = None
+    loading_start_clicks = 0
     new_round_state_reset = bool(require_new_round and loading_already_seen)
     if new_round_state_reset:
         setattr(bot, "_tactical_map_attempted_this_battle", False)
@@ -980,6 +984,59 @@ def wait_for_battle(
             loading_seen = True
             battle_frames = 0
             clock_frames = 0
+            if loading_start_action_visible(bot, image):
+                now = time.monotonic()
+                if loading_start_seen_at is None:
+                    loading_start_seen_at = now
+                    logger.info(
+                        "检测到第二阶段“开始战斗”页面，准备确认后继续等待 HUD"
+                    )
+                if (
+                    hasattr(bot, "gamepad")
+                    and loading_start_clicks < 3
+                    and (
+                        loading_start_last_click_at is None
+                        or now - loading_start_last_click_at >= 2.0
+                    )
+                ):
+                    loading_start_clicks += 1
+                    loading_start_last_click_at = now
+                    try:
+                        clicked = click_loading_start_action(
+                            bot.hwnd,
+                            image=image,
+                            vision=bot.vision,
+                            should_abort=lambda: operation_paused(bot),
+                        )
+                    except (CaptureFault, SafetyFault, RuntimeError) as error:
+                        clicked = False
+                        logger.warning(
+                            "“开始战斗”确认动作异常 (%s/3): %s",
+                            loading_start_clicks,
+                            error,
+                        )
+                    if clicked:
+                        logger.info(
+                            "已点击“开始战斗”确认按钮 (%s/3)，等待新一局 HUD",
+                            loading_start_clicks,
+                        )
+                if (
+                    loading_start_seen_at is not None
+                    and now - loading_start_seen_at >= 12.0
+                    and loading_start_clicks >= 3
+                ):
+                    logger.warning(
+                        "“开始战斗”页面连续确认失败，已达到有限重试；"
+                        "交回生命周期重新识别"
+                    )
+                    return False
+            else:
+                # A new visual episode must be allowed one fresh confirmation
+                # attempt; this also prevents a stale count from suppressing
+                # a later, genuinely actionable pre-battle page.
+                loading_start_seen_at = None
+                loading_start_last_click_at = None
+                loading_start_clicks = 0
             continue
         if state == ScreenState.BATTLE:
             unknown_frames = 0

@@ -6,6 +6,7 @@ import port_navigator
 from core.ocr import OcrToken
 from core.frame_guard import CaptureFault
 from core.ui import (
+    LOADING_START_BUTTON,
     RESULTS_REQUEUE_BUTTON,
     RESULTS_RETURN_TO_PORT_BUTTON,
     ScreenState,
@@ -29,6 +30,39 @@ def test_queue_next_battle_clicks_only_verified_requeue_region():
         assert port_navigator.queue_next_battle(vision=vision)
 
     click.assert_called_once_with(None, image, RESULTS_REQUEUE_BUTTON)
+
+
+def test_loading_start_action_clicks_only_after_visual_confirmation():
+    image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+    vision = Mock()
+    vision._has_loading_start_action.return_value = True
+
+    with patch.object(port_navigator, "_click_local", return_value=True) as click:
+        assert port_navigator.click_loading_start_action(
+            None,
+            image=image,
+            vision=vision,
+        )
+
+    click.assert_called_once_with(
+        None,
+        LOADING_START_BUTTON.center(image.shape[1], image.shape[0]),
+    )
+
+
+def test_loading_start_action_refuses_unconfirmed_loading_page():
+    image = np.zeros((1494, 2560, 3), dtype=np.uint8)
+    vision = Mock()
+    vision._has_loading_start_action.return_value = False
+
+    with patch.object(port_navigator, "_click_local") as click:
+        assert not port_navigator.click_loading_start_action(
+            None,
+            image=image,
+            vision=vision,
+        )
+
+    click.assert_not_called()
 
 
 def test_queue_next_battle_refuses_unknown_screen():

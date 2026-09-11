@@ -19,6 +19,7 @@ from core.ui import (
     BATTLE_TYPE_SEARCH_AREA,
     ESCAPE_RESUME_BUTTON,
     EXIT_CONTINUE_BUTTON,
+    LOADING_START_BUTTON,
     PORT_BATTLE_BUTTON,
     PORT_DIALOG_CLOSE,
     PORT_MODE_SELECTOR,
@@ -2528,6 +2529,49 @@ def click_center(hwnd=None):
     image = _capture(hwnd)
     height, width = image.shape[:2]
     return _click_local(hwnd, (width // 2, height // 2))
+
+
+def click_loading_start_action(
+    hwnd=None,
+    image=None,
+    *,
+    vision=None,
+    should_abort=None,
+):
+    """Click the positively detected second-stage ``开始战斗`` action.
+
+    After ``继续战斗`` the client can stop on a roster/tips page instead of
+    entering the live HUD immediately.  That page is deliberately classified
+    as loading so no movement keys are sent, but it still requires this one
+    explicit mouse confirmation.  The visual detector is the same narrow
+    green-bar detector used by the lifecycle guard, and the relative click is
+    never issued on an unverified loading frame.
+    """
+    if _operation_paused(should_abort):
+        return False
+    image = image if image is not None else _capture(hwnd)
+    vision = vision or Vision()
+    detector = getattr(vision, "_has_loading_start_action", None)
+    if not callable(detector):
+        logger.warning("加载页没有可用的“开始战斗”按钮检测器，拒绝点击")
+        return False
+    try:
+        visible = bool(detector(image))
+    except Exception:
+        logger.warning("加载页“开始战斗”按钮复核失败，拒绝点击", exc_info=True)
+        return False
+    if not visible:
+        logger.debug("当前画面未确认“开始战斗”按钮，拒绝点击")
+        return False
+    if _operation_paused(should_abort):
+        return False
+    height, width = image.shape[:2]
+    point = LOADING_START_BUTTON.center(width, height)
+    logger.info("加载页已确认“开始战斗”按钮，点击进入战斗: local=%s", point)
+    clicked = _click_local(hwnd, point)
+    if not clicked:
+        logger.warning("“开始战斗”按钮点击未派发，保留页面并稍后有限重试")
+    return bool(clicked)
 
 
 def enter_battle(

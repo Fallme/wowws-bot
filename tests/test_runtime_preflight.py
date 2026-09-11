@@ -570,6 +570,7 @@ def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():
         patch("main.time.sleep", return_value=None),
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot", return_value=False) as configure,
+        patch("main.click_loading_start_action", return_value=True) as start_click,
     ):
         assert wait_for_battle(
             bot,
@@ -580,6 +581,7 @@ def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():
 
     assert controller.reassertions == 1
     configure.assert_called_once_with(bot)
+    start_click.assert_called_once()
 
 
 def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing():
