@@ -245,6 +245,45 @@ def test_return_to_port_tries_escape_three_times_for_unrecognized_pages():
     assert bot.gamepad.escapes == 3
 
 
+def test_return_to_port_escapes_post_battle_loading_blocker():
+    """A result-ad/loading page must not leave return_to_port spinning."""
+    image = np.full((90, 160, 3), 80, dtype=np.uint8)
+
+    class Gamepad:
+        escapes = 0
+
+        def escape(self):
+            self.escapes += 1
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=SimpleNamespace(grab=lambda *_a, **_k: image),
+        last_analysis=None,
+        gamepad=Gamepad(),
+        distance_reader=SimpleNamespace(backend=Mock()),
+        intervention=None,
+    )
+
+    with (
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch(
+            "main.classify_runtime_screen",
+            side_effect=[
+                ScreenState.LOADING,
+                ScreenState.PORT,
+            ],
+        ),
+        patch("main.handle_post_battle"),
+        patch("main.operation_paused", return_value=False),
+        patch("main.in_battle_type_selector", return_value=False),
+        patch("main.is_battle_survey_page", return_value=False),
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert return_to_port(bot, attempts=2, post_battle_context=True)
+
+    assert bot.gamepad.escapes == 1
+
+
 def test_same_battle_continuation_rebuilds_closed_distance_ocr():
     """An unconfirmed result page can send the loop back into the same
     battle; collect_battle_rewards already closed the async OCR service and

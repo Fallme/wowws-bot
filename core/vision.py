@@ -616,15 +616,29 @@ class Vision:
         silhouette_candidates = [
             candidate for candidate in candidates if candidate[0]
         ]
-        ranked = silhouette_candidates or candidates
-        ranked.sort(key=lambda candidate: (candidate[1], candidate[2]), reverse=True)
+        # The range-circle score is useful when the arrow is occluded, but it
+        # is not an identity signal. A fixed triangular marker elsewhere in
+        # the minimap can have a stronger ring simply because it is painted on
+        # top of the map texture. A unique white-core silhouette is the live
+        # ship arrow and must win before ring coverage is considered.
+        white_silhouette_candidates = [
+            candidate for candidate in silhouette_candidates if candidate[7]
+        ]
+        unique_white_arrow = len(white_silhouette_candidates) == 1
+        if unique_white_arrow:
+            ranked = list(white_silhouette_candidates)
+        else:
+            ranked = silhouette_candidates or candidates
+            ranked.sort(key=lambda candidate: (candidate[1], candidate[2]), reverse=True)
         # Only portions of the range circle can be visible behind islands or
         # capture overlays.  Twelve occupied sectors still describe a ring;
         # requiring eighteen made the live white arrow disappear precisely
         # when the ship approached an island.
         minimum_coverage = 12
         minimum_score = max(32, int(scale * scale * 0.00024))
-        unique_white_arrow = len(silhouette_candidates) == 1 and ranked[0][7]
+        unique_white_arrow = unique_white_arrow or (
+            len(silhouette_candidates) == 1 and ranked[0][7]
+        )
         if not unique_white_arrow and (
             ranked[0][1] < minimum_coverage or ranked[0][2] < minimum_score
         ):
@@ -2736,10 +2750,15 @@ class Vision:
         """Classify only states with positive UI evidence; never infer by exclusion."""
         if image is None or image.size == 0:
             return ScreenState.UNKNOWN
+        # Resolve the live HUD before broad reward/modal heuristics. The
+        # pre-battle roster page has teal/orange artwork that can satisfy both
+        # of those heuristics, but it also exposes a minimap and HUD anchors.
+        # Genuine result/port overlays do not, so this ordering is safe.
+        battle_seen = self._has_battle_hud(image)
         # This port modal has neither trustworthy port nor battle controls.
         # Keep it UNKNOWN so recovery can dismiss/retry it explicitly instead
         # of ever entering the combat loop.
-        if self._is_port_reward_overlay(image):
+        if self._is_port_reward_overlay(image) and not battle_seen:
             return ScreenState.UNKNOWN
         # After a battle, the game can return to the port while leaving a
         # right-side victory/defeat reward card open.  This is positive proof
@@ -2748,14 +2767,20 @@ class Vision:
         # The reward collector independently recognizes and OCRs this card.
         from core.results import ResultRewardReader
 
-        if ResultRewardReader._looks_like_port_reward_card(image):
-            return ScreenState.PORT
+        reward_card_seen = ResultRewardReader._looks_like_port_reward_card(image)
+        if reward_card_seen:
+            # A pre-battle roster can trip the broad reward-card detector, but
+            # its explicit start action is stronger evidence that this is not
+            # the port. Keep ordinary post-battle reward cards as PORT even if
+            # incidental artwork happens to resemble a HUD.
+            start_action_seen = self._has_loading_start_action(image)
+            if not start_action_seen:
+                return ScreenState.PORT
         loading_seen = self.in_loading(image)
         # Resolve explicit menu pages before considering battle.  A port has
         # dense bottom cards and a real "加入战斗" action; a battle HUD must
         # never override that positive evidence.  The old ordering did the
         # reverse and let incidental port texture become a combat state.
-        battle_seen = self._has_battle_hud(image)
         # Result-button colour alone is not sufficient: battle score markers,
         # consumables and minimap overlays can produce the same teal/orange
         # ratios.  A live battle HUD always wins this conflict so combat is

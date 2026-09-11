@@ -23,6 +23,8 @@ DEFAULT_GAME_PROCESS_NAMES = frozenset(
 )
 _INTERACTION_PAUSE_GUARD = None
 _AUTOMATION_INPUT_OBSERVER = None
+MIN_GAME_SURFACE_WIDTH = 640
+MIN_GAME_SURFACE_HEIGHT = 360
 
 
 def configured_game_process_names() -> frozenset[str]:
@@ -224,25 +226,36 @@ def _foreground_matches(hwnd) -> bool:
     """Treat a foreground child/owned game surface as the game window itself."""
     try:
         foreground = int(win32gui.GetForegroundWindow() or 0)
-        if foreground == int(hwnd):
-            return True
+        target = int(hwnd)
+        if foreground == target:
+            return is_usable_game_window(target)
         if not foreground:
             return False
-        if int(win32gui.GetAncestor(foreground, win32con.GA_ROOT)) == int(
-            win32gui.GetAncestor(int(hwnd), win32con.GA_ROOT)
-        ):
-            return True
+        foreground_root = int(win32gui.GetAncestor(foreground, win32con.GA_ROOT))
+        target_root = int(win32gui.GetAncestor(target, win32con.GA_ROOT))
+        if foreground_root == target_root:
+            # A child/render surface is allowed when its root is the usable
+            # game window. This rejects a tiny helper HWND that happens to be
+            # foreground while preserving normal child-window activation.
+            return is_usable_game_window(target_root) or is_usable_game_window(target)
         # DirectX can replace the visible render surface without immediately
         # invalidating the previously bound top-level HWND. Treat any visible
-        # surface owned by the exact same game process as foreground; matching
-        # only roots made an already-active game look permanently background.
+        # surface owned by the exact same game process as foreground, but only
+        # when both surfaces have real game-sized geometry. Matching any tiny
+        # same-process helper made input appear successful while the game stayed
+        # stopped until a manual screen switch.
         _target_thread, target_pid = win32process.GetWindowThreadProcessId(
-            int(hwnd)
+            target
         )
         _foreground_thread, foreground_pid = (
             win32process.GetWindowThreadProcessId(foreground)
         )
-        return bool(target_pid and int(target_pid) == int(foreground_pid))
+        return bool(
+            target_pid
+            and int(target_pid) == int(foreground_pid)
+            and is_usable_game_window(target)
+            and is_usable_game_window(foreground)
+        )
     except Exception:
         return False
 
@@ -389,6 +402,30 @@ def is_game_window(hwnd) -> bool:
         return is_game_process_window(int(hwnd))
     except Exception:
         return False
+
+
+def is_usable_game_window(hwnd) -> bool:
+    """Return whether a game HWND exposes enough surface for capture/input.
+
+    During DirectX display-mode transitions Windows can briefly expose a
+    visible same-process surface with a near-zero rectangle. It is a valid
+    process window but not a usable game target, so callers must reacquire or
+    activate the real render surface instead of treating it as focused.
+    """
+    if not hwnd:
+        return False
+    try:
+        rect = get_window_rect(int(hwnd))
+        return bool(
+            int(rect.get("width", 0)) >= MIN_GAME_SURFACE_WIDTH
+            and int(rect.get("height", 0)) >= MIN_GAME_SURFACE_HEIGHT
+        )
+    except Exception:
+        # Geometry APIs can fail for a window while it is being recreated.
+        # Keep the existing identity checks authoritative and let activation
+        # retry; this helper must not turn a transient Win32 error into a
+        # permanent loss of the game binding.
+        return True
 
 
 def ensure_game_window_foreground(hwnd) -> bool:
