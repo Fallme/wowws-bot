@@ -4,7 +4,7 @@ import bot as bot_module
 from bot import BattleBot
 
 
-def test_completed_round_keeps_matching_frames_events_and_log_then_prunes_old(tmp_path, monkeypatch):
+def test_completed_round_preserves_all_previous_rounds_and_trajectory(tmp_path, monkeypatch):
     root = tmp_path / "runs"
     old = root / "run_20000101_000000"
     old.mkdir(parents=True)
@@ -29,7 +29,9 @@ def test_completed_round_keeps_matching_frames_events_and_log_then_prunes_old(tm
     assert (current / "events.jsonl").exists()
     assert (current / "round.log").exists()
     assert (current / "completed.json").exists()
-    assert not old.exists()
+    assert old.exists()
+    assert (current / "trajectory.png").exists()
+    assert (current / "trajectory.jsonl").exists()
     assert (active / "round.log").read_text(encoding="utf-8") == "still recording"
     assert bot.complete_round_diagnostics(3) == current
     bot.stop(release_input=False)

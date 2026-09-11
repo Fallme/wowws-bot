@@ -232,6 +232,8 @@ class ResultRewardReader:
                     index
                     for index, (other, _other_piece) in enumerate(kept)
                     if cls._overlap_ratio(token, other) >= 0.55
+                    or (cls._overlap_ratio(token, other) >= 0.40
+                        and (piece.startswith(_other_piece) or _other_piece.startswith(piece)))
                 ),
                 None,
             )
@@ -476,6 +478,33 @@ class ResultRewardReader:
         )
         return float(np.mean(vivid_green)) >= 0.012
 
+    def _anchored_reward_regions(self, image, regions):
+        """Locate the numeric row below its label, independent of window height.
+
+        Keep the calibrated horizontal columns; moving the panel vertically
+        must not make the reader repeatedly OCR the caption instead of credits.
+        The next section's damage total is outside this narrow anchored row.
+        """
+        height, width = image.shape[:2]
+        left, top = int(width * 0.04), int(height * 0.20)
+        crop = image[top:int(height * 0.65), left:int(width * 0.65)]
+        for token in self.backend.recognize(crop):
+            if "在战斗中获得" not in re.sub(r"\s+", "", token.text):
+                continue
+            if token.confidence < 0.75 or len(token.box) < 4:
+                continue
+            ys = [point[1] for point in token.box]
+            label_height = max(ys) - min(ys)
+            if label_height < 8:
+                continue
+            y1 = (top + max(ys) + label_height * 0.10) / height
+            y2 = min(1.0, (top + max(ys) + label_height * 2.5) / height)
+            return {
+                name: RelativeRegion(region.left, y1, region.right, y2)
+                for name, region in regions.items()
+            }
+        return None
+
     def read(self, image) -> BattleRewards:
         height, width = image.shape[:2]
         # Layout follows the captured client aspect ratio.  A maximized 16:9
@@ -487,7 +516,18 @@ class ResultRewardReader:
             regions = BORDERLESS_RESULT_REWARD_REGIONS
         else:
             regions = RESULT_REWARD_REGIONS
-        rewards = self._read_regions(image, regions)
+        # A clipped leading digit can still score 99% OCR confidence. For real
+        # images, locate the row first. This also avoids expensive numeric
+        # fallback retries against a caption that cannot contain any credits.
+        anchored = None
+        if isinstance(self.backend, RapidOcrBackend):
+            try:
+                anchored = self._anchored_reward_regions(image, regions)
+            except Exception:
+                logger.debug("结算收益标题定位失败", exc_info=True)
+        rewards = self._read_regions(image, anchored or regions)
+        if anchored is not None and not rewards.recognized:
+            rewards = self._read_regions(image, regions)
         if rewards.recognized or not self._looks_like_port_reward_card(image):
             return rewards
 

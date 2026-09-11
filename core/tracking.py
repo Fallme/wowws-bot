@@ -27,6 +27,41 @@ class ConsecutivePointFilter:
         return [(round(point[0]), round(point[1])) for point in confirmed]
 
 
+class NavigationTargetLock:
+    """Associate a current contact with the selected normalized target.
+
+    Missing targets are never returned as live observations. Brief misses do
+    not authorize switching to a different ship on every control frame.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.position = None
+        self.seen_at = None
+        self.misses = 0
+
+    def update(self, contacts, preferred, now):
+        if self.seen_at is not None and (now < self.seen_at or now - self.seen_at > 4.0):
+            self.reset()
+        if self.position is not None:
+            matches = [p for p in contacts if math.dist(p, self.position) <= .025]
+            if matches:
+                self.position = min(matches, key=lambda p: math.dist(p, self.position))
+                self.seen_at = now
+                self.misses = 0
+                return self.position
+            self.misses += 1
+            if self.misses < 3:
+                return None
+            self.reset()
+        if preferred is not None:
+            self.position = preferred
+            self.seen_at = now
+        return self.position
+
+
 class ArrowHeadingFilter:
     """Smooth the live white-arrow vector without deriving heading from travel.
 

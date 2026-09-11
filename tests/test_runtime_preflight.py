@@ -1679,3 +1679,36 @@ def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():
 
     assert rebound == [22]
     maximize.assert_called_once_with(22)
+
+
+def test_daily_reward_preflight_allows_lifecycle_without_movement_probe(tmp_path):
+    class BattleVision(FakeVision):
+        def classify_screen(self, _image):
+            return ScreenState.DAILY_REWARD
+
+    controller = FakeController()
+    bot = SimpleNamespace(hwnd=1, gamepad=controller, vision=BattleVision())
+    store = CalibrationStore(tmp_path / "input_calibration.json")
+
+    with (
+        patch("main.ensure_game_window_foreground", return_value=True),
+        patch("main.time.sleep", return_value=None),
+    ):
+        status = automatic_input_preflight(
+            bot,
+            "World of Warships",
+            (0, 0, 2560, 1600),
+            ScreenState.DAILY_REWARD,
+            store=store,
+        )
+
+    assert status.valid
+    assert controller.stop_calls == 0
+    assert bot.vision.allow_stale_requests == [True]
+    record = store.load()
+    assert record is not None
+    assert (
+        record.observations[AUTOMATIC_PREFLIGHT_KEY]["input_check"]
+        == "reward_controls_preserved"
+    )
+

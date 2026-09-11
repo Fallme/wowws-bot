@@ -41,6 +41,7 @@ from core.window import (
     get_window_rect,
     physical_click,
     physical_scroll,
+    park_port_cursor,
     window_message_click,
 )
 from dxgi_capture import ScreenCapture
@@ -2152,7 +2153,7 @@ def _confirm_custom_ship_after_click(
             time.sleep(0.5)
             if _operation_paused(should_abort):
                 return False
-            if is_custom_ship_selected(_capture(hwnd), full_name, backend):
+            if is_custom_ship_selected(_capture_ship_cards(hwnd), full_name, backend):
                 _remember_selected_ship(f"custom:{full_name}")
                 return True
         logger.warning(
@@ -2189,11 +2190,17 @@ def _rewind_ship_carousel(hwnd, rect, *, steps=20, should_abort=None):
     return moved
 
 
-def _scroll_ship_carousel_down(hwnd, rect, *, step=6):
+def _scroll_ship_carousel_down(hwnd, rect, *, step=3):
     """Advance one page through the carousel after it has been rewound."""
     carousel_x = rect["left"] + rect["width"] // 2
     carousel_y = rect["top"] + int(rect["height"] * 0.90)
     return physical_scroll(carousel_x, carousel_y, -abs(int(step)), hwnd=hwnd)
+
+
+def _capture_ship_cards(hwnd):
+    if hwnd:
+        park_port_cursor(hwnd)
+    return _capture(hwnd)
 
 
 def _select_custom_ship(
@@ -2212,7 +2219,7 @@ def _select_custom_ship(
             return False
         if _operation_paused(should_abort):
             return False
-        image = _capture(hwnd)
+        image = _capture_ship_cards(hwnd)
         if is_custom_ship_selected(image, full_name, backend):
             logger.info("回到舰船栏起点后已确认目标自定义舰船: %s", full_name)
             _remember_selected_ship(f"custom:{full_name}")
@@ -2249,7 +2256,7 @@ def _select_custom_ship(
         time.sleep(0.35)
         if _operation_paused(should_abort):
             return False
-        image = _capture(hwnd)
+        image = _capture_ship_cards(hwnd)
         if is_custom_ship_selected(image, full_name, backend):
             _remember_selected_ship(f"custom:{full_name}")
             return True
@@ -2279,7 +2286,7 @@ def select_requested_ship(
     if ship_key not in SUPPORTED_SHIPS and not is_custom:
         logger.error("不支持的舰船: %s", ship_key)
         return False
-    image = _capture(hwnd)
+    image = _capture_ship_cards(hwnd)
     vision = vision or Vision()
     if vision.classify_screen(image) != ScreenState.PORT:
         logger.warning("当前不是港口，拒绝选择舰船")
@@ -2314,7 +2321,7 @@ def select_requested_ship(
                     return False
                 time.sleep(0.25)
                 try:
-                    refreshed = _capture(hwnd)
+                    refreshed = _capture_ship_cards(hwnd)
                 except CaptureFault:
                     continue
                 if vision.classify_screen(refreshed) != ScreenState.PORT:
@@ -2386,7 +2393,7 @@ def select_requested_ship(
                     return False
                 time.sleep(0.25)
                 try:
-                    image = _capture(hwnd)
+                    image = _capture_ship_cards(hwnd)
                 except CaptureFault:
                     continue
                 try:
@@ -2429,7 +2436,7 @@ def select_requested_ship(
             return False
         if _operation_paused(should_abort):
             return False
-        image = _capture(hwnd)
+        image = _capture_ship_cards(hwnd)
         selected_key, _confidence, _source = detect_selected_ship(
             image,
             selection_backend,
@@ -2459,7 +2466,7 @@ def select_requested_ship(
             time.sleep(0.25)
             if _operation_paused(should_abort):
                 return False
-            image = _capture(hwnd)
+            image = _capture_ship_cards(hwnd)
             selected_key, _confidence, _source = detect_selected_ship(
                 image,
                 selection_backend,

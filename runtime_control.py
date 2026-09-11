@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -13,6 +14,20 @@ from typing import Any
 
 
 logger = logging.getLogger("runtime")
+
+
+def shutdown_after_plan(limits, plan_completed):
+    """Power off only after an explicitly selected plan completes normally."""
+    if not plan_completed or not limits.shutdown_when_done or limits.stop_requested():
+        return False
+    try:
+        subprocess.run(["shutdown.exe", "/s", "/t", "0"], check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        logger.info("整组正常完成，已发送关机请求")
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        logger.exception("关机请求失败")
+        return False
 
 
 @dataclass(frozen=True)
@@ -25,6 +40,7 @@ class RunLimits:
     pause_file: Path | None = None
     quick_battle: bool = False
     close_game_when_done: bool = False
+    shutdown_when_done: bool = False
 
     @classmethod
     def from_env(cls) -> "RunLimits":
@@ -47,6 +63,7 @@ class RunLimits:
             pause_file=Path(pause) if pause else None,
             quick_battle=quick in {"1", "true", "yes", "on"},
             close_game_when_done=close_game in {"1", "true", "yes", "on"},
+            shutdown_when_done=os.environ.get("WOWS_SHUTDOWN_WHEN_DONE", "").lower() in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -89,6 +106,7 @@ class RuntimeStatus:
     duration_minutes: float = 0
     quick_battle: bool = False
     close_game_when_done: bool = False
+    shutdown_when_done: bool = False
     started_at: float = 0
     updated_at: float = field(default_factory=time.time)
     error: str = ""
@@ -169,6 +187,7 @@ class RuntimeReporter:
             duration_minutes=limits.duration_minutes,
             quick_battle=limits.quick_battle,
             close_game_when_done=limits.close_game_when_done,
+            shutdown_when_done=limits.shutdown_when_done,
             started_at=time.time(),
         )
 

@@ -31,6 +31,11 @@ class ScreenStateRegressionTests(unittest.TestCase):
             ScreenState.LOADING,
         )
 
+    def test_live_teal_start_button_defers_opening_navigation(self):
+        image = cv2.imread(str(self.FIXTURE_ROOT / "loading_tips_live.png"))
+        self.assertTrue(self.vision._has_loading_start_action(image))
+        self.assertEqual(self.vision.classify_screen(image), ScreenState.LOADING)
+
     def test_login_startup_artwork_is_loading_never_battle_or_modal(self):
         image = cv2.imread(str(self.FIXTURE_ROOT / "login_startup.png"))
         self.assertIsNotNone(image)

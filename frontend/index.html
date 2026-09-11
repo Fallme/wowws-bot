@@ -65,14 +65,26 @@
             <p id="limitHint">完整结束 5 局后返回港口并停止</p>
           </div>
           <label class="quick-battle-toggle"><input id="quickBattle" type="checkbox" /><span><b>快速战斗</b><small>单局最多 5 分钟；计入计划局数，不统计收益或胜负</small></span></label>
-          <label class="quick-battle-toggle"><input id="closeGameWhenDone" type="checkbox" /><span><b>完成后关闭游戏</b><small>仅整组目标完成后关闭《战舰世界》；暂停、终止或异常不会关闭</small></span></label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <label class="quick-battle-toggle"><input id="closeGameWhenDone" type="checkbox" /><span><b>完成后关闭游戏</b></span></label>
+          <label class="quick-battle-toggle"><input id="shutdownWhenDone" type="checkbox" /><span><b>运行完关机</b></span></label>
+          </div>
           <div class="readiness" id="calibrationCard"><span></span><div><strong id="calibrationTitle">启动时自动检查</strong><small id="calibrationMessage">画面、港口和输入均由系统确认</small></div></div>
           <div class="action-row"><button class="start-button" id="startBtn"><span>开始自动战斗</span><b>→</b></button><button class="stop-button" id="stopBtn" disabled>终止任务</button></div>
           <p class="microcopy">开始后自动启动游戏、校验港口、选择舰船并循环完整对局。</p>
         </article>
 
         <article class="deck-card live-card">
-          <div class="section-title"><span>02</span><div><small>LIVE OPERATION</small><h2>当前状态</h2></div><em id="liveBadge">OFFLINE</em></div>
+          <div class="section-title live-section-title"><span>02</span><div><small>LIVE OPERATION</small><h2>当前状态</h2></div>
+          <div class="ocr-toolbar" title="切换在下次任务生效；显卡组件自动安装，失败回退 CPU">
+            <span class="ocr-toolbar-label" id="ocrRuntimeStatus" role="status">OCR 待机</span>
+            <input type="hidden" id="ocrDevice" value="nvidia" />
+            <div class="ocr-device-switch" role="group" aria-label="OCR 识别设备，下次任务生效">
+              <button type="button" data-ocr-device="cpu" aria-pressed="false">CPU</button>
+              <button type="button" data-ocr-device="nvidia" aria-pressed="true">NVIDIA</button>
+            </div>
+          </div>
+          <em id="liveBadge">OFFLINE</em></div>
           <div class="operation-copy operation-banner"><small>当前阶段</small><strong id="movementMode">等待任务</strong><p id="movementReason">配置预设后即可开始</p></div>
           <div class="live-workspace">
             <div class="map-column">

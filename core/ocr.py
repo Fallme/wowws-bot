@@ -103,9 +103,9 @@ def numeric_ocr_fallback_variants(image: np.ndarray) -> tuple[np.ndarray, ...]:
 class RapidOcrBackend:
     """Lazy offline RapidOCR backend with CUDA-first, CPU fallback execution."""
 
-    def __init__(self, *, prefer_gpu: bool = True, device_id: int = 0):
+    def __init__(self, *, prefer_gpu: bool | None = None, device_id: int = 0):
         self._engine = None
-        self.prefer_gpu = bool(prefer_gpu)
+        self.prefer_gpu = (os.environ.get("WOWS_OCR_DEVICE", "nvidia") != "cpu") if prefer_gpu is None else bool(prefer_gpu)
         self.device_id = max(0, int(device_id))
         self.execution_provider = "uninitialized"
         self.fallback_reason = ""
@@ -272,9 +272,31 @@ class RapidOcrBackend:
         model_root = Path(rapidocr.__file__).resolve().parent / "models"
         self._engine = self._build_engine(RapidOCR, model_root, use_cuda=False)
 
+    def recognize_glyph(self, image: np.ndarray) -> list[OcrToken]:
+        """Recognize an already located cap letter with the same OCR model.
+
+        Tiny single letters are often dropped by text detection. The geometric
+        marker detector supplies this crop, so run recognition directly.
+        """
+        if image is None or image.size == 0:
+            return []
+        from rapidocr.ch_ppocr_rec import TextRecInput
+        engine = self._load()
+        crop = cv2.resize(image, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        args = TextRecInput(img=crop, return_word_box=False)
+        try:
+            result = engine.text_rec(args)
+        except Exception as error:
+            if self.execution_provider != "CUDAExecutionProvider":
+                raise
+            self._fallback_to_cpu(error)
+            result = self._engine.text_rec(args)
+        return [OcrToken(str(text), float(score)) for text, score in zip(result.txts, result.scores)]
+
     def recognize(self, image: np.ndarray) -> list[OcrToken]:
         if image is None or image.size == 0:
             return []
+        started = time.perf_counter()
         engine = self._load()
         try:
             result = engine(image, use_cls=False, text_score=0.60)
@@ -295,6 +317,7 @@ class RapidOcrBackend:
             raw_box = boxes[index] if index < len(boxes) else ()
             box = tuple((float(point[0]), float(point[1])) for point in raw_box)
             tokens.append(OcrToken(str(text), score, box))
+        logger.debug("OCR %s 区域 %sx%s 文字 %s 条   %.0fms", self.execution_provider, image.shape[1], image.shape[0], len(tokens), (time.perf_counter() - started) * 1000)
         return tokens
 
 

@@ -46,8 +46,10 @@ class StuckRecoveryController:
         self.low_speed_started = None
         self.active_side = self.preferred_side
         self._next_fallback_side = self.preferred_side
+        self.reverse_until = None
 
     def reset(self):
+        self.reverse_until = None
         self.samples.clear()
         self.recovery_started = None
         self.cooldown_until = 0.0
@@ -60,6 +62,12 @@ class StuckRecoveryController:
         self.samples.clear()
         self.recovery_started = None
         self.low_speed_started = None
+        self.reverse_until = None
+
+    def begin_reverse(self, now, escape_rudder=None, seconds=12.0):
+        """Only the native-route low-speed AND displacement watchdog may arm this."""
+        self._begin_recovery(now, escape_rudder)
+        self.reverse_until = now + max(2.0, min(float(seconds), 20.0))
 
     def _record(self, now, position):
         if position is None:
@@ -125,6 +133,11 @@ class StuckRecoveryController:
         speed_knots=None,
     ):
         self._record(now, position)
+        if self.reverse_until is not None:
+            if now < self.reverse_until:
+                return RecoveryCommand(-1.0, 0.0, "reverse_clear")
+            self.recovery_started = now
+            self.reverse_until = None
         if self.recovery_started is not None:
             elapsed = now - self.recovery_started
             if elapsed < self.escape_turn_seconds:

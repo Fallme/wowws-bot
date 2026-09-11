@@ -97,7 +97,8 @@ class SendInputBackend:
     def _send_key(self, key: str, *, key_up: bool):
         virtual_key = VK[key]
         flags = KEYEVENTF_KEYUP if key_up else 0
-        self.user32.keybd_event(virtual_key, 0, flags, 0)
+        scan_code = self.user32.MapVirtualKeyW(virtual_key, 0)
+        self.user32.keybd_event(virtual_key, scan_code, flags, 0)
         self._mark_injected(keyboard=True)
 
     def key_down(self, key: str):
@@ -107,9 +108,13 @@ class SendInputBackend:
         self._send_key(key, key_up=True)
 
     def tap(self, key: str):
+        started = time.perf_counter()
         self.key_down(key)
-        time.sleep(self.tap_seconds)
-        self.key_up(key)
+        try:
+            time.sleep(self.tap_seconds)
+        finally:
+            self.key_up(key)
+            logger.debug("按键 %s   %.0fms", key, (time.perf_counter() - started) * 1000)
 
     def left_click(self):
         down = _INPUT(type=INPUT_MOUSE, mi=_MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0))
@@ -132,7 +137,7 @@ class KeyboardDispatch:
 
 
 class KeyboardController:
-    """Native W/S engine-telegraph and A/D rudder controller."""
+    """Native W/S engine telegraph and five-notch Q/E rudder controller."""
 
     backend_name = "windows_native_keyboard"
     MAX_NOTCH = 4
@@ -224,6 +229,16 @@ class KeyboardController:
                 self.device.tap("s")
             self._throttle_notch = target
 
+    def reverse_escape(self):
+        """Explicit bounded-recovery input; ordinary navigation stays forward-only."""
+        self._ensure_target_focus()
+        self._set_rudder(0.0)
+        if self._throttle_notch != -self.MAX_NOTCH:
+            for _ in range(self.MAX_NOTCH * 2):
+                self.device.tap("s")
+            self._throttle_notch = -self.MAX_NOTCH
+        self._record("reverse_escape", -1.0, 0.0)
+
     def _set_rudder(self, rudder: float):
         value = self._clamp(rudder)
         if abs(value) < 0.10:
@@ -235,7 +250,9 @@ class KeyboardController:
         key = "e" if delta > 0 else "q"
         for _ in range(abs(delta)):
             self.device.tap(key)
-        self._rudder_notch = target
+            # Preserve completed taps if a later input fails. A retry must
+            # send only the remaining notches, not repeat the whole reversal.
+            self._rudder_notch += 1 if delta > 0 else -1
 
     def set_movement(self, throttle: float, rudder: float):
         self._ensure_target_focus()

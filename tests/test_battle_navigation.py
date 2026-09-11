@@ -372,7 +372,11 @@ def test_island_layer_voting_survives_one_empty_detection_frame():
     assert BattleBot._confirmed_island_layer(samples, [island]) is None
     assert BattleBot._confirmed_island_layer(samples, []) is None
     assert BattleBot._confirmed_island_layer(samples, [island]) is None
-    assert BattleBot._confirmed_island_layer(samples, [island]) == [island]
+    confirmed = BattleBot._confirmed_island_layer(samples, [island])
+    assert len(confirmed) == 1
+    assert confirmed[0]["area"] == pytest.approx(island["area"], abs=0.001)
+    from core.terrain import rasterize
+    assert (rasterize(confirmed) == rasterize([island])).all()
 
 
 def test_player_pose_uses_short_cache_when_one_minimap_frame_misses_arrow():
@@ -791,7 +795,7 @@ def test_normal_rudder_direction_waits_for_ship_response_before_reversing():
     assert bot._latency_compensated_rudder(-0.4, 14.8) == -0.4
 
 
-def test_island_override_releases_to_neutral_before_opposite_rudder():
+def test_island_override_orders_counter_rudder_without_artificial_wait():
     bot = BattleBot(
         1,
         {"strategy": {"rudder_minimum_hold_seconds": 4.0}},
@@ -802,7 +806,7 @@ def test_island_override_releases_to_neutral_before_opposite_rudder():
     assert bot._latency_compensated_rudder(0.4, 10.0) == 0.4
     assert bot._latency_compensated_rudder(
         -0.8, 10.5, safety_override=True
-    ) == 0.0
+    ) == -0.8
     assert bot._latency_compensated_rudder(
         -0.8, 11.2, safety_override=True
     ) == -0.8
@@ -981,7 +985,7 @@ def test_missing_minimap_pose_keeps_safe_course_without_ending_battle():
     assert gamepad.reassertions == 5
 
 
-def test_native_autopilot_crawling_speed_requests_route_retry_after_six_seconds():
+def test_native_autopilot_does_not_handoff_for_six_seconds_low_speed_alone():
     bot = BattleBot(
         1,
         {"strategy": {"autopilot_zero_speed_retry_seconds": 6.0}},
@@ -1005,19 +1009,19 @@ def test_native_autopilot_crawling_speed_requests_route_retry_after_six_seconds(
 
     bot._execute_rules(analysis, 106.1)
 
-    assert bot.autopilot_retry_pending
-    assert not bot.opening_autopilot_active
-    assert bot.native_autopilot_abandoned
-    assert "持续低速" in bot.last_movement_reason
+    assert not bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active
+    assert not bot.native_autopilot_abandoned
+    assert "等待确认接敌" in bot.last_movement_reason
 
     # The game's green label can linger after native control is abandoned.
     # It must not re-lock Q/E on the next frame.
     bot._execute_rules(analysis, 106.5)
-    assert not bot.opening_autopilot_active
-    assert bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active
+    assert not bot.autopilot_retry_pending
 
 
-def test_native_autopilot_stalled_position_requests_route_retry_immediately():
+def test_native_autopilot_does_not_handoff_for_feedback_error_while_moving():
     class StalledFeedback:
         @staticmethod
         def update(_now, _position, _throttle):
@@ -1048,9 +1052,9 @@ def test_native_autopilot_stalled_position_requests_route_retry_immediately():
 
     bot._execute_rules(analysis, 100.0)
 
-    assert bot.autopilot_retry_pending
-    assert not bot.opening_autopilot_active
-    assert "位移闭环" in bot.last_movement_reason
+    assert not bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active
+    assert "等待确认接敌" in bot.last_movement_reason
 
 
 def test_battle_feedback_accepts_slow_battleship_minimap_progress():
@@ -1118,7 +1122,7 @@ def test_missing_green_hud_guess_does_not_cancel_native_autopilot():
     assert not bot.generic_center_route_active
 
 
-def test_confirmed_native_autopilot_hands_off_only_after_stable_visual_arrival():
+def test_confirmed_native_autopilot_keeps_ownership_at_waypoint_without_contact():
     gamepad = RecordingGamepad()
     bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
     bot.intervention = SimpleNamespace(poll=lambda *_args: False)
@@ -1149,11 +1153,11 @@ def test_confirmed_native_autopilot_hands_off_only_after_stable_visual_arrival()
     bot._execute_rules(analysis, now + 0.2)
 
     assert not bot.autopilot_retry_pending
-    assert not bot.opening_autopilot_active
-    assert bot.generic_center_route_active
+    assert bot.opening_autopilot_active
+    assert not bot.generic_center_route_active
     assert gamepad.movements == []
 
-def test_confirmed_native_autopilot_hands_off_after_missing_hud_and_low_speed():
+def test_confirmed_native_autopilot_keeps_ownership_without_fresh_displacement_proof():
     class TakeoverGamepad(RecordingGamepad):
         def __init__(self):
             super().__init__()
@@ -1186,11 +1190,11 @@ def test_confirmed_native_autopilot_hands_off_after_missing_hud_and_low_speed():
 
     bot._execute_rules(analysis, now + 10.1)
 
-    assert gamepad.takeovers == 1
-    assert bot.autopilot_retry_pending
-    assert not bot.opening_autopilot_active
-    assert bot.native_autopilot_abandoned
-    assert "Q/E接管" in bot.last_movement_reason
+    assert gamepad.takeovers == 0
+    assert not bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active
+    assert not bot.native_autopilot_abandoned
+    assert "等待确认接敌" in bot.last_movement_reason
 
 
 def test_confirmed_native_autopilot_ignores_missing_hud_while_ship_is_moving():

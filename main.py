@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import time
+from runtime_control import shutdown_after_plan
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -328,10 +329,55 @@ def ensure_capture_foreground(bot) -> bool:
     return ensure_bound_game_foreground(bot)
 
 
+def loading_start_confirmed(bot, image) -> bool:
+    detector = getattr(bot.vision, "_has_loading_start_action", None)
+    if not callable(detector) or not detector(image):
+        return False
+    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    hud = getattr(bot.vision, "_has_battle_hud", None)
+    if backend is None or not callable(hud) or not hud(image):
+        return True
+    try:
+        height, width = image.shape[:2]
+        action = image[int(height * .91):, int(width * .43):int(width * .57)]
+        words = "".join(token.text for token in backend.recognize(action)).replace(" ", "")
+        return not words or "开始战斗" in words
+    except Exception:
+        logger.debug("加载按钮文字复核失败", exc_info=True)
+        return True
+
+
 def classify_runtime_screen(bot, image) -> ScreenState:
     """Classify normal game pages plus OCR-confirmed first-login rewards."""
     state = bot.vision.classify_screen(image)
     backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    # Economy pages hide Join Battle but retain the dense ship carousel. Their
+    # artwork passes the broad HUD texture check; confirm the page heading
+    # before allowing any opening W/M commands. Do not classify it as PORT:
+    # ship selection must wait until recovery closes this subpage.
+    carousel = getattr(bot.vision, "_is_port_ship_bar", None)
+    if state in {ScreenState.BATTLE, ScreenState.LOADING} and callable(carousel) and carousel(image):
+        if backend is None:
+            return ScreenState.UNKNOWN
+        try:
+            height, width = image.shape[:2]
+            heading = image[:int(height * 0.12), int(width * 0.35):int(width * 0.65)]
+            text = "".join(token.text for token in backend.recognize(heading))
+            if "经济加成" in text.replace(" ", ""):
+                return ScreenState.UNKNOWN
+        except Exception:
+            logger.debug("疑似港口子页面 OCR 失败，暂缓战斗指令", exc_info=True)
+            return ScreenState.UNKNOWN
+    # The visual exit-confirmation heuristic deliberately has broad colour
+    # Teal ocean/consumable pixels can resemble the prebattle action bar.
+    # With a competing HUD, require its text instead of endlessly recovering
+    # an active match as LOADING. OCR failure remains fail-closed.
+    if state == ScreenState.LOADING and backend is not None:
+        hud = getattr(bot.vision, "_has_battle_hud", None)
+        start = getattr(bot.vision, "_has_loading_start_action", None)
+        if callable(hud) and callable(start) and hud(image) and start(image):
+            if not loading_start_confirmed(bot, image):
+                return ScreenState.BATTLE
     # The visual exit-confirmation heuristic deliberately has broad colour
     # tolerance for different maps and UI scales. It is never sufficient to
     # authorize Esc on its own: a port animation can put a similarly solid
@@ -547,7 +593,8 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
     is then verified by the existing closed-loop minimap feedback in battle.
     """
     store = store or CalibrationStore()
-    if screen_state not in {ScreenState.PORT, ScreenState.BATTLE, ScreenState.RESULTS}:
+    if screen_state not in {ScreenState.PORT, ScreenState.BATTLE, ScreenState.RESULTS,
+                            ScreenState.DAILY_REWARD}:
         raise SafetyFault(f"自动自检无法确认当前游戏界面: {screen_state.value}")
     if not ensure_capture_foreground(bot):
         raise SafetyFault("无法激活游戏窗口，输入自检未通过")
@@ -558,6 +605,10 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
     # battle and is the direct cause of resumed battles starting at STOP.
     if screen_state == ScreenState.BATTLE:
         input_check = "battle_controls_preserved"
+    elif screen_state == ScreenState.DAILY_REWARD:
+        # Startup recognizes this overlay; let the lifecycle claim/close it.
+        # Movement key probes are unnecessary on a reward dialog.
+        input_check = "reward_controls_preserved"
     else:
         bot.gamepad.stop()
         input_check = "safe_release_dispatched"
@@ -566,7 +617,8 @@ def automatic_input_preflight(bot, title, rect, screen_state, store=None):
     # Requiring visual motion here made a static result page fail preflight
     # before the lifecycle could click ``继续战斗``. Battle HUDs remain strict:
     # a motionless combat frame is still treated as a frozen capture backend.
-    static_screen = screen_state in {ScreenState.PORT, ScreenState.RESULTS}
+    static_screen = screen_state in {ScreenState.PORT, ScreenState.RESULTS,
+                                    ScreenState.DAILY_REWARD}
     verification_frame = bot.vision.grab(
         bot.hwnd,
         allow_stale=static_screen,
@@ -645,6 +697,19 @@ def wait_while_loading(
             logger.info("加载等待画面暂不可用，交回生命周期重试: %s", error)
             return None
     return image
+
+
+def timed_port_action(label, action, *args, **kwargs):
+    """Report measured operation duration on the operation's own log line."""
+    started = time.perf_counter()
+    outcome = "失败"
+    try:
+        result = action(*args, **kwargs)
+        outcome = "完成" if result else "未完成"
+        return result
+    finally:
+        logger.info("%s%s   %.0fms", label, outcome,
+                    (time.perf_counter() - started) * 1000)
 
 
 def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
@@ -754,11 +819,12 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         )
         return False
 
-    logger.info("已连续确认港口，准备点击“加入战斗”")
+    configure_port = configure_port or bool(getattr(bot, "_port_recheck_required", False))
+    logger.info("已连续确认港口，准备复核配置并进入战斗")
     if configure_port:
         ship_key = os.environ.get("WOWS_SHIP", "pommern")
         mode = os.environ.get("WOWS_MODE", "asymmetric")
-        if not select_requested_ship(
+        if not timed_port_action("目标舰船复核与选择", select_requested_ship,
             bot.hwnd,
             ship_key,
             vision=bot.vision,
@@ -770,7 +836,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         ):
             logger.warning("未能安全选择目标舰船")
             return False
-        if not ensure_selected_ship_commander(
+        if not timed_port_action("指挥官复核", ensure_selected_ship_commander,
             bot.hwnd,
             ship_key,
             custom_name=os.environ.get("WOWS_CUSTOM_SHIP_NAME", ""),
@@ -779,7 +845,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         ):
             logger.warning("目标舰船指挥官状态未完成复核或召回；等待重新识别")
             return False
-        if not ensure_requested_mode(
+        if not timed_port_action("战斗模式复核与选择", ensure_requested_mode,
             bot.hwnd,
             mode,
             vision=bot.vision,
@@ -788,7 +854,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
         ):
             logger.warning("未能安全选择目标战斗模式")
             return False
-    if not enter_battle(
+    if not timed_port_action("加入战斗", enter_battle,
         bot.hwnd,
         vision=bot.vision,
         configure_port=False,
@@ -797,6 +863,7 @@ def prepare_battle(bot: BattleBot, should_stop=None, configure_port=True):
     ):
         logger.warning("“加入战斗”请求未能派发或未通过港口复核")
         return False
+    bot._port_recheck_required = False
     # Return immediately. The lifecycle observer must see the loading screen;
     # sleeping here used to miss that transition and later mistake the current
     # battle for a new port workflow.
@@ -878,7 +945,7 @@ def wait_for_battle(
                 "_has_loading_start_action",
                 None,
             )
-            if callable(loading_action_detector) and loading_action_detector(image):
+            if loading_start_confirmed(bot, image):
                 # The roster/start-battle page can retain minimap-shaped and
                 # HUD-shaped decoration. It is still a loading phase: W/M/Esc
                 # are all forbidden until that action disappears on a fresh
@@ -956,6 +1023,18 @@ def wait_for_battle(
                 if opening_configured:
                     setattr(bot, "_opening_autopilot_preconfigured", True)
                     logger.info("新一局 HUD 已出现，已先行建立自动航线")
+                elif not getattr(bot, "_opening_autopilot_attempted", True):
+                    opening_attempted = False
+                    battle_frames = 0
+                    clock_frames = 0
+                    continue
+                # Configuring the map may take seconds. Never confirm entry
+                # using the old pre-configuration frame/clock.
+                image = bot.vision.grab(bot.hwnd, allow_stale=True)
+                if classify_battle_continuity_screen(bot, image) != ScreenState.BATTLE:
+                    battle_frames = 0
+                    clock_frames = 0
+                    continue
             if require_new_round:
                 clock = bot.vision.read_battle_clock_seconds(image, clock_backend)
                 if clock is not None and clock >= 15 * 60:
@@ -1030,6 +1109,7 @@ def run_battle(
     quick_battle=False,
     quick_seconds=300.0,
 ):
+    bot.runtime_screen_classifier = lambda image: classify_runtime_screen(bot, image)
     intervention = getattr(bot, "intervention", None)
     resume_motion_reasserted = False
     dead_at_start = False
@@ -1109,15 +1189,23 @@ def run_battle(
             )
             reassert = getattr(bot.gamepad, "reassert_full_speed", None)
             full_speed = getattr(bot.gamepad, "full_speed", None)
-            if resynchronize is not None:
-                resynchronize()
-                resume_motion_reasserted = True
-            elif reassert is not None:
-                reassert()
-                resume_motion_reasserted = True
-            elif full_speed is not None:
-                full_speed()
-                resume_motion_reasserted = True
+            if operation_paused(bot) or not ensure_bound_game_foreground(bot):
+                return "resume_state"
+            try:
+                if resynchronize is not None:
+                    resynchronize()
+                    resume_motion_reasserted = True
+                elif reassert is not None:
+                    reassert()
+                    resume_motion_reasserted = True
+                elif full_speed is not None:
+                    full_speed()
+                    resume_motion_reasserted = True
+            except RuntimeError as error:
+                if "游戏窗口不在前台" not in str(error):
+                    raise
+                logger.info("恢复驾驶时前台已变化，撤销本次操作并重新识别场景")
+                return "resume_state"
             if resume_motion_reasserted:
                 logger.info("战斗 HUD 已确认，立即重发全速前进，再配置自动航线")
     preconfigured_autopilot = bool(
@@ -1223,6 +1311,12 @@ def run_battle(
         return "resume_state"
 
     if not autopilot_set:
+        synchronize = getattr(bot, "_resynchronize_forward_controls", None)
+        if synchronize is not None:
+            # The failed M-map attempt may have changed the actual game helm.
+            # Repair both engine and Q/E caches before any fallback command.
+            synchronize()
+            resume_motion_reasserted = True
         enable_center_route = getattr(bot, "enable_generic_center_route", None)
         if enable_center_route is not None:
             enable_center_route(
@@ -1609,6 +1703,7 @@ def configure_opening_autopilot(
     try:
         image = bot.vision.grab(bot.hwnd, allow_stale=True)
         if classify_battle_continuity_screen(bot, image) != ScreenState.BATTLE:
+            setattr(bot, "_opening_autopilot_attempted", False)
             return False
         height, width = image.shape[:2]
         player_normalized = None
@@ -1657,6 +1752,7 @@ def configure_opening_autopilot(
                     classify_battle_continuity_screen(bot, image)
                     != ScreenState.BATTLE
                 ):
+                    setattr(bot, "_opening_autopilot_attempted", False)
                     return False
                 height, width = image.shape[:2]
         if player_normalized is None:
@@ -1726,7 +1822,7 @@ def configure_opening_autopilot(
                 elif (
                     getattr(bot.vision, "_has_loading_start_action", None)
                     is not None
-                    and bot.vision._has_loading_start_action(tactical_frame)
+                    and loading_start_confirmed(bot, tactical_frame)
                 ):
                     # The live HUD can appear for one transitional frame before
                     # the ship is actually spawned.  On that pre-battle roster
@@ -1843,6 +1939,11 @@ def configure_opening_autopilot(
                 enable(target_label, target_normalized=normalized_target)
             except TypeError:
                 enable(target_label)
+            bot._native_spawn_position = player_normalized
+            if autopilot_reader is not None and backend is not None:
+                # Carry the observed HUD confirmation into the battle loop.
+                # A later unreadable frame must not undo this verified setup.
+                bot._native_autopilot_confirmed = True
             logger.info(
                 "[SYSTEM] 战术地图自动航行成功: %s | local=(%s,%s)",
                 target_label,
@@ -2567,6 +2668,10 @@ def wait_for_web_resume(
         else:
             window_missing_reported = False
         time.sleep(max(0.01, float(poll_interval)))
+    if bot is not None:
+        # A user may have changed ship/mode while paused. Keep this dirty
+        # across battle/loading/result recovery until a verified port entry.
+        bot._port_recheck_required = True
     logger.info("[SYSTEM] %s，开始重新识别当前画面并接续原流程", resume_source)
     reporter.update(
         resume_state,
@@ -3160,7 +3265,9 @@ def run():
                 # Select/configure the ship only once per task.  After a
                 # confirmed battle entry the ship lock is authoritative for
                 # later rounds; the port path then only starts the next match.
-                configured_this_attempt = not ship_locked
+                configured_this_attempt = not ship_locked or bool(
+                    getattr(bot, "_port_recheck_required", False)
+                )
                 if not configured_this_attempt:
                     logger.info("本任务舰船已锁定：本轮港口只进入战斗，不重新选船或滚动舰船栏")
                 try:
@@ -4163,6 +4270,7 @@ def run():
         if plan_completed and limits.close_game_when_done:
             close_game_window_after_plan(bot.hwnd)
         logger.info("Bot 已停止")
+        shutdown_after_plan(limits, plan_completed)
 
 
 if __name__ == "__main__":

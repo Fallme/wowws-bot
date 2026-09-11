@@ -156,3 +156,51 @@
   border-color: var(--accent);
   background: linear-gradient(110deg, #eeb54b3d, #142127);
 }
+
+.ocr-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 7px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.ocr-toolbar-label { color: #a8b6b8; font-size: 10px; letter-spacing: .08em; }
+.ocr-device-switch {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #071115;
+}
+.ocr-device-switch button {
+  min-height: 26px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ocr-device-switch button:hover { color: var(--text); border-color: #8a652f; }
+.ocr-device-switch button[aria-pressed="true"] {
+  color: #211a0c;
+  background: var(--accent);
+  border-color: #d99c32;
+}
+.ocr-device-switch button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.live-section-title { flex-wrap: nowrap; gap: 8px; }
+.live-section-title #liveBadge { margin-left: 0; flex-shrink: 0; }
+.ocr-toolbar-label { white-space: nowrap; font-family: Consolas, "Microsoft YaHei", monospace; }
+.ocr-toolbar-label.active { color: var(--green); }
+@media (max-width: 480px) {
+  .live-section-title > span { display: none; }
+  .live-section-title > div > small { display: none; }
+  .live-section-title h2 { font-size: 13px; letter-spacing: 0; }
+  .live-section-title { gap: 5px; }
+  .ocr-toolbar { gap: 4px; }
+  .ocr-device-switch button { padding: 4px; font-size: 10px; }
+}

@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.terrain import repair_overlay_gaps
+
 import cv2
 import numpy as np
 
@@ -315,225 +317,77 @@ class Vision:
             for zone, label in zip(zones, labels)
         ]
 
-    def find_capture_zones(self, minimap, player=None, ocr_backend=None):
-        """Return plausible capture circles visible on the minimap.
+    @staticmethod
+    def _capture_center_glyph(minimap, center):
+        """Require an actual small upright glyph, never infer a missing cap."""
+        height, width = minimap.shape[:2]
+        scale = min(height, width)
+        half = max(9, int(scale * 0.025))
+        x, y = center
+        x1, y1 = max(0, x-half), max(0, y-half)
+        crop = minimap[y1:min(height, y+half+1), x1:min(width, x+half+1)]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue, sat, val = cv2.split(hsv)
+        colored = (sat > 110) & ((hue < 12) | ((hue > 35) & (hue < 90)))
+        mask = ((val > 130) & ((sat < 90) | colored)).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            gx, gy, w, h = cv2.boundingRect(contour)
+            if not (max(2, scale*.003) <= w <= scale*.022
+                    and max(5, scale*.008) <= h <= scale*.028
+                    and .25 <= w/h <= 1.10 and cv2.contourArea(contour) >= 9):
+                continue
+            if math.dist((x1+gx+w/2, y1+gy+h/2), center) <= max(4, scale*.010):
+                return (x1+gx, y1+gy, w, h)
+        return None
 
-        ``player`` is optional, but when supplied it lets us reject the large
-        gun/secondary range rings centred on the white player arrow.  Those
-        rings are the main reason a tactical-map click can silently target the
-        ship's current position instead of a capture area.
-        """
+    def find_capture_zones(self, minimap, player=None, ocr_backend=None):
+        """Circle evidence plus a centre glyph. No equal-spacing or A/B/C guesses."""
         if minimap is None or minimap.size == 0:
             return []
         height, width = minimap.shape[:2]
         scale = min(width, height)
-        gray = cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 1.2)
+        gray = cv2.GaussianBlur(cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY), (5, 5), 1.2)
         circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=scale * 0.055,
-            param1=100,
-            param2=max(24, scale * 0.045),
-            minRadius=max(12, int(scale * 0.040)),
-            maxRadius=max(20, int(scale * 0.115)),
+            gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=scale*.055,
+            param1=100, param2=max(24, scale*.045),
+            minRadius=max(12, int(scale*.040)), maxRadius=max(20, int(scale*.115)),
         )
         if circles is None:
             return []
-        raw_candidates = []
-        for rank, (raw_x, raw_y, raw_radius) in enumerate(circles[0]):
+        zones = []
+        for raw_x, raw_y, radius in circles[0]:
+            if radius < scale * .060:
+                continue
             center = (int(round(raw_x)), int(round(raw_y)))
-            if (
-                center[0] < scale * 0.035
-                or center[1] < scale * 0.035
-                or center[0] > width - scale * 0.035
-                or center[1] > height - scale * 0.035
-            ):
+            if not (scale*.035 < center[0] < width-scale*.035 and scale*.035 < center[1] < height-scale*.035):
                 continue
-            raw_candidates.append(
-                (
-                    rank,
-                    CaptureZone(
-                        center=center,
-                        radius=float(raw_radius),
-                        state=self._capture_zone_state(
-                            minimap,
-                            center,
-                            float(raw_radius),
-                        ),
-                    ),
-                )
-            )
-
-        # In many station battles the capture circles form an evenly spaced
-        # row at an arbitrary angle. That relationship is much more reliable
-        # than circle colour:
-        # the player's concentric range rings and circular island bays are
-        # otherwise easy Hough false positives.  The middle cap can be heavily
-        # obscured by the white player arrow, so infer its exact centre from
-        # the two endpoints after requiring actual circular evidence nearby.
-        endpoints = [
-            item
-            for item in raw_candidates
-            if scale * 0.064 <= item[1].radius <= scale * 0.112
-            and (
-                player is None
-                or math.dist(item[1].center, player)
-                > max(scale * 0.12, item[1].radius * 1.15)
-            )
-        ]
-        best_formation = None
-        for left_index, (left_rank, left) in enumerate(endpoints):
-            for right_rank, right in endpoints[left_index + 1 :]:
-                first, third = left, right
-                separation = math.dist(first.center, third.center)
-                # Partial arcs from the player's concentric range rings can
-                # be fitted as three nearby circles.  Real multi-cap layouts
-                # span a substantial part of the minimap; reject the compact
-                # fake formation before assigning A/B/C labels.
-                if not scale * 0.36 <= separation <= scale * 0.74:
-                    continue
-                if abs(first.radius - third.radius) > scale * 0.025:
-                    continue
-                midpoint = (
-                    (first.center[0] + third.center[0]) / 2.0,
-                    (first.center[1] + third.center[1]) / 2.0,
-                )
-                middle_evidence = [
-                    (rank, zone)
-                    for rank, zone in raw_candidates
-                    if zone not in (first, third)
-                    and scale * 0.045 <= zone.radius <= scale * 0.110
-                    and math.dist(zone.center, midpoint) <= scale * 0.070
-                ]
-                if not middle_evidence:
-                    continue
-                middle_rank, _middle = min(
-                    middle_evidence,
-                    key=lambda item: (math.dist(item[1].center, midpoint), item[0]),
-                )
-                score = (
-                    left_rank
-                    + right_rank
-                    + middle_rank * 0.35
-                    + abs(separation / scale - 0.42) * 30.0
-                    + abs(first.radius - third.radius) / scale * 35.0
-                )
-                if best_formation is None or score < best_formation[0]:
-                    radius = (first.radius + third.radius) / 2.0
-                    ordered = sorted(
-                        (first, third),
-                        key=(
-                            (lambda zone: zone.center[0])
-                            if abs(first.center[0] - third.center[0])
-                            >= abs(first.center[1] - third.center[1])
-                            else (lambda zone: zone.center[1])
-                        ),
-                    )
-                    best_formation = (
-                        score,
-                        [
-                            CaptureZone(
-                                ordered[0].center,
-                                radius,
-                                "A",
-                                ordered[0].state,
-                            ),
-                            CaptureZone(
-                                (int(round(midpoint[0])), int(round(midpoint[1]))),
-                                radius,
-                                "B",
-                                _middle.state,
-                            ),
-                            CaptureZone(
-                                ordered[1].center,
-                                radius,
-                                "C",
-                                ordered[1].state,
-                            ),
-                        ],
-                    )
-        if best_formation is not None:
-            return self._apply_capture_zone_ocr_labels(
-                minimap, best_formation[1], ocr_backend
-            )
-
-        # Some maps use a triangular or otherwise staggered point layout.
-        # Dynamically cluster the equally sized high-confidence circles rather
-        # than applying coordinates from a known map. Nearby duplicate Hough
-        # fits are collapsed; spatially separated peers are retained.
-        uniform_groups = []
-        for anchor_rank, anchor in endpoints:
-            peers = [
-                (rank, zone)
-                for rank, zone in endpoints
-                if abs(zone.radius - anchor.radius) <= scale * 0.014
-            ]
-            distinct = []
-            for rank, zone in sorted(peers, key=lambda item: item[0]):
-                if all(
-                    math.dist(zone.center, kept.center) > scale * 0.12
-                    for _kept_rank, kept in distinct
-                ):
-                    distinct.append((rank, zone))
-            if len(distinct) >= 2:
-                formation_span = max(
-                    math.dist(first[1].center, second[1].center)
-                    for index, first in enumerate(distinct)
-                    for second in distinct[index + 1 :]
-                )
-                if formation_span < scale * 0.36:
-                    continue
-                uniform_groups.append(
-                    (
-                        sum(rank for rank, _zone in distinct[:4])
-                        + abs(anchor.radius / scale - 0.075) * 20.0,
-                        distinct[:4],
-                    )
-                )
-        if uniform_groups:
-            _score, group = min(uniform_groups, key=lambda item: item[0])
-            zones = [zone for _rank, zone in group]
-            zones.sort(key=lambda zone: (zone.center[0], zone.center[1]))
-            zones = [
-                CaptureZone(
-                    zone.center,
-                    zone.radius,
-                    chr(ord("A") + index),
-                    zone.state,
-                )
-                for index, zone in enumerate(zones)
-            ]
-            return self._apply_capture_zone_ocr_labels(
-                minimap, zones, ocr_backend
-            )
-
-        # Non-three-point maps retain a conservative fallback.  Exclude any
-        # circle centred on or enclosing the player so a range ring can never
-        # become an autopilot destination.
-        candidates = []
-        for _rank, zone in raw_candidates:
-            if not scale * 0.064 <= zone.radius <= scale * 0.112:
+            # Only concentric circles are ship range rings. A cap may contain us.
+            if player is not None and math.dist(center, player) <= scale*.045:
                 continue
-            if player is not None:
-                player_offset = math.dist(zone.center, player)
-                if player_offset <= max(scale * 0.12, zone.radius * 1.15):
-                    continue
-                if player_offset <= zone.radius * 0.72:
-                    continue
-            candidates.append(zone)
-        if len(candidates) >= 2:
-            candidate_span = max(
-                math.dist(first.center, second.center)
-                for index, first in enumerate(candidates)
-                for second in candidates[index + 1 :]
-            )
-            if candidate_span < scale * 0.36:
-                return []
-        return self._apply_capture_zone_ocr_labels(
-            minimap, candidates, ocr_backend
-        )
+            glyph = self._capture_center_glyph(minimap, center)
+            if glyph is None:
+                continue
+            if any(math.dist(center, z.center) < scale*.055 for z in zones):
+                continue
+            zone = CaptureZone(center, float(radius), "", self._capture_zone_state(minimap, center, float(radius)))
+            label = ""
+            glyph_reader = getattr(ocr_backend, "recognize_glyph", None)
+            if glyph_reader is not None:
+                gx, gy, gw, gh = glyph
+                crop = minimap[max(0, gy-1):gy+gh+1, max(0, gx-1):gx+gw+1]
+                try:
+                    tokens = glyph_reader(crop)
+                    accepted = [t for t in tokens if t.text.strip().upper() in {"A", "B", "C", "D"} and t.confidence >= .85]
+                    if accepted:
+                        label = max(accepted, key=lambda t: t.confidence).text.strip().upper()
+                except Exception:
+                    logger.debug("点位字母直读失败，保留未命名点位", exc_info=True)
+            elif ocr_backend is not None:
+                label = self._capture_zone_ocr_label(minimap, zone, ocr_backend)
+            zones.append(CaptureZone(center, float(radius), label, zone.state))
+        # Partial OCR labels remain partial; geometry must never rename D as C.
+        return sorted(zones, key=lambda z: (z.center[0], z.center[1]))
 
     def find_nearest_capture_zone(self, minimap, player):
         """Find the nearest neutral/hostile lettered capture point.
@@ -572,6 +426,18 @@ class Vision:
         if minimap is None or minimap.size == 0 or radius <= 1:
             return "unknown"
         height, width = minimap.shape[:2]
+        # Ownership belongs to the centre glyph. Nearby friendly range rings
+        # must not turn a white C point green.
+        half = max(4, int(min(height, width) * .009))
+        x, y = center
+        core = minimap[max(0, y-half):y+half+1, max(0, x-half):x+half+1]
+        ch, cs, cv = cv2.split(cv2.cvtColor(core, cv2.COLOR_BGR2HSV))
+        if np.count_nonzero((cv >= 135) & (cs >= 110) & ((ch <= 10) | (ch >= 165))) >= 4:
+            return "hostile"
+        if np.count_nonzero((cv >= 135) & (cs >= 110) & (ch >= 35) & (ch <= 95)) >= 4:
+            return "friendly"
+        if np.count_nonzero((cv >= 160) & (cs <= 75)) >= 5:
+            return "neutral"
         yy, xx = np.ogrid[:height, :width]
         distance = np.hypot(xx - float(center[0]), yy - float(center[1]))
         # The ownership colour sits on the capture outline. Sampling an
@@ -829,7 +695,7 @@ class Vision:
                     )
                 if len(polygon) >= 3:
                     cv2.fillPoly(terrain, [np.asarray(polygon, dtype=np.int32)], 255)
-            return self._measure_island_risk(terrain, pose)
+            return self._measure_island_risk(terrain, pose, trusted_terrain=True)
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
         hue = hsv[:, :, 0].astype(np.float64)
         saturation = hsv[:, :, 1]
@@ -849,8 +715,8 @@ class Vision:
         # are UI, not terrain, and previously produced a permanent 0.01 island
         # distance around the player marker.
         ui_overlay = (
-            (((hue >= 35) & (hue <= 95)) | (hue <= 8) | (hue >= 168))
-            & (saturation > 70)
+            (((hue >= 35) & (hue <= 95)) & (saturation > 70))
+            | (((hue <= 10) | (hue >= 168)) & (saturation > 22))
         )
         colored_land[ui_overlay] = 0
         capture_zone = self.find_nearest_capture_zone(minimap, pose.position)
@@ -946,10 +812,17 @@ class Vision:
         safety_clearance_km: float = 0.45,
         initial_rudder: float = 0.0,
         preferred_side: int = 1,
+        map_span_km: float = 50.0,
+        speed_scale: float = 1.0,
+        observed_speed_km_s: float | None = None,
+        turn_speed_retention: float = 1.0,
+        speed_response_seconds: float = 12.0,
+        initial_yaw_rate: float | None = None,
+        yaw_response_seconds: float = 0.0,
     ):
         """Choose a Q/E notch by comparing physically plausible future paths.
 
-        The minimap grid is 50 km wide.  Each candidate helm order is simulated
+        Map span and movement compression are explicit. Each order is simulated
         with a bounded rudder slew and a circular full-rudder turn.  Terrain
         clearance is a hard constraint; only after a route is safe do target
         progress and final heading decide which course wins.
@@ -965,12 +838,11 @@ class Vision:
             return None
 
         scale = float(min(width, height))
-        pixels_per_km = max(scale / 50.0, 1e-6)
-        speed_km_s = max(1.0, float(speed_knots)) * 1.852 / 3600.0
+        pixels_per_km = max(scale / max(1.0, float(map_span_km)), 1e-6)
+        speed_km_s = max(1.0, float(speed_knots)) * 1.852 / 3600.0 * max(0.1, speed_scale)
         speed_pixels_s = speed_km_s * pixels_per_km
         shift_seconds = max(1.0, float(rudder_shift_seconds))
         turn_radius = max(0.25, float(turning_radius_km))
-        full_turn_rate = speed_km_s / turn_radius
         horizon = max(30.0, min(float(horizon_seconds), 240.0))
         clearance_limit = max(0.15, min(float(safety_clearance_km), 1.5))
 
@@ -1022,22 +894,34 @@ class Vision:
             y = start_y
             heading_angle = math.atan2(heading_y, heading_x)
             effective_rudder = initial_helm
+            current_speed = (speed_km_s if observed_speed_km_s is None else
+                             max(0.0, min(observed_speed_km_s, speed_km_s * 1.5)))
+            yaw_rate = (initial_helm * current_speed / turn_radius if initial_yaw_rate is None
+                        else max(-0.26, min(float(initial_yaw_rate), 0.26)))
             clearances = []
+            future_clearances = []
             collision_time = None
             elapsed = 0.0
             while elapsed < horizon:
-                step = min(1.0, horizon - elapsed)
+                step = min(1.0, 0.5 / max(speed_pixels_s * 1.5, 1e-6), horizon - elapsed)
                 maximum_change = step / shift_seconds
                 helm_delta = max(
                     -maximum_change,
                     min(candidate - effective_rudder, maximum_change),
                 )
                 effective_rudder += helm_delta
+                desired_speed = speed_km_s * (1 - (1 - turn_speed_retention) * abs(effective_rudder))
+                current_speed += (desired_speed - current_speed) * (1 - math.exp(-step / max(1.0, speed_response_seconds)))
                 # Positive E rudder turns clockwise in minimap coordinates,
                 # whose Y axis points down, hence the positive angle update.
-                heading_angle += effective_rudder * full_turn_rate * step
-                x += math.cos(heading_angle) * speed_pixels_s * step
-                y += math.sin(heading_angle) * speed_pixels_s * step
+                target_yaw_rate = effective_rudder * current_speed / turn_radius
+                yaw_rate += (target_yaw_rate - yaw_rate) * (
+                    1.0 if yaw_response_seconds <= 0 else
+                    1 - math.exp(-step / yaw_response_seconds)
+                )
+                heading_angle += yaw_rate * step
+                x += math.cos(heading_angle) * current_speed * pixels_per_km * step
+                y += math.sin(heading_angle) * current_speed * pixels_per_km * step
                 elapsed += step
 
                 if not (0 <= x < width and 0 <= y < height):
@@ -1058,6 +942,8 @@ class Vision:
                     )
                     clearance = min(boundary_clearance, land_clearance)
                 clearances.append(clearance)
+                if elapsed >= shift_seconds:
+                    future_clearances.append(clearance)
                 if collision_time is None and clearance <= clearance_limit:
                     collision_time = elapsed
 
@@ -1073,7 +959,6 @@ class Vision:
             final_bearing = abs(math.atan2(final_cross, final_dot)) / math.pi
             progress_km = initial_distance_km - final_distance_km
             minimum_clearance = min(clearances) if clearances else 0.0
-            future_clearances = clearances[int(min(len(clearances), shift_seconds)) :]
             mean_future_clearance = (
                 sum(future_clearances) / len(future_clearances)
                 if future_clearances
@@ -1147,7 +1032,7 @@ class Vision:
             predicted_endpoint=selected["endpoint"],
         )
 
-    def _measure_island_risk(self, terrain, pose):
+    def _measure_island_risk(self, terrain, pose, *, trusted_terrain=False):
         """Evaluate a frozen/rasterized terrain layer against live heading."""
         if terrain is None or pose is None or not np.any(terrain):
             return None
@@ -1165,14 +1050,15 @@ class Vision:
             (xx - player_x) ** 2 + (yy - player_y) ** 2
             <= (scale * 0.035) ** 2
         )
-        terrain[self_exclusion] = 0
+        if not trusted_terrain:
+            terrain[self_exclusion] = 0
         terrain_y, terrain_x = np.nonzero(terrain)
         delta_x = terrain_x.astype(np.float64) - player_x
         delta_y = terrain_y.astype(np.float64) - player_y
         heading_x, heading_y = pose.heading
         forward = delta_x * heading_x + delta_y * heading_y
         lateral = delta_x * (-heading_y) + delta_y * heading_x
-        minimum_forward = scale * 0.018
+        minimum_forward = 0.0 if trusted_terrain else scale * 0.018
         # Islands only justify evasive steering when they are directly in the
         # current bow corridor.  The old 0.34 widening factor included large
         # off-bow islands and made a full-speed ship start a needless arc.
@@ -1214,7 +1100,7 @@ class Vision:
             avoidance_rudder = 1.0 if right_clearance > left_clearance else -1.0
         return IslandRisk(distance, avoidance_rudder)
 
-    def find_minimap_island_outlines(self, minimap, *, maximum_shapes: int = 24):
+    def find_minimap_island_outlines(self, minimap, *, maximum_shapes: int = 128):
         """Return simplified island polygons for the browser radar.
 
         This intentionally derives coastline candidates from the same live
@@ -1251,8 +1137,8 @@ class Vision:
         # Red/green team marks, capture circles and smoke overlays are not
         # coastlines.  Remove them before connected-component extraction.
         ui_overlay = (
-            (((hue >= 35) & (hue <= 95)) | (hue <= 8) | (hue >= 168))
-            & (saturation > 70)
+            (((hue >= 35) & (hue <= 95)) & (saturation > 70))
+            | (((hue <= 10) | (hue >= 168)) & (saturation > 22))
         )
         colored_terrain[ui_overlay] = 0
         neutral_terrain[ui_overlay] = 0
@@ -1261,29 +1147,32 @@ class Vision:
         zone_mask = np.zeros((height, width), dtype=bool)
         yy, xx = np.indices((height, width))
         for zone in self.find_capture_zones(minimap, player=player):
-            zone_mask |= (
-                (xx - zone.center[0]) ** 2 + (yy - zone.center[1]) ** 2
-                <= (zone.radius * 1.12) ** 2
-            )
+            # Only remove ring strokes and labels, never land inside a cap.
+            radial = np.hypot(xx - zone.center[0], yy - zone.center[1])
+            zone_mask |= abs(radial - zone.radius) <= max(3.0, scale * 0.006)
+            zone_mask |= radial <= max(4.0, scale * 0.012)
         colored_terrain[zone_mask] = 0
         neutral_terrain[zone_mask] = 0
         if player is not None:
             player_mask = (
                 (xx - player[0]) ** 2 + (yy - player[1]) ** 2
-                <= (scale * 0.045) ** 2
+                <= max(5.0, scale * 0.012) ** 2
             )
             colored_terrain[player_mask] = 0
             neutral_terrain[player_mask] = 0
 
-        minimum_pixels = max(70, int(scale * scale * 0.00018))
-        minimum_extent = max(8, int(scale * 0.014))
+        occluded = ui_overlay | zone_mask
+        if player is not None:
+            occluded |= player_mask
+        gap_radius = max(4, min(7, int(round(scale * 0.01))))
+        colored_terrain = repair_overlay_gaps(colored_terrain, occluded, gap_radius)
+        neutral_terrain = repair_overlay_gaps(neutral_terrain, occluded, gap_radius)
+        minimum_pixels = max(24, int(scale * scale * 0.00010))
+        minimum_extent = max(6, int(scale * 0.010))
 
         def retained_components(source, *, neutral=False):
             source = cv2.morphologyEx(
                 source, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
-            )
-            source = cv2.morphologyEx(
-                source, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
             )
             count, component_labels, component_stats, _ = (
                 cv2.connectedComponentsWithStats(source, connectivity=8)
@@ -1305,6 +1194,14 @@ class Vision:
                     or bounding_area > scale * scale * (0.20 if neutral else 0.22)
                 ):
                     continue
+                component_crop = (component_labels[
+                    y:y + component_height, x:x + component_width
+                ] == component_label).astype(np.uint8)
+                thickness = cv2.distanceTransform(
+                    np.pad(component_crop, 1), cv2.DIST_L2, 5
+                )
+                if float(thickness.max()) < 2.5:
+                    continue
                 kept[component_labels == component_label] = 255
             return kept
 
@@ -1312,9 +1209,8 @@ class Vision:
             retained_components(colored_terrain),
             retained_components(neutral_terrain, neutral=True),
         )
-        # Reapply capture removal after the two masks are combined so circle
-        # fragments cannot reconnect through a nearby snowy island.
-        terrain[zone_mask] = 0
+        # Small overlay gaps have been reconstructed from adjacent land.
+        # Do not erase those coastlines again or close visible water channels.
         labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
             terrain, connectivity=8
         )
@@ -1325,7 +1221,7 @@ class Vision:
             density = pixels / bounding_area
             if pixels < minimum_pixels or density < 0.15:
                 continue
-            if max(component_width, component_height) < max(8, int(scale * 0.014)):
+            if max(component_width, component_height) < minimum_extent:
                 continue
             if (
                 x <= scale * 0.008
@@ -1350,7 +1246,7 @@ class Vision:
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0:
                 continue
-            simplified = cv2.approxPolyDP(contour, perimeter * 0.035, True)
+            simplified = cv2.approxPolyDP(contour, max(0.5, perimeter * 0.003), True)
             if len(simplified) < 3:
                 continue
             points = [
@@ -1358,7 +1254,7 @@ class Vision:
                     round(float(point[0][0]) / max(width, 1), 4),
                     round(float(point[0][1]) / max(height, 1), 4),
                 ]
-                for point in simplified[:12]
+                for point in simplified
             ]
             candidates.append(
                 (
@@ -1564,10 +1460,14 @@ class Vision:
         clusters = self._cluster_colored_points(points, radius_x=35, radius_y=24)
         # Enemy ship glyphs have several colored strokes.  Single tiny capture
         # labels and zone-ring fragments are intentionally discarded.
+        minimap = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        zones = self.find_capture_zones(minimap)
+        label_margin = max(10, min(hsv.shape[:2]) * .024)
         return [
             (center_x, center_y)
             for center_x, center_y, total_area, members in clusters
             if total_area >= 35 and members >= 2
+            and not any(math.dist((center_x, center_y), z.center) <= label_margin for z in zones)
         ]
 
     @staticmethod
@@ -2158,6 +2058,8 @@ class Vision:
         # dark/textured loading fallback on a valid port frame.
         if self.in_port(image):
             return False
+        if self._has_loading_start_action(image):
+            return True
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if gray.mean() < 40 and gray.std() < 25:
             return True
@@ -2211,7 +2113,7 @@ class Vision:
         green = cv2.inRange(
             hsv,
             np.array([35, 45, 45]),
-            np.array([85, 255, 255]),
+            np.array([100, 255, 255]),
         )
         count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
             green,

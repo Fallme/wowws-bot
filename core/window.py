@@ -680,6 +680,20 @@ def physical_scroll(screen_x, screen_y, notches, *, hwnd=None):
             _acknowledge_automation_input()
 
 
+def park_port_cursor(hwnd):
+    """Leave the cursor over open port water before reading ship cards."""
+    if _interaction_paused() or not ensure_game_window_foreground(hwnd):
+        return False
+    rect = get_client_rect(hwnd)
+    moved = _set_physical_cursor_pos(ctypes.windll.user32,
+        rect["left"] + int(rect["width"] * .5),
+        rect["top"] + int(rect["height"] * .45))
+    if moved:
+        _acknowledge_automation_input()
+        time.sleep(.4)
+    return moved
+
+
 def click_center(hwnd):
     rect = get_client_rect(hwnd)
     return physical_click(

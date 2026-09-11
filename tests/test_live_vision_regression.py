@@ -118,9 +118,13 @@ def test_real_tactical_grid_rectifies_capture_points_to_minimap_coordinates():
     assert tactical_map.shape[0] == tactical_map.shape[1]
     tactical_zones = vision.find_capture_zones(tactical_map)
     minimap_zones = vision.find_capture_zones(minimap)
-    assert [zone.label for zone in tactical_zones] == ["A", "B", "C"]
-    assert [zone.label for zone in minimap_zones] == ["A", "B", "C"]
-    for tactical_zone, minimap_zone in zip(tactical_zones, minimap_zones):
+    assert len(tactical_zones) == 3
+    # The middle small-map glyph is obscured. Do not invent its centre or
+    # promote the smaller range-ring/text fragment beside it to a cap.
+    assert len(minimap_zones) == 2
+    for minimap_zone in minimap_zones:
+        tactical_zone = min(tactical_zones, key=lambda zone: abs(
+            zone.center[0] / tactical_map.shape[1] - minimap_zone.center[0] / minimap.shape[1]))
         tactical_position = (
             tactical_zone.center[0] / tactical_map.shape[1],
             tactical_zone.center[1] / tactical_map.shape[0],
@@ -213,7 +217,7 @@ def test_speed_ocr_retries_an_enhanced_crop_after_original_failure(live_frame):
 def test_central_capture_circle_is_selected():
     minimap = np.full((420, 420, 3), (80, 105, 120), dtype=np.uint8)
     cv2.circle(minimap, (210, 210), 45, (220, 220, 220), 2)
-    cv2.rectangle(minimap, (202, 202), (218, 218), (220, 220, 220), 2)
+    cv2.putText(minimap, "A", (206, 214), cv2.FONT_HERSHEY_SIMPLEX, .4, (230, 230, 230), 1)
     cv2.circle(minimap, (90, 320), 45, (220, 220, 220), 2)
 
     zone = Vision().find_central_capture_zone(minimap)
@@ -228,6 +232,7 @@ def test_nearest_capture_circle_is_selected_from_player_position():
     minimap = np.full((420, 420, 3), (80, 105, 120), dtype=np.uint8)
     cv2.circle(minimap, (95, 100), 40, (220, 220, 220), 2)
     cv2.circle(minimap, (315, 300), 40, (220, 220, 220), 2)
+    cv2.putText(minimap, "A", (91, 104), cv2.FONT_HERSHEY_SIMPLEX, .4, (230, 230, 230), 1)
 
     zone = Vision().find_nearest_capture_zone(minimap, (70, 210))
 
@@ -236,7 +241,7 @@ def test_nearest_capture_circle_is_selected_from_player_position():
     assert zone.center[1] == pytest.approx(100, abs=4)
 
 
-def test_three_capture_points_are_recovered_from_alignment_amid_range_rings():
+def test_three_capture_points_require_center_glyphs_amid_range_rings():
     minimap = np.full((690, 690, 3), (45, 58, 64), dtype=np.uint8)
     player = (355, 165)
     # Player range rings and an offset circular decoy must not become points.
@@ -244,17 +249,18 @@ def test_three_capture_points_are_recovered_from_alignment_amid_range_rings():
     cv2.circle(minimap, (430, 235), 62, (205, 205, 205), 2)
     for center in ((180, 350), (325, 350), (470, 350)):
         cv2.circle(minimap, center, 48, (230, 230, 230), 2)
+        cv2.putText(minimap, "A", (center[0]-4, center[1]+4), cv2.FONT_HERSHEY_SIMPLEX, .4, (230, 230, 230), 1)
 
     zones = Vision().find_capture_zones(minimap, player)
 
-    assert [zone.label for zone in zones] == ["A", "B", "C"]
+    assert [zone.label for zone in zones] == ["", "", ""]
     assert [zone.center[0] for zone in zones] == pytest.approx(
         [180, 325, 470], abs=5
     )
-    assert Vision().find_nearest_capture_zone(minimap, player).label == "B"
+    assert Vision().find_nearest_capture_zone(minimap, player).center[0] == pytest.approx(325, abs=5)
 
 
-def test_obscured_middle_capture_point_is_inferred_and_player_is_inside():
+def test_obscured_middle_capture_point_is_not_invented_from_alignment():
     minimap = np.full((684, 684, 3), (45, 58, 64), dtype=np.uint8)
     player = (335, 327)
     cv2.circle(minimap, (177, 347), 48, (230, 230, 230), 2)
@@ -263,9 +269,7 @@ def test_obscured_middle_capture_point_is_inferred_and_player_is_inside():
 
     zone = Vision().find_nearest_capture_zone(minimap, player)
 
-    assert zone.label == "B"
-    assert zone.center == pytest.approx((320, 346), abs=5)
-    assert np.hypot(player[0] - zone.center[0], player[1] - zone.center[1]) < zone.radius
+    assert zone is None
 
 
 def test_capture_formation_is_detected_at_map_specific_diagonal_angle():
@@ -273,6 +277,7 @@ def test_capture_formation_is_detected_at_map_specific_diagonal_angle():
     centers = ((150, 180), (300, 300), (450, 420))
     for center in centers:
         cv2.circle(minimap, center, 44, (230, 230, 230), 2)
+        cv2.putText(minimap, "A", (center[0]-4, center[1]+4), cv2.FONT_HERSHEY_SIMPLEX, .4, (230, 230, 230), 1)
 
     zones = Vision().find_capture_zones(minimap, (520, 100))
 
@@ -301,9 +306,9 @@ def test_live_capture_letters_keep_their_visible_ownership_state(live_frame):
     zones = vision.find_capture_zones(minimap, player)
 
     assert [(zone.label, zone.state) for zone in zones] == [
-        ("A", "hostile"),
-        ("B", "friendly"),
-        ("C", "neutral"),
+        ("", "hostile"),
+        ("", "friendly"),
+        ("", "neutral"),
     ]
 
 

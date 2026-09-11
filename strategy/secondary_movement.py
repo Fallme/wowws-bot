@@ -92,11 +92,13 @@ class SecondaryMovementController:
         qe_speed_knots: float = 30.0,
         qe_rudder_shift_seconds: float = 15.0,
         qe_turning_radius_km: float = 1.0,
+        pursue_enemies: bool = False,
     ):
         # Legacy distance-band arguments remain accepted so existing ship
         # configs load cleanly. Station-first control deliberately does not
         # turn away merely because an enemy is close or health is low.
         self.preferred_side = 1 if preferred_side >= 0 else -1
+        self.pursue_enemies = pursue_enemies
         self.opening_seconds = max(0.0, float(opening_seconds))
         self.secondary_range_km = self._bounded(secondary_range_km, 2.0, 30.0)
         self.island_warning_distance = self._bounded(
@@ -335,14 +337,6 @@ class SecondaryMovementController:
         )
 
     def plan(self, state: SecondaryMovementInput) -> MovementCommand:
-        if state.elapsed < self.straight_opening_seconds:
-            return MovementCommand(
-                MovementMode.ROUTE_PLANNING,
-                throttle=1.0,
-                rudder=0.0,
-                reason="已锁定中央点航线，开局直航建立真实航迹",
-            )
-
         kinematic_emergency = bool(
             state.kinematic_avoidance_required
             and (
@@ -389,6 +383,25 @@ class SecondaryMovementController:
             )
 
         distance, distance_source = self._effective_distance(state)
+        if state.elapsed < self.straight_opening_seconds:
+            return MovementCommand(MovementMode.ROUTE_PLANNING, 1.0, 0.0,
+                                   "开局直航建立真实航迹，避山始终优先")
+        if self.pursue_enemies and state.minimap_target_bearing is not None:
+            bearing = state.minimap_target_bearing
+            if abs(bearing) > 0.75:
+                if not self._objective_recovery_direction:
+                    self._objective_recovery_direction = 1 if bearing > 0 else -1
+                bearing = abs(bearing) * self._objective_recovery_direction
+            elif abs(bearing) < 0.4:
+                self._objective_recovery_direction = 0
+            in_range = distance is not None and distance <= self.secondary_target_km
+            rudder = (state.kinematic_rudder if state.kinematic_rudder is not None
+                      else (0.0 if (in_range and abs(bearing) <= 1/3) or abs(bearing) < 0.035 else self._clamp(bearing * 2)))
+            return MovementCommand(
+                MovementMode.BRAWL if in_range else MovementMode.APPROACH,
+                (0.25 if state.inside_capture_point else 0.5) if in_range else 1.0, rudder,
+                "已进入副炮接战距离，保持接敌" if in_range else "敌舰优先，全速沿可通航路径进入副炮范围",
+            )
         # Route-planner arrival is historical and can remain true after the
         # ship drifts out of a point.  Current minimap position is authoritative:
         # after the contacted enemy dies, resume full-speed travel until the

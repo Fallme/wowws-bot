@@ -797,6 +797,9 @@ class RunnerManager:
             limit_type = str(payload.get("limit_type", "continuous"))
             limit_value = float(payload.get("limit_value", 0))
             quick_battle = bool(payload.get("quick_battle", False))
+            ocr_device = str(payload.get("ocr_device", "nvidia"))
+            if ocr_device not in {"cpu", "nvidia"}:
+                raise ValueError("OCR 设备必须是 cpu 或 nvidia")
             launcher_client = normalize_launch_client(
                 payload.get("launcher_client", "steam")
             )
@@ -835,6 +838,7 @@ class RunnerManager:
             env.update(
                 {
                     "WOWS_SHIP": ship,
+                    "WOWS_OCR_DEVICE": ocr_device,
                     "WOWS_MODE": mode,
                     "WOWS_RUN_ID": run_id,
                     "WOWS_STATE_FILE": str(STATE_PATH),
@@ -848,6 +852,7 @@ class RunnerManager:
                     "WOWS_CLOSE_GAME_WHEN_DONE": (
                         "1" if close_game_when_done else "0"
                     ),
+                    "WOWS_SHUTDOWN_WHEN_DONE": "1" if payload.get("shutdown_when_done", False) else "0",
                     "PYTHONUNBUFFERED": "1",
                     "PYTHONUTF8": "1",
                 }
@@ -862,7 +867,7 @@ class RunnerManager:
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.process = subprocess.Popen(
-                [sys.executable, str(BASE_DIR / "main.py")],
+                [sys.executable, str(BASE_DIR / "tools" / "run_with_ocr.py")],
                 cwd=BASE_DIR,
                 env=env,
                 stdout=self.log_stream,
@@ -1324,7 +1329,10 @@ def main():
     if not ensure_elevated_control_server():
         return
     host = os.environ.get("WOWS_PANEL_HOST", "127.0.0.1")
-    port = int(os.environ.get("WOWS_PANEL_PORT", "8765"))
+    # 8765 falls inside a Windows-reserved port block (Hyper-V/WSL dynamic
+    # range 8753-8852) on some machines, which makes bind fail with
+    # WinError 10013.  8899 is outside every observed reservation.
+    port = int(os.environ.get("WOWS_PANEL_PORT", "8899"))
     wait_for_port = "--wait-for-port" in sys.argv
     deadline = time.monotonic() + (12.0 if wait_for_port else 0.0)
     while True:

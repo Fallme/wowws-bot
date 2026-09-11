@@ -181,16 +181,16 @@ class SecondaryMovementTests(unittest.TestCase):
         self.assertEqual(command.mode, MovementMode.AVOID_ISLAND)
         self.assertGreater(command.throttle, 0)
 
-    def test_opening_first_establishes_straight_course(self):
+    def test_opening_does_not_override_confirmed_near_island(self):
         command = self.plan(
             elapsed=3,
             capture_point_bearing=0.9,
             island_distance=0.01,
             island_avoidance_rudder=-1,
         )
-        self.assertEqual(command.mode, MovementMode.ROUTE_PLANNING)
-        self.assertEqual(command.throttle, 1.0)
-        self.assertEqual(command.rudder, 0.0)
+        self.assertEqual(command.mode, MovementMode.AVOID_ISLAND)
+        self.assertLess(command.throttle, 1.0)
+        self.assertLess(command.rudder, 0.0)
 
     def test_forward_enemy_biases_route_before_arrival_without_uturn(self):
         command = self.plan(
