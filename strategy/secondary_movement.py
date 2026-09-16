@@ -1,6 +1,6 @@
 """Station-first navigation for secondary-battery ships.
 
-The ship keeps flank speed outside a capture zone and treats the central cap
+The ship slows to second notch on close contact and treats the central cap
 as its persistent navigation objective. Enemy bearings only bias that route
 while the nearest enemy is outside secondary range; they never cause an early
 about-turn.  Navigation distance is derived from the white player marker and
@@ -8,8 +8,9 @@ red enemy markers on the minimap's 5 km grid.  Viewport OCR is deliberately
 excluded because aircraft and friendly labels can be mistaken for the target.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+import math
 
 
 class MovementMode(str, Enum):
@@ -135,6 +136,7 @@ class SecondaryMovementController:
         # until the target is clearly ahead so Q/E cannot alternate into a
         # broad rear-half circle.
         self._objective_recovery_direction = 0
+        self._contact_slowdown = False
 
     @staticmethod
     def _bounded(value: float, minimum: float, maximum: float) -> float:
@@ -146,6 +148,7 @@ class SecondaryMovementController:
 
     def reset(self):
         self._objective_recovery_direction = 0
+        self._contact_slowdown = False
 
     def _island_rudder(self, state: SecondaryMovementInput) -> float:
         if (
@@ -337,6 +340,25 @@ class SecondaryMovementController:
         )
 
     def plan(self, state: SecondaryMovementInput) -> MovementCommand:
+        distance = state.minimap_distance_km
+        reliable_contact = (
+            distance is not None and math.isfinite(distance) and distance > 0
+            and state.minimap_target_bearing is not None
+        )
+        # One kilometre of hysteresis prevents telegraph chatter around 10 km.
+        self._contact_slowdown = bool(reliable_contact and distance <= (
+            11.0 if self._contact_slowdown else 10.0
+        ))
+        command = self._plan(state)
+        if self._contact_slowdown and command.mode not in {
+            MovementMode.AVOID_ISLAND, MovementMode.EVADE, MovementMode.SEPARATE,
+            MovementMode.DISENGAGE,
+        }:
+            command = replace(command, throttle=0.5,
+                              reason=f"小地图接敌{distance:.1f}km，保持前进二挡")
+        return command
+
+    def _plan(self, state: SecondaryMovementInput) -> MovementCommand:
         kinematic_emergency = bool(
             state.kinematic_avoidance_required
             and (

@@ -74,6 +74,9 @@ class RecordingGamepad:
     def set_movement(self, throttle, rudder):
         self.movements.append((throttle, rudder))
 
+    def reverse_escape(self):
+        self.movements.append((-1.0, 0.0))
+
     def stop(self):
         self.movements.append((0.0, 0.0))
 
@@ -377,6 +380,18 @@ def test_island_layer_voting_survives_one_empty_detection_frame():
     assert confirmed[0]["area"] == pytest.approx(island["area"], abs=0.001)
     from core.terrain import rasterize
     assert (rasterize(confirmed) == rasterize([island])).all()
+
+
+def test_unconfirmed_point_layer_is_not_used_as_a_navigation_target():
+    image = cv2.imread(str(Path("tests") / "fixtures" / "live_battle.png"))
+    vision = FixtureVision(image)
+    bot = BattleBot(1, {"strategy": {}}, vision=vision,
+                    gamepad=RecordingGamepad(),
+                    distance_reader=FixtureDistanceReader())
+    first = bot.analyze()
+    assert first.capture_zones
+    assert bot.route_planner.zone is None
+    assert first.navigation_source in {"unknown", "minimap_center"}
 
 
 def test_player_pose_uses_short_cache_when_one_minimap_frame_misses_arrow():
@@ -876,7 +891,7 @@ def test_island_manoeuvre_rejects_ambiguous_turn_side():
     assert bot._stable_island_risk() is None
 
 
-def test_low_speed_collision_escalates_island_avoidance_to_full_power_escape():
+def test_low_speed_collision_escalates_island_avoidance_to_reverse():
     gamepad = RecordingGamepad()
     bot = BattleBot(
         1,
@@ -914,9 +929,9 @@ def test_low_speed_collision_escalates_island_avoidance_to_full_power_escape():
         )
         bot._execute_rules(analysis, 100.0 + second)
 
-    assert gamepad.movements[-1] == (1.0, -1)
-    assert bot.last_movement_reason == "舰船位置长时间未变化，执行自动脱困"
-    assert bot._last_movement_mode == "recovery:forward_escape_turn"
+    assert gamepad.movements[-1] == (-1.0, 0.0)
+    assert "先倒船" in bot.last_movement_reason
+    assert bot._last_movement_mode == "recovery:reverse_clear"
 
 
 def test_movement_feedback_retries_before_requesting_human_intervention():
@@ -1254,7 +1269,7 @@ def test_confirmed_native_autopilot_ignores_low_speed_and_stuck_feedback():
     assert bot.opening_autopilot_active
     assert not bot.autopilot_retry_pending
     assert gamepad.movements == []
-    assert "禁止W/Q/E" in bot.last_movement_reason
+    assert "禁止Q/E" in bot.last_movement_reason
 
 
 def test_native_autopilot_rejects_single_frame_false_arrival():

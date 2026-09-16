@@ -288,6 +288,24 @@ def operation_paused(bot: BattleBot) -> bool:
         mark_pause = getattr(bot, "mark_manual_pause", None)
         if mark_pause is not None:
             mark_pause()
+    # Recognition and foreground loops can pause without returning to the
+    # lifecycle reporter. Publish transitions here so Continue stays available.
+    reporter = getattr(bot, "runtime_reporter", None)
+    if reporter is not None:
+        status = reporter.status
+        latched = paused and bool(getattr(intervention, "latched", False))
+        if (
+            bool(status.manual_intervention_active) != paused
+            or bool(status.manual_intervention_latched) != latched
+        ):
+            reporter.update(
+                "paused" if paused else "recovering",
+                "检测到用户操作，等待静默或点击继续"
+                if paused else "暂停已解除，正在接续当前流程",
+                manual_intervention_active=paused,
+                manual_intervention_latched=latched,
+                paused_by_user=paused,
+            )
     return paused
 
 
@@ -468,7 +486,7 @@ def classify_battle_continuity_screen(bot, image) -> ScreenState:
                     return state
             except Exception:
                 logger.debug("战斗连续性港口子页面复核失败", exc_info=True)
-        if loading_start_action_visible(bot, image):
+        if loading_start_confirmed(bot, image):
             logger.info("检测到战斗开始按钮，保持加载态，暂不发送驾驶指令")
             return ScreenState.LOADING
     if state != ScreenState.PORT:
@@ -987,7 +1005,7 @@ def wait_for_battle(
                 battle_frames = 0
                 clock_frames = 0
                 continue
-            if loading_start_action_visible(bot, image):
+            if loading_start_confirmed(bot, image):
                 # The roster/start-battle page can retain minimap-shaped and
                 # HUD-shaped decoration. It is still a loading phase: W/M/Esc
                 # are all forbidden until that action disappears on a fresh
@@ -1151,7 +1169,7 @@ def run_battle(
     quick_battle=False,
     quick_seconds=300.0,
 ):
-    bot.runtime_screen_classifier = lambda image: classify_runtime_screen(bot, image)
+    bot.runtime_screen_classifier = lambda image: classify_battle_continuity_screen(bot, image)
     intervention = getattr(bot, "intervention", None)
     resume_motion_reasserted = False
     dead_at_start = False
@@ -1193,7 +1211,7 @@ def run_battle(
         if control_state != ScreenState.BATTLE:
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
             return "resume_state"
-        if loading_start_action_visible(bot, control_frame):
+        if loading_start_confirmed(bot, control_frame):
             logger.warning("战斗动作互锁：最新画面仍带开始战斗按钮，撤销驾驶并重新分流")
             return "resume_state"
         # A run can be restarted while the previous match is still in the
@@ -1225,7 +1243,11 @@ def run_battle(
             and not abandoned_native_route
         )
         if not autopilot_visible and not dead_at_start:
-            resynchronize = getattr(
+            # Resuming must update the helm model as well as the key cache.
+            resynchronize = (
+                getattr(bot, "_resynchronize_forward_controls", None)
+                if resume_existing else None
+            ) or getattr(
                 bot.gamepad,
                 "resynchronize_forward_controls",
                 None,
@@ -1311,12 +1333,12 @@ def run_battle(
         )
         if (
             not autopilot_set
+            and not resume_existing
             and not opening_autopilot_attempted
             and not abandoned_native_route
         ):
-            # A recovered battle must use the same opening rule as a freshly
-            # detected battle: establish native autopilot first, then let the
-            # Q/E controller take over only after the game route ends.
+            # Only a fresh preconfigured entry may retry setup here. Resuming
+            # an initialized round must preserve its current navigation owner.
             autopilot_set = (
                 configure_opening_autopilot(bot)
                 if should_stop is None
@@ -1349,19 +1371,21 @@ def run_battle(
         logger.info("[USER] 自动航行配置期间用户介入；不启用后备驾驶，等待重新判定场景")
         return "resume_state"
 
-    if not autopilot_set and not normalize_tactical_map_overlay(bot):
+    if not autopilot_set and not dead_at_start and not normalize_tactical_map_overlay(bot):
         logger.info("自动航行未完成且战术地图仍未收尾，交回场景路由")
         return "resume_state"
 
-    if not autopilot_set:
+    if not autopilot_set and not dead_at_start:
         synchronize = getattr(bot, "_resynchronize_forward_controls", None)
-        if synchronize is not None:
+        if synchronize is not None and (not resume_motion_reasserted or not resume_existing):
             # The failed M-map attempt may have changed the actual game helm.
             # Repair both engine and Q/E caches before any fallback command.
             synchronize()
             resume_motion_reasserted = True
         enable_center_route = getattr(bot, "enable_generic_center_route", None)
-        if enable_center_route is not None:
+        if enable_center_route is not None and not (
+            resume_existing and getattr(bot, "generic_center_route_active", False)
+        ):
             enable_center_route(
                 "战术地图自动航行设置失败，通用驾驶向地图中央接管"
             )
@@ -1381,9 +1405,9 @@ def run_battle(
     elif resume_existing and autopilot_set:
         bot.last_movement_reason = "已重新识别当前战斗，游戏自动航行仍开启，禁止Q/E"
         logger.info("恢复当前战斗，确认原生自动航行仍开启，不发送W/Q/E")
-    elif resume_existing:
-        bot.last_movement_reason = "恢复战斗的自动航行设置失败，通用驾驶向点位/地图中心接管"
-        logger.info("恢复当前战斗，自动航行未生效，通用驾驶按小地图接管")
+    elif resume_existing and not dead_at_start:
+        bot.last_movement_reason = "接续本局小地图驾驶，保留计时与航线，不重做开局"
+        logger.info("恢复当前战斗，继续原有小地图驾驶")
     elif autopilot_set:
         logger.info("进入战斗，已交由游戏自动航行驶向地图中心")
     else:
@@ -2641,7 +2665,7 @@ def wait_for_web_resume(
             web_paused or (intervention is not None and intervention.latched)
         ),
         movement_mode="manual_pause",
-        movement_reason="保持现有船速与舵位；5秒静默后自动恢复，持续20秒则等待网页继续",
+        movement_reason="保持现有船速与舵位；5秒静默后自动恢复，持续20秒后回到游戏静默恢复或点击网页继续",
     )
     window_missing_reported = False
     foreground_retry_reported = False
@@ -2820,6 +2844,7 @@ def run():
     logger.info("找到游戏窗口: %s", title)
     logger.info("窗口坐标: %s", rect)
     bot = BattleBot(hwnd, ship_config)
+    bot.runtime_reporter = reporter
     # Close the race between an upper-level pause check and a lower-level
     # multi-attempt focus/click operation.  Every side effect in core.window
     # now consults the live keyboard/Web intervention state itself.

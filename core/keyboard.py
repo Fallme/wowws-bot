@@ -217,6 +217,14 @@ class KeyboardController:
         target = max(0, min(int(target), self.MAX_NOTCH))
         delta = target - self._throttle_notch
         if delta:
+            if target == 0 and self._throttle_notch == -self.MAX_NOTCH:
+                # Finish reverse at STOP without a transient FULL-ahead command.
+                for _ in range(self.MAX_NOTCH * 2):
+                    self.device.tap("s")
+                for _ in range(self.MAX_NOTCH):
+                    self.device.tap("w")
+                self._throttle_notch = 0
+                return
             # The native telegraph can be changed by game autopilot or manual
             # takeover while our cache is frozen. This applies to both cached
             # upshifts and downshifts: four W taps from an actual FULL-reverse
@@ -229,11 +237,17 @@ class KeyboardController:
                 self.device.tap("s")
             self._throttle_notch = target
 
+    def set_throttle(self, throttle: float):
+        """Change engine telegraph without touching native autopilot steering."""
+        self._ensure_target_focus()
+        self._set_throttle_notch(self._notch_for(throttle))
+        self._record("throttle", throttle, self._rudder_notch / self.MAX_RUDDER_NOTCH)
+
     def reverse_escape(self):
         """Explicit bounded-recovery input; ordinary navigation stays forward-only."""
         self._ensure_target_focus()
-        self._set_rudder(0.0)
         if self._throttle_notch != -self.MAX_NOTCH:
+            self._resynchronize_rudder()
             for _ in range(self.MAX_NOTCH * 2):
                 self.device.tap("s")
             self._throttle_notch = -self.MAX_NOTCH
@@ -302,6 +316,10 @@ class KeyboardController:
     def resynchronize_forward_controls(self):
         """Cancel external steering and establish FULL-ahead plus neutral rudder."""
         self._ensure_target_focus()
+        self._resynchronize_rudder()
+        self.reassert_full_speed()
+
+    def _resynchronize_rudder(self):
         self.device.key_up("q")
         self.device.key_up("e")
         # Four Q taps reach hard-left from any real rudder state; two E taps
@@ -312,7 +330,6 @@ class KeyboardController:
         for _ in range(self.MAX_RUDDER_NOTCH):
             self.device.tap("e")
         self._rudder_notch = 0
-        self.reassert_full_speed()
 
     def takeover_from_autopilot(self):
         """Backward-compatible alias for deterministic control hand-off."""

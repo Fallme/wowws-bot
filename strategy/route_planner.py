@@ -61,6 +61,12 @@ class CoarseRoutePlanner:
         self._retarget_samples = 0
         self.snapshot = RouteSnapshot()
 
+    def replan(self):
+        """Retain the objective, but rebuild the approach from the next live pose."""
+        zone = self.zone
+        self.reset()
+        self.zone = zone
+
     def observe_zone(self, zone, minimap_shape, *, allow_retarget: bool = False) -> bool:
         """Accept the first central zone and reject later target switching."""
         if zone is None:

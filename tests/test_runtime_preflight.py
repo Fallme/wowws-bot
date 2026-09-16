@@ -672,7 +672,7 @@ def test_run_battle_scene_interlock_rejects_port_before_any_command():
     assert events == []
 
 
-def test_resumed_battle_reasserts_full_speed_before_autopilot_setup():
+def test_resumed_battle_reasserts_full_speed_without_reopening_map():
     events = []
 
     class BattleVision:
@@ -725,7 +725,6 @@ def test_resumed_battle_reasserts_full_speed_before_autopilot_setup():
 
     assert events == [
         "full_speed",
-        "autopilot",
         "center_route",
         "analyze",
     ]

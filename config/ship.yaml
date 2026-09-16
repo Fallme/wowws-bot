@@ -69,9 +69,8 @@ pommern:
     stuck_low_speed_seconds: 8.0     # 已给前进指令但持续低速则判定触岸
     stuck_low_speed_knots: 1.5       # 允许轻微漂移，避免0.4-0.6节永不触发
     autopilot_stall_speed_knots: 1.5 # 绿色自动航行存在但低于此速度也视为卡住
-    stuck_escape_turn_seconds: 8.0   # 全速单侧硬舵脱离岸线，不倒船
-    stuck_forward_seconds: 6.0       # 反舵扶正并继续向前驶离
-    stuck_cooldown_seconds: 12.0     # 首次失败后允许换边再次脱困
+    stuck_reverse_seconds: 12.0     # 先倒船，再停车并按新船位重新规划
+    stuck_cooldown_seconds: 12.0     # 重规划后的加速宽限，避免立即重复脱困
     opening_autopilot_minimum_seconds: 35.0 # 开局至少保留游戏自动航行，避免出生点红色误报取消
     enable_minimap_torpedo_evasion: true   # 仅10km内确认驱逐/巡洋舰时允许覆盖
     manual_intervention_pause_seconds: 5.0
@@ -155,8 +154,7 @@ napoli:
     stuck_low_speed_seconds: 7.0
     stuck_low_speed_knots: 1.5
     autopilot_stall_speed_knots: 1.5
-    stuck_escape_turn_seconds: 7.0
-    stuck_forward_seconds: 5.0
+    stuck_reverse_seconds: 12.0
     stuck_cooldown_seconds: 12.0
     opening_autopilot_minimum_seconds: 35.0
     enable_minimap_torpedo_evasion: true

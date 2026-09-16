@@ -291,6 +291,37 @@ def test_mouse_activity_after_switching_away_extends_and_latches_pause():
     assert monitor.last_trigger == "background_mouse"
 
 
+def test_long_background_pause_auto_resumes_after_returning_to_game():
+    current_tick = [100]
+    foreground = [7]
+    monitor = UserInterventionMonitor(
+        7,
+        pause_seconds=5,
+        latch_seconds=10,
+        input_tick_reader=lambda: current_tick[0],
+        keyboard_activity_reader=lambda: False,
+        foreground_reader=lambda: foreground[0],
+    )
+    controller = SimpleNamespace(last_injected_tick_ms=9000)
+    monitor.reset()
+
+    foreground[0] = 99
+    assert monitor.poll(controller, now=10)
+    for now in (15, 20, 25):
+        current_tick[0] += 10
+        assert monitor.poll(controller, now=now)
+    assert monitor.latched
+
+    # Returning to the game is not enough by itself; the return key event is
+    # consumed first and a full quiet period must still elapse.
+    foreground[0] = 7
+    current_tick[0] += 10
+    assert monitor.poll(controller, now=26)
+    assert monitor.latched
+    assert not monitor.poll(controller, now=31.1)
+    assert not monitor.latched
+
+
 def test_any_tick_from_a_long_automation_batch_is_not_user_input():
     current_tick = [1000]
     monitor = UserInterventionMonitor(

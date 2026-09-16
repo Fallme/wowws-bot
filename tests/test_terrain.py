@@ -5,6 +5,7 @@ import numpy as np
 
 from core.terrain import confirm_terrain, extend_template, rasterize, repair_overlay_gaps
 from core.vision import PlayerPose, Vision
+from strategy.island_route import IslandRoutePlanner
 
 
 def rectangle(x1, y1, x2, y2):
@@ -63,3 +64,32 @@ def test_confirmed_shore_next_to_ship_is_not_erased_as_player_icon():
     )
     assert risk is not None
     assert risk.distance < .02
+
+
+def test_island_route_planner_never_returns_a_waypoint_inside_land():
+    island = rectangle(.38, .25, .62, .75)
+    planner = IslandRoutePlanner()
+    waypoint = planner.waypoint(
+        (320, 320, 3), (30, 160), (290, 160), [island]
+    )
+    assert waypoint is not None
+    assert not (.38 * 320 <= waypoint[0] <= .62 * 320
+                and .25 * 320 <= waypoint[1] <= .75 * 320)
+    assert planner.waypoint(
+        (320, 320, 3), (30, 30), (290, 290), [island]
+    ) is not None
+
+
+def test_island_route_planner_snaps_a_coarse_objective_to_nearby_water():
+    # The central objective is allowed to fall on an island in the noisy
+    # fallback layer.  The planner must choose the adjacent shoreline water,
+    # not report a permanently blocked route.
+    island = rectangle(.38, .25, .62, .75)
+    planner = IslandRoutePlanner()
+    waypoint = planner.waypoint(
+        (320, 320, 3), (160, 300), (160, 160), [island]
+    )
+
+    assert waypoint is not None
+    assert not (.38 * 320 <= waypoint[0] <= .62 * 320
+                and .25 * 320 <= waypoint[1] <= .75 * 320)
