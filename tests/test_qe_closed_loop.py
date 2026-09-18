@@ -28,7 +28,7 @@ def setup_bot(fail=False):
                     vision=object(), gamepad=controls)
     bot.intervention = SimpleNamespace(poll=lambda *_: False)
     bot.movement.plan = lambda _: MovementCommand(MovementMode.APPROACH, .75, -.5, "test")
-    bot.stuck_recovery = SimpleNamespace(update=lambda *a, **kw: None, cancel=lambda: None)
+    bot.stuck_recovery = SimpleNamespace(reverse_until=None, update=lambda *a, **kw: None, cancel=lambda: None)
     bot._movement_feedback_update = lambda *a: None
     return bot, controls
 

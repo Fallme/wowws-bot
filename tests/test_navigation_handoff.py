@@ -56,6 +56,10 @@ def test_aligned_bow_with_residual_turn_receives_countersteer(rate, side):
 class Controls:
     def __init__(self):
         self.takeovers = 0
+        self.reversals = 0
+
+    def reverse_escape(self):
+        self.reversals += 1
 
     def resynchronize_forward_controls(self):
         self.takeovers += 1
@@ -86,7 +90,7 @@ def test_arrival_and_failure_establish_control_once_and_disable_native_rearm():
     assert controls.takeovers == 2
 
 
-def test_confirmed_green_hud_cannot_lock_a_proven_stationary_ship_forever():
+def test_confirmed_native_route_cannot_be_interrupted_by_stall():
     bot, controls = make_bot()
     bot.enable_opening_autopilot("test")
     bot._native_autopilot_confirmed = True
@@ -97,6 +101,7 @@ def test_confirmed_green_hud_cannot_lock_a_proven_stationary_ship_forever():
         bot._execute_rules(analysis, float(t))
         assert bot.opening_autopilot_active
     bot._execute_rules(analysis, 50.)
-    assert controls.takeovers == 1
-    assert bot.autopilot_retry_pending
-    assert not bot.opening_autopilot_active
+    assert controls.takeovers == 0
+    assert controls.reversals == 0
+    assert not bot.autopilot_retry_pending
+    assert bot.opening_autopilot_active

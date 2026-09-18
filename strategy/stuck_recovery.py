@@ -13,7 +13,7 @@ class RecoveryCommand:
 
 
 class StuckRecoveryController:
-    """Detect a stationary ship and perform a bounded forward-only escape."""
+    """Back clear of a collision before requesting a fresh route."""
 
     def __init__(
         self,
@@ -33,11 +33,10 @@ class StuckRecoveryController:
         self.stationary_pixels = max(1.0, float(stationary_pixels))
         self.low_speed_seconds = max(3.0, float(low_speed_seconds))
         self.low_speed_knots = max(0.4, float(low_speed_knots))
-        # ``reverse_seconds`` is accepted only for old integrations. It now
-        # controls the first forward-turn phase and can never enable reverse.
-        self.escape_turn_seconds = float(
-            escape_turn_seconds if reverse_seconds is None else reverse_seconds
-        )
+        # Keep legacy constructor arguments compatible with existing configs.
+        self.reverse_seconds = max(2.0, min(float(
+            12.0 if reverse_seconds is None else reverse_seconds
+        ), 20.0))
         self.forward_seconds = max(2.0, float(forward_seconds))
         self.cooldown_seconds = max(3.0, float(cooldown_seconds))
         self.samples = deque()
@@ -47,8 +46,10 @@ class StuckRecoveryController:
         self.active_side = self.preferred_side
         self._next_fallback_side = self.preferred_side
         self.reverse_until = None
+        self._last_observation_at = None
 
     def reset(self):
+        self._last_observation_at = None
         self.reverse_until = None
         self.samples.clear()
         self.recovery_started = None
@@ -59,17 +60,24 @@ class StuckRecoveryController:
 
     def cancel(self):
         """Yield immediately to a higher-priority live safety manoeuvre."""
+        self._last_observation_at = None
         self.samples.clear()
         self.recovery_started = None
         self.low_speed_started = None
         self.reverse_until = None
 
-    def begin_reverse(self, now, escape_rudder=None, seconds=12.0):
-        """Only the native-route low-speed AND displacement watchdog may arm this."""
-        self._begin_recovery(now, escape_rudder)
-        self.reverse_until = now + max(2.0, min(float(seconds), 20.0))
+    def begin_reverse(self, now, escape_rudder=None, seconds=None):
+        """Arm bounded reverse for either native or local navigation."""
+        command = self._begin_recovery(now, escape_rudder)
+        if seconds is not None:
+            self.reverse_until = now + max(2.0, min(float(seconds), 20.0))
+        return command
 
     def _record(self, now, position):
+        if self._last_observation_at is not None and not 0 < now - self._last_observation_at <= 5.0:
+            self.samples.clear()
+            self.low_speed_started = None
+        self._last_observation_at = now
         if position is None:
             self.samples.clear()
             return
@@ -117,12 +125,12 @@ class StuckRecoveryController:
         if escape_rudder is not None and abs(float(escape_rudder)) >= 0.2:
             self.active_side = 1 if float(escape_rudder) > 0 else -1
         else:
-            # With no reliable clearance signal, alternate recovery sides so
-            # a failed contact cannot repeat the same circular trap forever.
+            # Legacy diagnostic side; actual steering is replanned after reverse.
             self.active_side = self._next_fallback_side
             self._next_fallback_side *= -1
         self.samples.clear()
-        return RecoveryCommand(1.0, self.active_side, "forward_escape_turn")
+        self.reverse_until = now + self.reverse_seconds
+        return RecoveryCommand(-1.0, 0.0, "reverse_clear")
 
     def update(
         self,
@@ -136,23 +144,9 @@ class StuckRecoveryController:
         if self.reverse_until is not None:
             if now < self.reverse_until:
                 return RecoveryCommand(-1.0, 0.0, "reverse_clear")
-            self.recovery_started = now
-            self.reverse_until = None
-        if self.recovery_started is not None:
-            elapsed = now - self.recovery_started
-            if elapsed < self.escape_turn_seconds:
-                # Reverse is never a legal automation command: a stale position
-                # detector must not make the ship back across the map. Full
-                # ahead is intentional: the former 0.32 command could not pull
-                # a battleship free from terrain contact.
-                return RecoveryCommand(1.0, self.active_side, "forward_escape_turn")
-            if elapsed < self.escape_turn_seconds + self.forward_seconds:
-                return RecoveryCommand(0.82, -self.active_side, "forward_clear")
-            self.recovery_started = None
+            self.cancel()
             self.cooldown_until = now + self.cooldown_seconds
-            self.samples.clear()
-            self.low_speed_started = None
-            return None
+            return RecoveryCommand(0.0, 0.0, "replan")
 
         low_speed_stalled = self._low_speed_stalled(
             now,

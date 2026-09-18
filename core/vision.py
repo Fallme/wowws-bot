@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.terrain import repair_overlay_gaps
+from core.minimap_geometry import minimap_grid_bounds
 
 import cv2
 import numpy as np
@@ -74,6 +75,8 @@ class Vision:
         self.screen_capture = screen_capture or ScreenCapture()
         self.frame_guard = frame_guard or FrameGuard()
         self.last_frame_quality = None
+        self._minimap_grid_cache = None
+        self._minimap_grid_checked_at = float("-inf")
         self.red_lo1 = np.array([0, 40, 80])
         self.red_hi1 = np.array([15, 255, 255])
         self.red_lo2 = np.array([160, 40, 80])
@@ -368,6 +371,32 @@ class Vision:
             glyph = self._capture_center_glyph(minimap, center)
             if glyph is None:
                 continue
+            # Hough also sees the yellow ship/range rings.  A real capture
+            # point has a bright neutral or team-coloured circumference; the
+            # ring-ink vote rejects yellow range rings and wake arcs before a
+            # nearby digit is mistaken for an A/B/C marker.
+            if width <= 680:
+                angles = np.arange(72) * (2 * np.pi / 72)
+                radii = radius + np.arange(-3, 4)[:, None]
+                xs = np.clip(np.rint(center[0] + radii * np.cos(angles)), 0, width - 1).astype(int)
+                ys = np.clip(np.rint(center[1] + radii * np.sin(angles)), 0, height - 1).astype(int)
+                ring = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)[ys, xs]
+                ring_ink = (
+                    (ring[:, :, 2] >= 145)
+                    & (
+                        (ring[:, :, 1] <= 90)
+                        | (
+                            (ring[:, :, 1] >= 100)
+                            & (
+                                (ring[:, :, 0] <= 15)
+                                | (ring[:, :, 0] >= 165)
+                                | ((ring[:, :, 0] >= 35) & (ring[:, :, 0] <= 95))
+                            )
+                        )
+                    )
+                )
+                if float(np.mean(ring_ink)) < 0.32:
+                    continue
             if any(math.dist(center, z.center) < scale*.055 for z in zones):
                 continue
             zone = CaptureZone(center, float(radius), "", self._capture_zone_state(minimap, center, float(radius)))
@@ -1147,6 +1176,7 @@ class Vision:
         neutral_terrain = (
             (saturation <= 145)
             & (value >= 125)
+            & ((saturation <= 22) | (hue_delta > 16) | (value >= 180))
         ).astype(np.uint8) * 255
         # Red/green team marks, capture circles and smoke overlays are not
         # coastlines.  Remove them before connected-component extraction.
@@ -1198,7 +1228,12 @@ class Vision:
                 )
                 bounding_area = max(component_width * component_height, 1)
                 density = pixels / bounding_area
+                aspect = max(component_width, component_height) / max(
+                    min(component_width, component_height), 1
+                )
                 if pixels < minimum_pixels or density < 0.15:
+                    continue
+                if aspect > 4.5 and density < 0.35:
                     continue
                 if max(component_width, component_height) < minimum_extent:
                     continue
@@ -1233,16 +1268,14 @@ class Vision:
             x, y, component_width, component_height, pixels = stats[label]
             bounding_area = max(component_width * component_height, 1)
             density = pixels / bounding_area
+            aspect = max(component_width, component_height) / max(
+                min(component_width, component_height), 1
+            )
             if pixels < minimum_pixels or density < 0.15:
                 continue
-            if max(component_width, component_height) < minimum_extent:
+            if aspect > 4.5 and density < 0.35:
                 continue
-            if (
-                x <= scale * 0.008
-                or y <= scale * 0.008
-                or x + component_width >= width - scale * 0.008
-                or y + component_height >= height - scale * 0.008
-            ):
+            if max(component_width, component_height) < minimum_extent:
                 continue
             if (
                 component_width > scale * 0.52
@@ -1285,131 +1318,14 @@ class Vision:
 
     @staticmethod
     def plan_island_aware_waypoint(
-        minimap_shape,
-        player,
-        target,
-        island_outlines,
-        *,
-        clearance_ratio: float = 0.022,
+        minimap_shape, player, target, island_outlines, *, clearance_ratio=0.022,
     ):
-        """Return a short minimap waypoint when the direct route crosses land.
+        """Plan a complete water route; None means the target is unreachable."""
+        from strategy.island_route import IslandRoutePlanner
 
-        The final objective remains the capture point/map centre.  This local
-        planner only bends the next leg around the first blocking static island
-        and is recomputed from the live white-arrow position every frame.
-        """
-        if player is None or target is None or not island_outlines:
-            return target
-        height, width = minimap_shape[:2]
-        if height <= 0 or width <= 0:
-            return target
-        mask = np.zeros((height, width), dtype=np.uint8)
-        for island in island_outlines:
-            points = island.get("points", ()) if isinstance(island, dict) else ()
-            if len(points) < 3:
-                continue
-            polygon = np.array(
-                [
-                    [
-                        int(round(float(point[0]) * width)),
-                        int(round(float(point[1]) * height)),
-                    ]
-                    for point in points
-                ],
-                dtype=np.int32,
-            )
-            cv2.fillPoly(mask, [polygon], 255)
-        clearance = max(5, int(round(min(height, width) * clearance_ratio)))
-        mask = cv2.dilate(
-            mask,
-            cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (clearance * 2 + 1, clearance * 2 + 1)
-            ),
-        )
-
-        def blocked(start, end, *, width_pixels=4):
-            route = np.zeros_like(mask)
-            cv2.line(
-                route,
-                tuple(int(round(value)) for value in start),
-                tuple(int(round(value)) for value in end),
-                255,
-                max(2, int(width_pixels)),
-            )
-            # Ignore a tiny disk around the current player marker.  Terrain
-            # colour can overlap the arrow when a ship is already hugging a
-            # coast; that must not make every escape candidate impossible.
-            cv2.circle(
-                route,
-                tuple(int(round(value)) for value in start),
-                clearance,
-                0,
-                -1,
-            )
-            return bool(np.any((route > 0) & (mask > 0)))
-
-        if not blocked(player, target):
-            return target
-
-        route = np.zeros_like(mask)
-        cv2.line(
-            route,
-            tuple(int(round(value)) for value in player),
-            tuple(int(round(value)) for value in target),
-            255,
-            5,
-        )
-        blocking = (route > 0) & (mask > 0)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask, connectivity=8
-        )
-        if count <= 1:
-            return target
-        intersecting_labels = labels[blocking]
-        intersecting_labels = intersecting_labels[intersecting_labels > 0]
-        if not len(intersecting_labels):
-            return target
-        component = int(
-            max(
-                set(int(value) for value in intersecting_labels),
-                key=lambda value: int(np.count_nonzero(intersecting_labels == value)),
-            )
-        )
-        x, y, component_width, component_height, _pixels = stats[component]
-        ys, xs = np.where(labels == component)
-        # Probe expanded component corners on both sides of the direct route,
-        # not a permanent preferred side.  The shorter currently-clear leg
-        # wins, preventing one map from repeatedly producing the same circle.
-        margin = clearance * 1.5
-        candidates = [
-            (
-                max(4.0, min(width - 5.0, x - margin)),
-                max(4.0, min(height - 5.0, y - margin)),
-            ),
-            (
-                max(4.0, min(width - 5.0, x - margin)),
-                max(4.0, min(height - 5.0, y + component_height + margin)),
-            ),
-            (
-                max(4.0, min(width - 5.0, x + component_width + margin)),
-                max(4.0, min(height - 5.0, y - margin)),
-            ),
-            (
-                max(4.0, min(width - 5.0, x + component_width + margin)),
-                max(4.0, min(height - 5.0, y + component_height + margin)),
-            ),
-        ]
-        clear_candidates = [
-            candidate
-            for candidate in candidates
-            if not blocked(player, candidate, width_pixels=3)
-        ]
-        if not clear_candidates:
-            return target
-        return min(
-            clear_candidates,
-            key=lambda candidate: math.dist(player, candidate)
-            + math.dist(candidate, target),
+        return IslandRoutePlanner().waypoint(
+            minimap_shape, player, target, island_outlines,
+            clearance_ratio=clearance_ratio,
         )
 
     @staticmethod
@@ -1565,9 +1481,26 @@ class Vision:
         return any(cv2.contourArea(contour) > 300 for contour in contours)
 
     def find_minimap(self, image):
-        """Crop the large square minimap anchored to the bottom-right corner."""
+        """Use the verified grid bounds for the live 2560x1440 layout."""
         height, width = image.shape[:2]
         x1, y1, x2, y2 = MINIMAP_REGION.pixels(width, height)
+        if height == 1440:
+            now = time.monotonic()
+            if (
+                self._minimap_grid_cache is None
+                or self._minimap_grid_cache[0] != (width, height)
+                or now - self._minimap_grid_checked_at >= 5.0
+            ):
+                bounds = minimap_grid_bounds(image)
+                self._minimap_grid_checked_at = now
+                if bounds is not None:
+                    self._minimap_grid_cache = ((width, height), bounds)
+                elif self._minimap_grid_cache and self._minimap_grid_cache[0] != (width, height):
+                    self._minimap_grid_cache = None
+            if self._minimap_grid_cache is not None:
+                x1, y1, x2, y2 = self._minimap_grid_cache[1]
+        else:
+            self._minimap_grid_cache = None
         minimap = image[y1:y2, x1:x2]
         if minimap.size > 0 and minimap.std() > 8:
             return minimap
@@ -2690,6 +2623,17 @@ class Vision:
                 and metrics["score_clock"]["edge"] > 0.018
             ),
         }
+        # Pale maps can retain crisp HUD glyphs while losing sea/land contrast.
+        # Require a real player marker for this low-contrast fallback.
+        if (
+            not anchors["minimap"]
+            and metrics["minimap"]["std"] > 10
+            and metrics["minimap"]["edge"] > 0.025
+            and sum(anchors[name] for name in (
+                "player_name_health", "consumables", "score_clock"
+            )) >= 2
+        ):
+            anchors["minimap"] = self.find_player_pose_on_minimap(minimap) is not None
         logger.debug("Battle HUD anchors: %s", anchors)
         # The minimap is mandatory.  Require two of the three remaining,
         # independent HUD surfaces.  Making the lower-left player block

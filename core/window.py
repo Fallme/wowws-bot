@@ -233,7 +233,7 @@ def _foreground_matches(hwnd) -> bool:
             return False
         foreground_root = int(win32gui.GetAncestor(foreground, win32con.GA_ROOT))
         target_root = int(win32gui.GetAncestor(target, win32con.GA_ROOT))
-        if foreground_root == target_root:
+        if foreground_root and target_root and foreground_root == target_root:
             # A child/render surface is allowed when its root is the usable
             # game window. This rejects a tiny helper HWND that happens to be
             # foreground while preserving normal child-window activation.
@@ -421,11 +421,9 @@ def is_usable_game_window(hwnd) -> bool:
             and int(rect.get("height", 0)) >= MIN_GAME_SURFACE_HEIGHT
         )
     except Exception:
-        # Geometry APIs can fail for a window while it is being recreated.
-        # Keep the existing identity checks authoritative and let activation
-        # retry; this helper must not turn a transient Win32 error into a
-        # permanent loss of the game binding.
-        return True
+        # A recreated render window is not ready until geometry is readable.
+        # Reporting success here suppresses foreground restoration/rebinding.
+        return False
 
 
 def ensure_game_window_foreground(hwnd) -> bool:
@@ -445,6 +443,8 @@ def ensure_game_window_foreground(hwnd) -> bool:
         activate_window(hwnd)
         if _interaction_paused():
             return False
+        if _foreground_matches(hwnd):
+            return True
         time.sleep(0.10 * (attempt + 1))
     logger.warning("无法将《战舰世界》切换到前台")
     return False

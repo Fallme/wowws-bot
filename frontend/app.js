@@ -3,7 +3,7 @@ const state = {config:null,calibration:null,launcher:"steam",mode:"cooperative",
 const customStorage={name:"wowws.customShipName",range:"wowws.customSecondaryRange",selected:"wowws.selectedShip",tab:"wowws.shipTab",preset:"wowws.customPresetId",launcher:"wowws.launcherClient"};
 const labels={cooperative:"联合作战",asymmetric:"非对称作战"};
 const statusLabels={idle:"待机",starting:"启动中",launching_game:"启动游戏",entering_game:"进入游戏",preparing:"准备战斗",battle:"战斗中",paused:"已暂停",collecting_rewards:"结算统计",recovering:"状态恢复",requeueing:"进入下一局",returning:"返回港口",completed:"计划完成",stopped:"已停止",failed:"运行异常"};
-const movementLabels={idle:"等待任务",autopilot_route:"游戏自动航行",route_planning:"规划航线",opening:"驶向中央点",route_transit:"按航线推进",search:"驶向中央点",approach:"点内接敌",hold_range:"维持副炮距离",hold_capture:"点内留守",separate:"主动拉开",avoid_island:"绕岛修正",disengage:"脱离",evade:"规避鱼雷",manual_pause:"用户接管暂停"};
+const movementLabels={idle:"等待任务",autopilot_route:"游戏自动航行",route_planning:"规划航线",opening:"驶向中央点",route_transit:"按航线推进",search:"驶向中央点",approach:"点内接敌",hold_range:"维持副炮距离",hold_capture:"点内留守",separate:"主动拉开",avoid_island:"绕岛修正",disengage:"脱离",evade:"规避鱼雷",navigation_blocked:"等待安全航路",manual_pause:"用户接管暂停"};
 const routeLabels={unplanned:"未规划",departure:"离开出生点",transit:"驶向中央点",final_approach:"进入点位",station:"点内作战"};
 const logViewState={follow:true,lastText:null,programmatic:false};
 
@@ -85,7 +85,7 @@ async function pollStatus(){
     $("#autopilotStatus").textContent=data.autopilot_enabled?(data.autopilot_confirmed?"已确认 · 原生航线":"等待左下角启用确认"):"未开启 · 小地图接管";
     const observedRudder=data.rudder_indicator||"neutral",commanded=Number(data.commanded_rudder||0);$("#rudderStatus").textContent=observedRudder==="autopilot"?"原生自动舵":observedRudder==="Q"?"Q 左舵":observedRudder==="E"?"E 右舵":Math.abs(commanded)>=.1?(commanded<0?"Q 左舵":"E 右舵"):"中舵";
     const island=data.island_distance==null?"山体安全":`前方山体 ${Number(data.island_distance).toFixed(2)}`,enemyCount=Number(data.minimap_enemy_count||0);$("#mapSituation").textContent=`敌舰 ${enemyCount} · ${island}`;
-    const navLabels={native_autopilot:"原生自动航线",minimap_capture_zone:"点位远端",minimap_capture_zone_fallback:"点位远端接管",minimap_center:"地图中央"};$("#navigationStatus").textContent=navLabels[data.navigation_source]||data.navigation_source||"等待小地图";
+    const navLabels={native_autopilot:"原生自动航线",minimap_capture_zone:"点位远端",minimap_capture_zone_fallback:"点位远端接管",minimap_center:"地图中央",minimap_island_waypoint:"绕岛航点",minimap_route_blocked:"等待安全航路"};$("#navigationStatus").textContent=navLabels[data.navigation_source]||data.navigation_source||"等待小地图";
     const dead=data.health_percent!=null&&Number(data.health_percent)<=0;const hp=data.health_percent==null?"生命 —":dead?"死亡":`生命 ${Number(data.health_percent).toFixed(0)}%`;const hazards=dead?[]:[data.on_fire?"着火":"",data.flooding?"进水":""].filter(Boolean);$("#shipStatus").textContent=dead?"死亡":`${hp}${hazards.length?` · ${hazards.join("/")}`:" · 正常"}`;$("#speedStatus").textContent=data.speed_knots==null?"—":`${Number(data.speed_knots).toFixed(1)} kt`;
     const headingVector=normalizedVector(data.minimap_heading);$("#headingStatus").textContent=headingVector?`${Math.round((Math.atan2(headingVector[1],headingVector[0])*180/Math.PI+450)%360)}°`:"—";const otherReady=data.other_consumables_ready??data.heal_ready;$("#consumableStatus").textContent=`R ${data.damage_control_ready?"可用":"冷却"} · 其他 ${otherReady?"可用":"冷却"}`;
     renderLiveLog(data.log);

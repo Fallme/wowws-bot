@@ -43,7 +43,7 @@ def test_native_route_never_yields_for_arrival_terrain_far_or_cached_contact(cha
     assert backend.events == []
 
 
-def test_close_contact_requires_three_fresh_consecutive_frames_and_one_handoff():
+def test_close_contact_requires_three_frames_and_only_adjusts_throttle():
     bot, backend = native_bot()
     bot._native_spawn_position = (.2, .5)
     frame = analysis(minimap_player_normalized=(.55, .5), nearest_enemy_normalized=(.7, .5), minimap_target_bearing=.2, minimap_distance_km=10)
@@ -51,12 +51,13 @@ def test_close_contact_requires_three_fresh_consecutive_frames_and_one_handoff()
         bot._execute_rules(frame, t)
         assert bot.opening_autopilot_active
     bot._execute_rules(frame, 42)
-    assert not bot.opening_autopilot_active
-    assert bot.autopilot_retry_pending
-    assert "10.0km" in bot.last_movement_reason
+    assert bot.opening_autopilot_active
+    assert not bot.autopilot_retry_pending
+    assert backend.actual_notch == 2
+    assert not any(key in {"q", "e"} for _, key in backend.events)
     assert bot.stuck_recovery.reverse_until is None
     count = len(backend.events)
-    bot.request_autopilot_retry("duplicate")
+    bot._execute_rules(frame, 43)
     assert len(backend.events) == count
 
 
@@ -75,37 +76,42 @@ def test_contact_sampling_gap_does_not_count_as_continuous_contact():
     ((.5, .2), (.5, .51), (.5, .55)),
     ((.5, .8), (.5, .49), (.5, .45)),
 ])
-def test_native_route_keeps_ownership_until_enemy_half(spawn, near_mid, across):
+def test_native_route_keeps_ownership_until_enemy_half_outside_slowdown_range(spawn, near_mid, across):
     bot, backend = native_bot()
     for t, pos in enumerate([spawn] * 3 + [near_mid] * 4, 100):
         bot._execute_rules(analysis(minimap_player_normalized=pos,
             nearest_enemy_normalized=(.6, .6), minimap_target_bearing=.2,
-            minimap_distance_km=5), float(t))
+            minimap_distance_km=12), float(t))
         assert bot.opening_autopilot_active
     assert backend.events == []
     for t in (107., 108., 109.):
         bot._execute_rules(analysis(minimap_player_normalized=across,
             nearest_enemy_normalized=(.6, .6), minimap_target_bearing=.2,
-            minimap_distance_km=5), t)
-    assert not bot.opening_autopilot_active
+            minimap_distance_km=12), t)
+    assert bot.opening_autopilot_active
 
 
-def test_native_stall_arms_bounded_reverse_then_returns_to_forward():
+def test_native_stall_keeps_route_and_does_not_reverse():
     bot, backend = native_bot()
     frame = analysis(speed_knots=.4)
     for t in range(30, 50):
         bot._execute_rules(frame, float(t))
         assert bot.opening_autopilot_active
     bot._execute_rules(frame, 50.)
-    assert not bot.opening_autopilot_active
-    assert bot.stuck_recovery.reverse_until == 62.
+    assert bot.opening_autopilot_active
+    assert bot.stuck_recovery.reverse_until is None
+    assert backend.actual_notch == 4
+    assert backend.events == []
     for t in (51., 60.):
         bot._execute_rules(frame, t)
-        assert backend.actual_notch == -4
+        assert backend.actual_notch == 4
         assert backend.actual_rudder == 0
     bot._execute_rules(frame, 62.)
-    assert backend.actual_notch > 0
+    assert backend.actual_notch == 4
+    assert bot._last_movement_mode == "autopilot_route"
     assert bot.stuck_recovery.reverse_until is None
+    bot._execute_rules(frame, 63.)
+    assert backend.actual_notch > 0
 
 
 @pytest.mark.parametrize("enemy,bearing", [((.4, .5), 1.), ((.5, .6), .5), ((.51, .5), 0.)])

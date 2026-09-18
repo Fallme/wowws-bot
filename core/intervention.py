@@ -97,14 +97,15 @@ def _keyboard_activity() -> bool:
     ignored without installing a global hook.
     """
     user32 = ctypes.windll.user32
+    active = False
     for virtual_key in range(0x08, 0xFF):
         # Bit 0 means the key transitioned since our previous query. Bit 15
         # only means that it is currently down. Treating bit 15 as activity
         # made a held/stale key look new whenever an automated cursor move
         # changed GetLastInputInfo, so the bot cancelled its own UI click.
         if int(user32.GetAsyncKeyState(virtual_key)) & 0x0001:
-            return True
-    return False
+            active = True
+    return active
 
 
 def _tick_distance(left: int, right: int) -> int:
@@ -155,6 +156,10 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = False
+        # A long interaction outside the game requires an explicit Continue,
+        # but returning to the game is itself a positive focus signal.  Keep a
+        # separate marker so only that safe return path can clear the latch.
+        self._latched_while_away = False
         self._last_foreground: int | None = None
         self._automation_keyboard_quiet_until = 0.0
         self.last_trigger = ""
@@ -177,6 +182,7 @@ class UserInterventionMonitor:
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = False
+        self._latched_while_away = False
         self.last_trigger = ""
 
     def _consume_web_resume(self) -> bool:
@@ -187,12 +193,14 @@ class UserInterventionMonitor:
         except OSError:
             return False
         self._last_seen_tick = self._input_tick_reader()
+        self._keyboard_activity_reader()
         self.pause_until = 0.0
         self.intervention_started_at = None
         self.last_user_input_at = None
         self.latched = False
         self.web_paused = False
         self.resumed_from_web = True
+        self._latched_while_away = False
         self.last_trigger = "web_resume"
         # The Continue button is normally clicked from the browser.  Seed the
         # foreground baseline there so that this intentional Web action does
@@ -214,9 +222,13 @@ class UserInterventionMonitor:
         was_latched = self.latched
         if now - self.intervention_started_at >= self.latch_seconds:
             self.latched = True
+            if not was_latched:
+                self._latched_while_away = not self._is_game_foreground(
+                    self._last_foreground
+                )
         if self.latched and not was_latched:
             logger.warning(
-                "[USER] 连续操作达到 %.0f 秒，已锁定暂停；仅网页“继续”可恢复",
+                "[USER] 连续操作达到 %.0f 秒，已锁定暂停；网页“继续”或回到游戏后静默可恢复",
                 self.latch_seconds,
             )
 
@@ -312,6 +324,28 @@ class UserInterventionMonitor:
 
         if previous_tick is None or current_tick == previous_tick:
             if self.latched:
+                # When the user returns to the actual game after a long
+                # background session, wait for one ordinary quiet period and
+                # then resume automatically.  A latch created while typing in
+                # the game remains manual-only, and Web pause is always
+                # explicit, so this never steals focus from active input.
+                if (
+                    self._latched_while_away
+                    and not self.web_paused
+                    and self._is_game_foreground(current_foreground)
+                    and self.last_user_input_at is not None
+                    and now - self.last_user_input_at >= self.pause_seconds
+                ):
+                    self.latched = False
+                    self._latched_while_away = False
+                    self.pause_until = 0.0
+                    self.intervention_started_at = None
+                    self.last_user_input_at = None
+                    self.last_trigger = "auto_foreground_resume"
+                    logger.info(
+                        "[SYSTEM] 用户已回到游戏且保持静默，自动解除切屏暂停"
+                    )
+                    return False
                 return True
             if now >= self.pause_until and self.intervention_started_at is not None:
                 self.intervention_started_at = None

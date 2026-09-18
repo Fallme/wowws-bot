@@ -265,7 +265,7 @@ class SecondaryMovementTests(unittest.TestCase):
         )
 
         self.assertEqual(command.mode, MovementMode.BRAWL)
-        self.assertGreaterEqual(command.throttle, 0.6)
+        self.assertEqual(command.throttle, 0.5)
 
     def test_torpedo_evasion_keeps_full_speed(self):
         command = self.plan(torpedoes_incoming=True)

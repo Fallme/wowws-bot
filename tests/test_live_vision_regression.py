@@ -11,6 +11,7 @@ from core.ui import (
     NO_COMMANDER_CONFIRM_BUTTON,
 )
 from core.vision import PlayerPose, Vision
+from core.minimap_geometry import minimap_grid_bounds
 
 
 @pytest.fixture(scope="module")
@@ -23,6 +24,11 @@ def live_frame():
 def test_live_viewport_groups_target_strokes(live_frame):
     enemies = Vision().find_enemies_in_viewport(live_frame)
     assert len(enemies) == 1
+
+
+def test_low_contrast_1440p_grid_detector_abstains_when_grid_is_hidden():
+    frame = cv2.imread(str(Path("tests") / "fixtures" / "battle_low_contrast_1440.png"))
+    assert minimap_grid_bounds(frame) is None
 
 
 def test_live_health_uses_ship_status_gauge(live_frame):
@@ -105,6 +111,8 @@ def test_real_tactical_grid_rectifies_capture_points_to_minimap_coordinates():
         / "user_captures"
         / "codex-clipboard-68c91356-07a4-4753-a25a-0824b8b62c6f.png"
     )
+    if not path.exists():
+        pytest.skip("Optional local tactical-map training capture is unavailable")
     frame = cv2.imread(str(path))
     assert frame is not None
     vision = Vision(screen_capture=object())

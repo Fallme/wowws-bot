@@ -9,29 +9,28 @@ def test_moving_ship_does_not_trigger_recovery():
     assert command is None
 
 
-def test_stationary_ship_uses_two_bounded_forward_escape_phases():
+def test_stationary_ship_reverses_then_requests_replan_and_cooldown():
     controller = StuckRecoveryController(
         stationary_seconds=10,
-        escape_turn_seconds=4,
-        forward_seconds=3,
+        reverse_seconds=4,
     )
     command = None
     for second in range(12):
         command = controller.update(second, (100, 200), 1.0)
     assert command is not None
-    assert command.phase == "forward_escape_turn"
-    assert command.throttle == 1.0
+    assert command.phase == "reverse_clear"
+    assert command.throttle == -1.0
 
-    command = controller.update(16, (100, 200), 1.0)
-    assert command.phase == "forward_clear"
-    assert command.throttle > 0
+    command = controller.update(14, (100, 200), 1.0)
+    assert command.phase == "replan"
+    assert command.throttle == 0
+    assert controller.update(15, (100, 200), 1.0) is None
 
 
-def test_recovery_never_generates_reverse_throttle():
+def test_recovery_never_generates_blind_forward_throttle():
     controller = StuckRecoveryController(
         stationary_seconds=8,
-        escape_turn_seconds=4,
-        forward_seconds=3,
+        reverse_seconds=4,
     )
     commands = []
     for second in range(20):
@@ -40,7 +39,9 @@ def test_recovery_never_generates_reverse_throttle():
             commands.append(command)
 
     assert commands
-    assert all(command.throttle >= 0 for command in commands)
+    assert commands[0].phase == "reverse_clear"
+    assert commands[-1].phase == "replan"
+    assert all(command.throttle <= 0 for command in commands)
 
 
 def test_missing_position_clears_stationary_evidence():
@@ -51,7 +52,20 @@ def test_missing_position_clears_stationary_evidence():
     assert controller.update(11, (100, 200), 1.0) is None
 
 
-def test_recovery_uses_live_clearance_side_when_available():
+def test_observation_gap_does_not_count_as_sustained_low_speed():
+    controller = StuckRecoveryController(low_speed_seconds=8)
+    for second in (0, 1, 2, 20, 21, 22):
+        assert controller.update(second, (100, 200), 1.0, speed_knots=.4) is None
+
+
+def test_slow_but_continuous_capture_still_detects_collision():
+    controller = StuckRecoveryController(low_speed_seconds=8)
+    assert controller.update(0, (100, 200), 1.0, speed_knots=.4) is None
+    assert controller.update(4, (100, 200), 1.0, speed_knots=.4) is None
+    assert controller.update(8, (100, 200), 1.0, speed_knots=.4).phase == "reverse_clear"
+
+
+def test_reverse_uses_neutral_rudder_even_when_previous_route_wanted_a_turn():
     controller = StuckRecoveryController(stationary_seconds=10)
     command = None
     for second in range(12):
@@ -62,7 +76,8 @@ def test_recovery_uses_live_clearance_side_when_available():
             escape_rudder=-0.8,
         )
     assert command is not None
-    assert command.rudder == -1
+    assert command.rudder == 0
+    assert command.throttle == -1
 
 
 def test_sustained_low_speed_triggers_even_when_marker_slowly_drifts():
@@ -84,8 +99,8 @@ def test_sustained_low_speed_triggers_even_when_marker_slowly_drifts():
         )
 
     assert command is not None
-    assert command.phase == "forward_escape_turn"
-    assert command.throttle == 1.0
+    assert command.phase == "reverse_clear"
+    assert command.throttle == -1.0
 
 
 def test_normal_acceleration_clears_low_speed_stall_timer():
