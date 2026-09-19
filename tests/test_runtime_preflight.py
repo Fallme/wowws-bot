@@ -5,6 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+import main
 from core.calibration import AUTOMATIC_PREFLIGHT_KEY, CalibrationStore
 from core.frame_guard import CaptureFault
 from core.ocr import OcrToken
@@ -581,7 +582,158 @@ def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():
 
     assert controller.reassertions == 1
     configure.assert_called_once_with(bot)
+    # The pre-battle page carries its own countdown and reaches the HUD by
+    # itself, so a page that disappears within a couple of frames must never be
+    # clicked.  Clicking it on every confirmed frame is what produced the
+    # 2026-09-12 click storm that collapsed the native-route setup rate.
+    start_click.assert_not_called()
+
+
+def test_pre_battle_rescue_click_requires_the_strictly_confirmed_action():
+    """A port sub-page passes the loose green-bar test but has no start action.
+
+    The loose detector also fires on ship/economy sub-pages; issuing a physical
+    click at the bottom-centre of such a page is not recoverable, so the rescue
+    must be gated on the same OCR-confirmed action every other caller uses.
+    """
+    frame = np.full((200, 320, 3), 80, dtype=np.uint8)
+
+    class LooseOnlyVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return frame
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.LOADING
+
+        @staticmethod
+        def _has_loading_start_action(_image):
+            return True
+
+        @staticmethod
+        def _has_battle_hud(_image):
+            return True
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return None
+
+    backend = SimpleNamespace(recognize=lambda _image: [OcrToken("经济加成", 0.9)])
+    controller = SimpleNamespace(
+        reassert_full_speed=lambda: None,
+        full_speed=lambda: None,
+    )
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=LooseOnlyVision(),
+        gamepad=controller,
+        intervention=None,
+        distance_reader=SimpleNamespace(backend=backend),
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=False),
+        patch("main.click_loading_start_action") as start_click,
+    ):
+        wait_for_battle(
+            bot,
+            timeout=2,
+            require_new_round=True,
+            loading_already_seen=True,
+        )
+
+    start_click.assert_not_called()
+
+
+class _StuckRosterVision:
+    """Always looks like the confirmed pre-battle page."""
+
+    def __init__(self, *, flicker=False):
+        self.frame_index = 0
+        self.flicker = flicker
+
+    def grab(self, _hwnd, *, allow_stale=False):
+        self.frame_index += 1
+        return np.full((200, 320, 3), 80, dtype=np.uint8)
+
+    @staticmethod
+    def classify_screen(_image):
+        return ScreenState.LOADING
+
+    def _has_loading_start_action(self, _image):
+        if self.flicker:
+            return self.frame_index % 2 == 0
+        return True
+
+    @staticmethod
+    def read_battle_clock_seconds(_image, _backend):
+        return None
+
+
+class _AdvancingClock:
+    """Deterministic stand-in for ``main.time`` in the stuck-page tests."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += 1.0
+        return self.now
+
+    @staticmethod
+    def sleep(_seconds):
+        return None
+
+
+def _run_stuck_pre_battle(*, flicker):
+    controller = SimpleNamespace(reassert_full_speed=lambda: None)
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=_StuckRosterVision(flicker=flicker),
+        gamepad=controller,
+        intervention=None,
+    )
+    clock = _AdvancingClock()
+    with (
+        patch("main.time", clock),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.click_loading_start_action", return_value=True) as start_click,
+    ):
+        prepared = wait_for_battle(
+            bot,
+            timeout=400,
+            require_new_round=True,
+            loading_already_seen=True,
+        )
+    return prepared, start_click, clock
+
+
+def test_stuck_pre_battle_page_gets_exactly_one_bounded_rescue_click():
+    """A page that stops advancing is rescued once, then only waited out.
+
+    Running the fake clock past the whole budget is also the regression guard
+    for the removed early bail-out: the old code abandoned the round after
+    twelve seconds whenever three clicks had been spent.
+    """
+    prepared, start_click, clock = _run_stuck_pre_battle(flicker=False)
+
+    assert not prepared
     start_click.assert_called_once()
+    # It kept waiting for the full budget instead of handing back to the
+    # lifecycle after the first twelve seconds.
+    assert clock.now >= 400
+    assert main.LOADING_START_RESCUE_ATTEMPTS == 1
+
+
+def test_flickering_pre_battle_detector_never_arms_the_rescue():
+    """A detector that flickers between frames must not re-arm the budget."""
+    prepared, start_click, clock = _run_stuck_pre_battle(flicker=True)
+
+    assert not prepared
+    start_click.assert_not_called()
+    assert clock.now >= 400
 
 
 def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing():

@@ -359,6 +359,21 @@ def ensure_capture_foreground(bot) -> bool:
     return ensure_bound_game_foreground(bot)
 
 
+# The pre-battle roster page renders its own countdown and enters the live HUD
+# by itself; 2026-09-05..09-11 logs show thirteen successful native-route setups
+# on days when that page was never clicked at all.  Its explicit action is
+# therefore a rescue for a page that has visibly stopped advancing, never a
+# routine per-frame click: pressing it on every confirmed frame produced an
+# unbounded physical-click storm (85 clicks in one day) and the setup success
+# rate fell from 81% of attempts to 10%.  Wait out a full countdown plus a wide
+# margin, and give a whole page episode exactly one bounded attempt.
+LOADING_START_RESCUE_DELAY = 60.0
+LOADING_START_RESCUE_ATTEMPTS = 1
+# A detector that flickers between frames must not re-arm the bounded rescue.
+# The budget returns only after the confirmed page has really stayed away.
+LOADING_START_EPISODE_QUIET = 10.0
+
+
 def loading_start_action_visible(bot, image) -> bool:
     """Detect the pre-battle start action without trusting broad page colour."""
     detector = getattr(getattr(bot, "vision", None), "_has_loading_start_action", None)
@@ -956,8 +971,8 @@ def wait_for_battle(
     last_clock = None
     clock_backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
     opening_attempted = False
-    loading_start_seen_at = None
-    loading_start_last_click_at = None
+    loading_start_dwell_since = None
+    loading_start_quiet_since = None
     loading_start_clicks = 0
     new_round_state_reset = bool(require_new_round and loading_already_seen)
     if new_round_state_reset:
@@ -1002,23 +1017,29 @@ def wait_for_battle(
             loading_seen = True
             battle_frames = 0
             clock_frames = 0
-            if loading_start_action_visible(bot, image):
+            # Never treat this page as a routine action item.  It carries its
+            # own countdown and reaches the live HUD unaided, so the confirmed
+            # action is only a rescue for a page that has clearly stopped
+            # advancing.  The strict gate is mandatory here: the loose green-bar
+            # test also fires on port sub-pages that have no start action at
+            # all, and a stray physical click there is not recoverable.
+            if loading_start_confirmed(bot, image):
                 now = time.monotonic()
-                if loading_start_seen_at is None:
-                    loading_start_seen_at = now
+                loading_start_quiet_since = None
+                if loading_start_dwell_since is None:
+                    loading_start_dwell_since = now
                     logger.info(
-                        "检测到第二阶段“开始战斗”页面，准备确认后继续等待 HUD"
+                        "检测到已确认的“开始战斗”页面；该页自带倒计时，"
+                        "先等待其自行推进（兜底确认最早在 %s 秒后）",
+                        int(LOADING_START_RESCUE_DELAY),
                     )
                 if (
                     hasattr(bot, "gamepad")
-                    and loading_start_clicks < 3
-                    and (
-                        loading_start_last_click_at is None
-                        or now - loading_start_last_click_at >= 2.0
-                    )
+                    and loading_start_clicks < LOADING_START_RESCUE_ATTEMPTS
+                    and now - loading_start_dwell_since >= LOADING_START_RESCUE_DELAY
                 ):
                     loading_start_clicks += 1
-                    loading_start_last_click_at = now
+                    dwell = now - loading_start_dwell_since
                     try:
                         clicked = click_loading_start_action(
                             bot.hwnd,
@@ -1028,33 +1049,37 @@ def wait_for_battle(
                         )
                     except (CaptureFault, SafetyFault, RuntimeError) as error:
                         clicked = False
-                        logger.warning(
-                            "“开始战斗”确认动作异常 (%s/3): %s",
-                            loading_start_clicks,
-                            error,
-                        )
+                        logger.warning("“开始战斗”兜底确认动作异常: %s", error)
                     if clicked:
-                        logger.info(
-                            "已点击“开始战斗”确认按钮 (%s/3)，等待新一局 HUD",
+                        logger.warning(
+                            "“开始战斗”页面已连续确认 %s 秒仍未自行推进，"
+                            "已派发一次兜底确认 (%s/%s)；本次停留不再重复点击",
+                            int(dwell),
                             loading_start_clicks,
+                            LOADING_START_RESCUE_ATTEMPTS,
                         )
-                if (
-                    loading_start_seen_at is not None
-                    and now - loading_start_seen_at >= 12.0
-                    and loading_start_clicks >= 3
-                ):
-                    logger.warning(
-                        "“开始战斗”页面连续确认失败，已达到有限重试；"
-                        "交回生命周期重新识别"
-                    )
-                    return False
             else:
-                # A new visual episode must be allowed one fresh confirmation
-                # attempt; this also prevents a stale count from suppressing
-                # a later, genuinely actionable pre-battle page.
-                loading_start_seen_at = None
-                loading_start_last_click_at = None
-                loading_start_clicks = 0
+                # One episode is one continuous confirmed dwell.  The bounded
+                # budget may only be re-armed after the page has really stayed
+                # away, so a detector that flickers between frames can no
+                # longer turn the attempt cap into unlimited clicking.
+                loading_start_dwell_since = None
+                if loading_start_clicks:
+                    now = time.monotonic()
+                    if loading_start_quiet_since is None:
+                        loading_start_quiet_since = now
+                    elif (
+                        now - loading_start_quiet_since
+                        >= LOADING_START_EPISODE_QUIET
+                    ):
+                        loading_start_clicks = 0
+                        loading_start_quiet_since = None
+                        logger.info("“开始战斗”页面已离开，兜底确认额度已重置")
+            # This branch deliberately never returns False.  Bailing out only
+            # because the pre-battle page persisted discarded a confirmed,
+            # already in-flight transition: the caller then re-identified the
+            # scene, re-entered the same page and pushed the round onto the
+            # resume path, where the opening native route is never rebuilt.
             continue
         if state == ScreenState.BATTLE:
             unknown_frames = 0
