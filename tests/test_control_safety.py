@@ -10,6 +10,12 @@ from control_server import (
 )
 
 
+def empty_control_store():
+    store = Mock()
+    store.get_resume_candidate.return_value = None
+    return store
+
+
 def test_control_server_keeps_running_when_already_elevated():
     shell = Mock()
     shell.IsUserAnAdmin.return_value = 1
@@ -37,7 +43,7 @@ def test_control_server_restarts_itself_elevated_once():
 
 
 def test_runner_starts_without_manual_calibration(tmp_path):
-    manager = RunnerManager(Mock())
+    manager = RunnerManager(empty_control_store())
     process = Mock(pid=1234)
     process.poll.return_value = None
     with (
@@ -45,6 +51,7 @@ def test_runner_starts_without_manual_calibration(tmp_path):
         patch("control_server.STATE_PATH", tmp_path / "state.json"),
         patch("control_server.STOP_PATH", tmp_path / "stop.request"),
         patch("control_server.running_game_requires_elevation", return_value=False),
+        patch("control_server.remember_launch_client"),
         patch("control_server.subprocess.Popen", return_value=process),
     ):
         result = manager.start(
@@ -61,7 +68,7 @@ def test_runner_starts_without_manual_calibration(tmp_path):
 
 
 def test_runner_passes_selected_launcher_to_worker(tmp_path):
-    manager = RunnerManager(Mock())
+    manager = RunnerManager(empty_control_store())
     process = Mock(pid=1234)
     process.poll.return_value = None
     with (
@@ -71,6 +78,7 @@ def test_runner_passes_selected_launcher_to_worker(tmp_path):
         patch("control_server.running_game_requires_elevation", return_value=False),
         patch("control_server.PAUSE_PATH", tmp_path / "pause.request"),
         patch("control_server.RESUME_PATH", tmp_path / "resume.request"),
+        patch("control_server.remember_launch_client"),
         patch("control_server.subprocess.Popen", return_value=process) as popen,
     ):
         manager.start(
@@ -87,7 +95,7 @@ def test_runner_passes_selected_launcher_to_worker(tmp_path):
 
 
 def test_runner_requests_elevation_only_for_verified_game_mismatch():
-    manager = RunnerManager(Mock())
+    manager = RunnerManager(empty_control_store())
     with patch("control_server.running_game_requires_elevation", return_value=True):
         with pytest.raises(ElevationRequiredError):
             manager.start(

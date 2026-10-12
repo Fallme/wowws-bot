@@ -517,14 +517,14 @@ def get_client_rect(hwnd):
 
 
 def physical_click(
-    screen_x, screen_y, extra_delay=0.0, *, hwnd=None, button="left"
+    screen_x, screen_y, extra_delay=0.0, *, hwnd=None, button="left", should_abort=None
 ):
     """Click a physical coordinate and restore the original cursor.
 
     ``button`` is explicit so the port workflow can open the selected ship's
     context menu without introducing a second cursor-positioning path.
     """
-    if _interaction_paused():
+    if _interaction_paused() or (should_abort is not None and should_abort()):
         return False
     if hwnd and not ensure_game_window_foreground(hwnd):
         return False
@@ -589,7 +589,7 @@ def physical_click(
             if button == "left"
             else win32con.MOUSEEVENTF_RIGHTUP
         )
-        if _interaction_paused():
+        if _interaction_paused() or (should_abort is not None and should_abort()):
             logger.info("[USER] 鼠标移动后检测到暂停，取消本次点击")
             return False
         user32.mouse_event(down_flag, 0, 0, 0, 0)

@@ -50,6 +50,7 @@ class SecondaryMovementInput:
     island_avoidance_rudder: float | None = None
     kinematic_rudder: float | None = None
     kinematic_avoidance_required: bool = False
+    kinematic_all_paths_blocked: bool = False
     kinematic_collision_time_seconds: float | None = None
     kinematic_clearance_km: float | None = None
     kinematic_target: str = ""
@@ -306,7 +307,7 @@ class SecondaryMovementController:
     ) -> MovementCommand:
         collision_seconds = state.kinematic_collision_time_seconds
         emergency = bool(
-            collision_seconds is None or collision_seconds <= 30.0
+            state.kinematic_all_paths_blocked or collision_seconds is None or collision_seconds <= 30.0
         )
         clearance_text = (
             f"，预测净空约{state.kinematic_clearance_km:.1f}km"
@@ -314,15 +315,15 @@ class SecondaryMovementController:
             else ""
         )
         collision_text = (
-            f"约{collision_seconds:.0f}秒后触岸"
+            f"约{collision_seconds:.0f}秒后进入岸线安全余量"
             if collision_seconds is not None
             else "候选航迹均不安全"
         )
         return MovementCommand(
             MovementMode.AVOID_ISLAND,
             throttle=(
-                0.55
-                if emergency
+                0.25 if state.kinematic_all_paths_blocked
+                else 0.55 if emergency
                 else (0.82 if state.inside_capture_point else 1.0)
             ),
             rudder=self._island_rudder(state),
@@ -330,7 +331,8 @@ class SecondaryMovementController:
                 f"运动学预测{collision_text}，按{self.qe_speed_knots:.0f}节/"
                 f"{self.qe_rudder_shift_seconds:.0f}秒舵效/"
                 f"{self.qe_turning_radius_km:.1f}km转弯半径"
-                f"选择安全航迹{clearance_text}"
+                + ("未找到满足净空的航迹，低速转向脱险" if state.kinematic_all_paths_blocked else "选择避障航迹")
+                + clearance_text
                 + (
                     f"；避山优先，安全后继续朝{state.kinematic_target}推进"
                     if state.kinematic_target

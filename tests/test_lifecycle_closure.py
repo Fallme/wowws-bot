@@ -33,11 +33,15 @@ SHIP_CONFIG = {
 def drive_run(
     *,
     quick_battle=False,
+    resuming=False,
     recover,
     battle_finished="battle_timeout",
     port_return=False,
     claim_reward=False,
     quick_closure=ScreenState.BATTLE,
+    queue_return=False,
+    max_rounds=999,
+    use_real_stop=False,
     gates,
     monotonic,
 ):
@@ -50,11 +54,13 @@ def drive_run(
         gamepad=SimpleNamespace(escape=Mock(), confirm=Mock()),
         intervention=None,
         distance_reader=SimpleNamespace(backend=Mock()),
+        reset=Mock(),
     )
     limits = RunLimits(
-        max_rounds=999,
+        max_rounds=max_rounds,
         duration_minutes=99999,
         quick_battle=quick_battle,
+        resuming=resuming,
     )
     with ExitStack() as stack:
         stack.enter_context(patch("main.configure_dpi_awareness"))
@@ -104,9 +110,16 @@ def drive_run(
                 return_value=quick_closure,
             )
         )
+        fake_bot.queue_next_battle_mock = stack.enter_context(
+            patch("main.queue_next_battle", return_value=queue_return)
+        )
         stack.enter_context(patch("main.prepare_battle", return_value=False))
+        # Phase sampling has its own clock/tests. This harness's finite clock
+        # sequence drives only the outer lifecycle watchdog.
+        stack.enter_context(patch("main.observe_battle_phase"))
         stack.enter_context(patch("main.operation_paused", return_value=False))
-        stack.enter_context(patch("main.lifecycle_stop_requested", return_value=False))
+        if not use_real_stop:
+            stack.enter_context(patch("main.lifecycle_stop_requested", return_value=False))
         stack.enter_context(patch("main.shutdown_bot"))
         stack.enter_context(patch("main.time.monotonic", side_effect=monotonic))
         stack.enter_context(patch("main.time.sleep", return_value=None))
@@ -146,6 +159,22 @@ def test_battle_timeout_with_confirmed_port_return_keeps_plan_running():
     assert port_return.call_count == 1
 
 
+def test_continue_classifies_live_battle_and_uses_same_match_control():
+    exit_code, bot, run_battle, port_return, _claim, _quick = drive_run(
+        resuming=True,
+        recover=[ScreenState.BATTLE, ScreenState.BATTLE],
+        battle_finished="battle_timeout",
+        port_return=True,
+        gates=[GATE, GATE, GATE, None],
+        monotonic=[0.0, 999999.0],
+    )
+
+    assert exit_code == 0
+    bot.reset.assert_called_once_with(preserve_movement=True)
+    assert run_battle.call_args.kwargs["resume_existing"] is True
+    assert port_return.call_count == 1
+
+
 def test_quick_battle_closure_failing_three_times_terminates_task():
     """Quick battles must count a round only after a confirmed exit; three
     consecutive unconfirmed closures stop the task instead of spinning."""
@@ -162,6 +191,64 @@ def test_quick_battle_closure_failing_three_times_terminates_task():
     assert run_battle.call_count == 3
     assert quick_closure.call_count == 3
     assert port_return.call_count == 0
+
+
+def test_sunk_quick_battle_requeues_directly_from_confirmed_results():
+    exit_code, bot, run_battle, port_return, _claim, quick_closure = drive_run(
+        quick_battle=True,
+        recover=[ScreenState.BATTLE],
+        battle_finished="quick_death",
+        quick_closure=ScreenState.RESULTS,
+        gates=[GATE, GATE, GATE, None],
+        monotonic=[0.0, 999999.0],
+    )
+
+    assert exit_code == 0
+    assert run_battle.call_count == 1
+    quick_closure.assert_called_once()
+    assert quick_closure.call_args.kwargs["ship_sunk"] is True
+    bot.queue_next_battle_mock.assert_called_once()
+    port_return.assert_not_called()
+
+
+def test_sunk_quick_battle_counts_and_waits_after_immediate_death_requeue():
+    with patch("main.wait_for_battle", return_value=False) as wait:
+        exit_code, bot, run_battle, port_return, _claim, quick_closure = drive_run(
+            quick_battle=True,
+            recover=[ScreenState.BATTLE],
+            battle_finished="quick_death",
+            quick_closure=ScreenState.QUICK_REQUEUE,
+            queue_return=True,
+            gates=[GATE, GATE, GATE, None],
+            monotonic=[0.0, 999999.0],
+        )
+
+    assert exit_code == 0
+    assert run_battle.call_count == 1
+    quick_closure.assert_called_once()
+    wait.assert_called_once()
+    bot.queue_next_battle_mock.assert_called_once()
+    assert bot.queue_next_battle_mock.call_args.kwargs["source"] == ScreenState.QUICK_REQUEUE
+    port_return.assert_not_called()
+
+
+def test_last_sunk_quick_round_is_counted_without_queueing_an_extra_match():
+    exit_code, bot, run_battle, port_return, _claim, quick_closure = drive_run(
+        quick_battle=True,
+        max_rounds=1,
+        use_real_stop=True,
+        recover=[ScreenState.BATTLE],
+        battle_finished="quick_death",
+        quick_closure=ScreenState.QUICK_REQUEUE,
+        gates=[GATE, GATE, GATE, None],
+        monotonic=[0.0, 999999.0],
+    )
+
+    assert exit_code == 0
+    assert run_battle.call_count == 1
+    quick_closure.assert_called_once()
+    bot.queue_next_battle_mock.assert_not_called()
+    port_return.assert_not_called()
 
 
 def test_daily_reward_three_failures_force_close_and_keep_plan_running():

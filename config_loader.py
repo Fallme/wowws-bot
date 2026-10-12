@@ -25,9 +25,8 @@ def _custom_ship_config(data: dict) -> dict:
     if not 1.0 <= secondary_range <= 30.0:
         raise ValueError("自定义舰船副炮射程必须在 1.0 到 30.0 km 之间")
 
-    # Unknown ships deliberately inherit the generic battleship controls and
-    # do not use ship-specific torpedo/smoke commands. Only distance-dependent
-    # movement is adjusted from the user-provided secondary range.
+    # Unknown ships inherit generic movement controls. Torpedo capability is
+    # verified from the actual weapon HUD, never inherited from Pommern.
     base = data.get("pommern")
     if not isinstance(base, dict):
         raise ValueError("自定义舰船缺少基础控制配置")
@@ -42,6 +41,7 @@ def _custom_ship_config(data: dict) -> dict:
             "has_smoke": False,
         }
     )
+    ship.pop("torpedo", None)
     ship["secondary"]["range"] = secondary_range
     strategy = ship["strategy"]
     inner = min(max(secondary_range * 0.62, 3.0), secondary_range - 0.8)

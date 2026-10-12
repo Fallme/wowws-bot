@@ -5,21 +5,46 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import os
+import logging
 from pathlib import Path
 import re
 import subprocess
 import winreg
+import xml.etree.ElementTree as ET
+
+from core.wgc_version import resolve_wgc_version
+from core.wgc_readiness import wait_for_wgc_backend
+
+logger = logging.getLogger("launcher")
 
 
 STEAM_APP_ID = "552990"
 LAUNCH_CLIENTS = ("steam", "wgc")
+LAST_CLIENT_PATH = Path(__file__).resolve().parents[1] / "data" / "last_launcher.txt"
+
+
+def last_launch_client() -> str:
+    try:
+        return normalize_launch_client(LAST_CLIENT_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return "steam"
+
+
+def remember_launch_client(client: str) -> None:
+    selected = normalize_launch_client(client)
+    LAST_CLIENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_CLIENT_PATH.write_text(selected, encoding="utf-8")
 
 
 @dataclass(frozen=True)
 class LaunchResult:
+    # "started" means the launch request was dispatched, not that the game
+    # is ready. The lifecycle must verify a real game-process window.
     started: bool
     method: str
     detail: str
+    game_directory: str = ""
+    launcher_path: str = ""
 
 
 def normalize_launch_client(value: str | None) -> str:
@@ -217,11 +242,30 @@ def find_wgc_game_executable(*, search_roots=None) -> Path | None:
     for variable in ("WOWS_WGC_GAME_EXE", "WOWS_GAME_EXE"):
         override = os.environ.get(variable, "").strip()
         if override:
-            found = _first_file([Path(override)])
+            path = Path(override)
+            found = _first_file([path])
             if found is not None:
                 return found
+            # Updates can remove the versioned executable an old override
+            # named. The verified installation root remains useful; its
+            # current metadata decides the executable at launch time.
+            directory = wgc_game_directory(path)
+            if directory is not None:
+                found = _first_file(_game_executable_candidates(directory))
+                if found is not None:
+                    return found
 
     game_roots: list[Path] = []
+    # WGC records installations on arbitrary drives under apps/<game id>/.
+    # Prefer its own registration over guessed common installation folders.
+    center = find_wgc_executable()
+    if center is not None:
+        for record in (center.parent / "apps").glob("wows.*/*"):
+            try:
+                if record.is_file() and record.stat().st_size <= 4096:
+                    game_roots.append(Path(record.read_text(encoding="utf-8-sig").strip()))
+            except OSError:
+                continue
     for entry in _uninstall_entries():
         name = entry["name"].casefold()
         if "world of warships" not in name and "战舰世界" not in name:
@@ -253,12 +297,50 @@ def find_wgc_game_executable(*, search_roots=None) -> Path | None:
     return _first_file(candidates)
 
 
+def wgc_game_directory(executable: Path) -> Path | None:
+    """Resolve the installation, including overrides pointing into bin/bin64."""
+    for directory in tuple(executable.parents)[:4]:
+        try:
+            root = ET.parse(directory / "game_info.xml").getroot()
+            if (root.findtext("game/id") or "").upper().startswith("WOWS."):
+                return directory.resolve()
+        except (OSError, ET.ParseError):
+            continue
+    return None
+
+
+def find_wgc_direct_game_executable(game_directory: Path) -> Path | None:
+    """Return the last known server engine without networking during UI reads."""
+    return resolve_wgc_version(game_directory).executable
+
+
+def _early_process_exit(process) -> int | None:
+    """Catch the WG SDK's immediate restart request, before a window exists."""
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return None
+    try:
+        code = wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        return None
+    return code if isinstance(code, int) else None
+
+
+def wait_for_wgc_ready(directory: Path, *, timeout: float = 30.0, should_stop=None) -> bool:
+    center = find_wgc_executable()
+    return center is not None and wait_for_wgc_backend(
+        center, directory, timeout=timeout, should_stop=should_stop)
+
+
 def launcher_statuses() -> dict:
     """Return paths found for each UI choice. This function never starts anything."""
     steam = find_steam_executable()
     steam_game = find_steam_game_executable()
     wgc = find_wgc_executable()
     wgc_game = find_wgc_game_executable()
+    wgc_directory = wgc_game_directory(wgc_game) if wgc_game else None
+    selection = resolve_wgc_version(wgc_directory) if wgc_directory else None
+    direct_game = selection.executable if selection else None
     return {
         "steam": {
             "name": "Steam",
@@ -268,34 +350,36 @@ def launcher_statuses() -> dict:
             "detail": "已自动找到 Steam" if steam else "未检测到 Steam",
         },
         "wgc": {
-            "name": "WG Game Center",
-            "available": wgc_game is not None,
+            "name": "WG 版（直接启动）",
+            "available": direct_game is not None,
             "launcher_path": str(wgc or ""),
-            "game_path": str(wgc_game or ""),
+            "game_path": str(direct_game or ""),
+            "version": selection.version if selection else "",
+            "realm": selection.realm if selection else "",
+            "version_source": selection.source if selection else "",
             "detail": (
-                "已自动找到游戏路径"
-                if wgc_game
-                else "已找到 WG Center，但未找到游戏路径"
-                if wgc
-                else "未检测到 WG Center 游戏路径"
+                selection.detail + "；启动时自动同步服务器版本并直接运行游戏"
+                if selection
+                else "未检测到 WG 版游戏安装路径"
             ),
         },
     }
 
 
 def launch_game(
-    *, client: str | None = None, popen=subprocess.Popen, startfile=os.startfile
+    *, client: str | None = None, popen=subprocess.Popen, startfile=os.startfile,
+    should_stop=None
 ) -> LaunchResult:
     """Launch the game with the selected client and never cross-fallback clients."""
     try:
         selected = normalize_launch_client(
-            client if client is not None else os.environ.get("WOWS_LAUNCHER_CLIENT")
+            client if client is not None else os.environ.get("WOWS_LAUNCHER_CLIENT", last_launch_client())
         )
     except ValueError as error:
         return LaunchResult(False, "invalid_client", str(error))
 
     explicit_game = os.environ.get("WOWS_GAME_EXE", "").strip()
-    if explicit_game:
+    if explicit_game and selected != "wgc":
         executable = Path(explicit_game)
         if not executable.is_file():
             return LaunchResult(False, "game_exe", f"游戏路径不存在: {executable}")
@@ -308,20 +392,58 @@ def launch_game(
 
     if selected == "wgc":
         executable = find_wgc_game_executable()
-        if executable is None:
-            center = find_wgc_executable()
-            detail = (
-                f"已找到 WG Game Center（{center}），但未找到《战舰世界》安装路径"
-                if center
-                else "未找到 WG Game Center 或《战舰世界》安装路径"
-            )
-            return LaunchResult(False, "wgc_game", detail)
-        popen(
-            [str(executable)],
-            cwd=str(executable.parent),
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
-        return LaunchResult(True, "wgc_game", str(executable))
+        directory = wgc_game_directory(executable) if executable else None
+        if directory is None:
+            return LaunchResult(False, "wgc_game", "无法确认 WG 版战舰世界安装及 game_info.xml")
+        # WGC downloads several builds. Its runner selects the one enabled
+        # on the selected realm, which may differ from client.installed.
+        selection = resolve_wgc_version(directory, refresh=True)
+        native = selection.executable
+        if native is None:
+            return LaunchResult(False, "wgc_direct",
+                                selection.detail,
+                                str(directory))
+        command = [str(native)]
+        try:
+            app_type = (ET.parse(directory / "app_type.xml").getroot().findtext("app_type") or "").strip()
+        except (OSError, ET.ParseError):
+            app_type = ""
+        if app_type and re.fullmatch(r"[a-zA-Z0-9_]+", app_type):
+            command.append(f"--apptype={app_type}")
+        if should_stop is not None and should_stop():
+            return LaunchResult(False, "wgc_direct", "已按用户要求停止启动", str(directory))
+        retry_detail = ""
+        try:
+            # Mirror WG's native command and keep the user's shared profile,
+            # graphics/UI settings and selected realm at the installation root.
+            options = {"cwd": str(directory),
+                       "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+            process = popen(command, **options)
+            code = _early_process_exit(process)
+            if code is not None:
+                # Cold WG SDK initialization can start its background service
+                # and exit the engine. Retry that same engine once; never
+                # invoke a launcher command or wait for a launcher button.
+                logger.info("游戏本体提前退出(%s)，等待 WG 后台初始化完成后重试本体: %s", code, native)
+                ready = wait_for_wgc_ready(directory, should_stop=should_stop)
+                if should_stop is not None and should_stop():
+                    return LaunchResult(False, "wgc_direct", "已按用户要求停止启动", str(directory))
+                if not ready:
+                    return LaunchResult(False, "wgc_direct",
+                                        f"{selection.detail}；本体提前退出({code})，WG 后台在30秒内未就绪，未重复启动",
+                                        str(directory))
+                retry_detail = f"；本体提前退出({code})，WG 后台就绪后已重试一次"
+                logger.info("WG 后台已就绪，直接重试游戏本体: %s", native)
+                process = popen(command, **options)
+                code = _early_process_exit(process)
+                if code is not None:
+                    return LaunchResult(False, "wgc_direct",
+                                        f"{selection.detail}；游戏本体连续提前退出({code})，已停止重试",
+                                        str(directory))
+        except OSError as error:
+            return LaunchResult(False, "wgc_direct", f"无法直接启动游戏本体: {error}", str(directory))
+        remember_launch_client(selected)
+        return LaunchResult(True, "wgc_direct", f"{selection.detail}{retry_detail}；已直接启动游戏本体: {native}；等待真实游戏窗口", str(directory))
 
     steam = find_steam_executable()
     if steam is not None:
@@ -330,6 +452,7 @@ def launch_game(
             cwd=str(steam.parent),
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
+        remember_launch_client(selected)
         return LaunchResult(True, "steam", str(steam))
 
     uri = f"steam://rungameid/{STEAM_APP_ID}"
@@ -337,4 +460,5 @@ def launch_game(
         startfile(uri)
     except OSError as error:
         return LaunchResult(False, "steam_uri", str(error))
+    remember_launch_client(selected)
     return LaunchResult(True, "steam_uri", uri)

@@ -14,6 +14,9 @@ class ScreenState(str, Enum):
     PORT_EXIT_CONFIRMATION = "port_exit_confirmation"
     SURVEY = "survey"
     RESULTS = "results"
+    # A sunk quick-battle ship has reached the post-Esc Continue Battle page.
+    # The action has not yet been clicked, so the round limit can be checked.
+    QUICK_REQUEUE = "quick_requeue"
     UNKNOWN = "unknown"
 
 

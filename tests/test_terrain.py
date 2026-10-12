@@ -38,6 +38,27 @@ def test_incompatible_map_cannot_contaminate_template():
     assert extend_template(old, [rectangle(.6, .6, .8, .8)]) == old
 
 
+def test_small_coincidental_overlap_does_not_merge_another_map():
+    old = [rectangle(.1, .1, .3, .3)]
+    candidate = [rectangle(.29, .29, .49, .49), rectangle(.65, .65, .8, .8)]
+    assert extend_template(old, candidate) == old
+
+
+def test_arrow_on_actual_land_cannot_carve_escape_route():
+    planner = IslandRoutePlanner()
+    assert planner.waypoint((400, 400), (200, 200), (350, 200),
+                            [rectangle(.49, .49, .515, .515)]) is None
+    assert not planner.path
+
+
+def test_route_smoothing_cannot_cut_diagonal_land_corners():
+    mask = np.zeros((4, 4), np.uint8)
+    mask[0, 1] = 1
+    assert not IslandRoutePlanner._clear(mask, (0, 0), (3, 3))
+    assert not IslandRoutePlanner._clear(mask, (3, 3), (0, 0))
+    assert IslandRoutePlanner._clear(mask, (0, 1), (3, 1))
+
+
 def test_overlay_repair_preserves_visible_water_channel():
     land = np.zeros((80, 80), np.uint8)
     land[15:65, 15:65] = 255

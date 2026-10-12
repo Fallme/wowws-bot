@@ -41,6 +41,9 @@ class RunLimits:
     quick_battle: bool = False
     close_game_when_done: bool = False
     shutdown_when_done: bool = False
+    initial_completed_rounds: int = 0
+    initial_elapsed_seconds: float = 0.0
+    resuming: bool = False
 
     @classmethod
     def from_env(cls) -> "RunLimits":
@@ -64,6 +67,9 @@ class RunLimits:
             quick_battle=quick in {"1", "true", "yes", "on"},
             close_game_when_done=close_game in {"1", "true", "yes", "on"},
             shutdown_when_done=os.environ.get("WOWS_SHUTDOWN_WHEN_DONE", "").lower() in {"1", "true", "yes", "on"},
+            initial_completed_rounds=max(0, int(os.environ.get("WOWS_INITIAL_COMPLETED_ROUNDS", "0"))),
+            initial_elapsed_seconds=max(0.0, float(os.environ.get("WOWS_INITIAL_ELAPSED_SECONDS", "0"))),
+            resuming=os.environ.get("WOWS_RESUME_EXISTING", "").strip().lower() in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -114,6 +120,7 @@ class RuntimeStatus:
     calibration_valid: bool = False
     movement_verified: bool = False
     frame_status: str = "unknown"
+    battle_phase: str = "unknown"
     capture_backend: str = "uninitialized"
     target_distance_km: float | None = None
     distance_source: str = "unknown"
@@ -177,7 +184,8 @@ class RuntimeReporter:
         ship_display_name: str = "",
     ):
         self.limits = limits
-        self.started_monotonic = time.monotonic()
+        self.started_monotonic = time.monotonic() - limits.initial_elapsed_seconds
+        self.reward_history = {}
         self.status = RuntimeStatus(
             run_id=limits.run_id,
             ship=ship,
@@ -188,7 +196,9 @@ class RuntimeReporter:
             quick_battle=limits.quick_battle,
             close_game_when_done=limits.close_game_when_done,
             shutdown_when_done=limits.shutdown_when_done,
-            started_at=time.time(),
+            started_at=time.time() - limits.initial_elapsed_seconds,
+            completed_rounds=limits.initial_completed_rounds,
+            current_round=limits.initial_completed_rounds + 1,
         )
 
     def update(self, state: str, message: str, **values: Any):
@@ -208,7 +218,21 @@ class RuntimeReporter:
         if destination is None:
             return
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(asdict(self.status), ensure_ascii=False, indent=2)
+        if (
+            not self.status.quick_battle
+            and self.status.rewards_status in {"recognized", "unrecognized"}
+            and self.status.rewards_round > 0
+        ):
+            self.reward_history[self.status.rewards_round] = {
+                "run_id": self.status.run_id,
+                "rewards_round": self.status.rewards_round,
+                "rewards_status": self.status.rewards_status,
+                "last_rewards": dict(self.status.last_rewards or {}),
+                "last_outcome": self.status.last_outcome,
+            }
+        snapshot = asdict(self.status)
+        snapshot["reward_history"] = list(self.reward_history.values())
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
         with NamedTemporaryFile(
             "w",
             encoding="utf-8",

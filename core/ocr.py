@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib.util
 import logging
 import math
@@ -351,6 +351,16 @@ class TargetDistanceReader:
         half_width = max(110, round(width * 0.050))
         top = anchor_y - max(4, round(height * 0.004))
         bottom = anchor_y + max(65, round(height * 0.047))
+        # Target labels share the game's independently sized HUD. Their
+        # detected viewport anchor remains authoritative for position; only
+        # the crop dimensions follow a verified dial/key-row pixel scale.
+        from core.hud_layout import detect_hud_layout
+        layout = detect_hud_layout(image)
+        if layout.source("health_text") == "anchor" or layout.source("consumables") == "anchor":
+            scale = layout.ui_scale
+            half_width = max(32, round(160 * scale))
+            top = anchor_y - max(3, round(8 * scale))
+            bottom = anchor_y + max(25, round(100 * scale))
         x1 = max(0, anchor_x - half_width)
         x2 = min(width, anchor_x + half_width)
         y1 = max(0, top)
@@ -371,6 +381,7 @@ class TargetDistanceReader:
         roi: Rect,
         target_track_id: str,
         captured_at: float,
+        pixel_health_label: tuple[float, float, float] | None = None,
     ) -> DistanceObservation | None:
         candidates = []
         normalized = [(token, self._normalize(token.text)) for token in tokens]
@@ -384,8 +395,32 @@ class TargetDistanceReader:
                 continue
             unit_seen = "km" in text or "公里" in text
             confidence = token.confidence if unit_seen else token.confidence * 0.88
-            accepted = confidence >= self.minimum_confidence and health_seen
-            if not health_seen:
+            token_health_seen = health_seen
+            if not token_health_seen and pixel_health_label is not None:
+                # Pixel evidence replaces only the missing HP slash. The
+                # distance still needs its own OCR box below that same label;
+                # an aiming distance or nearby second ship cannot borrow it.
+                box = np.asarray(token.box, np.float32)
+                if (box.shape == (4, 2) and np.all(np.isfinite(box))
+                        and np.min(box) >= 0
+                        and np.max(box[:, 0]) <= roi.width * self.scale
+                        and np.max(box[:, 1]) <= roi.height * self.scale
+                        and len(self.DISTANCE_PATTERN.findall(text)) == 1):
+                    cx, cy = box.mean(axis=0) / self.scale
+                    lo, hi = box.min(axis=0) / self.scale, box.max(axis=0) / self.scale
+                    label_x, label_y, label_height = pixel_health_label
+                    unit = label_height / 14
+                    token_health_seen = bool(
+                        abs(cx - label_x) <= max(4, 16 * unit)
+                        and label_y + label_height * .85 <= cy <= label_y + label_height * 3
+                        and lo[0] >= label_x - 60 * unit and hi[0] <= label_x + 60 * unit
+                        and lo[1] >= label_y + label_height * .7
+                        and hi[1] <= label_y + label_height * 3
+                        and max(1, 6 * unit) <= hi[0] - lo[0] <= 110 * unit
+                        and max(1, 4 * unit) <= hi[1] - lo[1] <= 24 * unit
+                    )
+            accepted = confidence >= self.minimum_confidence and token_health_seen
+            if not token_health_seen:
                 reject_reason = "target_health_anchor_missing"
             elif confidence < self.minimum_confidence:
                 reject_reason = "ocr_confidence_below_threshold"
@@ -408,10 +443,87 @@ class TargetDistanceReader:
         return max(candidates, key=lambda item: item.confidence)
 
     @staticmethod
+    def _enemy_pixel_health_label(crop, anchor):
+        """One red HP/digit strip paired with this exact enemy ship glyph.
+
+        Small text can lose its slash even when the rendered numeric HP label
+        remains clear. Reuse the viewport detector's glyph/digit pairing, but
+        require one unambiguous label and an exact match to the input anchor.
+        This supplies health context, never a distance or weapon capability.
+        """
+        if crop is None or crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        red = (((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 165))
+               & (hsv[:, :, 1] >= 145) & (hsv[:, :, 2] >= 145)).astype(np.uint8) * 255
+        selected = cv2.inRange(hsv, np.array([10, 45, 210]), np.array([22, 130, 255]))
+        contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        labels = []
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            unit = height / 14
+            if (not 3 <= height <= 40 or not 4 * unit <= width <= 190 * unit
+                    or cv2.contourArea(contour) / (width * height) < .45):
+                continue
+            flat = np.count_nonzero(red[y:y + height, x:x + width], axis=1) >= width * .75
+            if np.count_nonzero(flat) < max(1, round(unit)):
+                continue
+            # Import only after a real red rectangle is present. This static
+            # utility measures pixels without constructing a capture adapter.
+            from core.vision import Vision
+            points = Vision._viewport_hp_ship_markers(red, hsv, (x, y, width, height), unit)
+            if not points:
+                points = Vision._viewport_hp_ship_markers(selected, hsv, (x, y, width, height), unit)
+            for point in points:
+                if not any(abs(point[0] - old[0]) < 12 * unit
+                           and abs(point[1] - old[1]) < 12 * unit for old in labels):
+                    labels.append((point[0], point[1], y, height))
+        if len(labels) != 1:
+            return None
+        px, py, top, height = labels[0]
+        tolerance = max(2, 6 * height / 14)
+        if abs(px - anchor[0]) > tolerance or abs(py - anchor[1]) > tolerance:
+            return None
+        return float(px), float(top), float(height)
+
+    @staticmethod
     def _clahe(image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
         return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
+    def _friendly_health_label_overlaps(crop):
+        """A green numeric HP strip makes this enemy-label crop ambiguous.
+
+        Distance text itself is white for both teams. Picking the highest OCR
+        confidence in a mixed crop can attach a nearby ally's distance to the
+        tracked enemy, even over consecutive frames. Wait for separated labels.
+        Size comes from each strip, independent of viewport or own-ship UI.
+        """
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array([35, 90, 100]), np.array([105, 255, 255]))
+        contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            if (height < 3 or width < max(12, height * 3.8)
+                    or cv2.contourArea(contour) / (width * height) < .55):
+                continue
+            strip = hsv[y:y + height, x:x + width]
+            # At small UI sizes, downsampling mixes white glyph strokes with
+            # the green bar below them. Keep the bright numeric-stroke and
+            # solid-strip requirements, allowing that local colour mixture
+            # only for strips whose actual pixel height is under ten.
+            saturation_limit = 90 if height < 10 else 70
+            white = ((strip[:, :, 1] < saturation_limit)
+                     & (strip[:, :, 2] >= 175)).astype(np.uint8) * 255
+            glyphs, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            strokes = [cv2.boundingRect(glyph) for glyph in glyphs
+                       if max(2, height * .25) <= cv2.boundingRect(glyph)[3] <= height
+                       and 1 <= cv2.boundingRect(glyph)[2] <= height * 1.5]
+            if len(strokes) >= 3:
+                return True
+        return False
 
     def read(
         self,
@@ -426,6 +538,9 @@ class TargetDistanceReader:
         if roi.width <= 0 or roi.height <= 0:
             return None
         crop = image[roi.y : roi.y + roi.height, roi.x : roi.x + roi.width]
+        friendly_overlap = self._friendly_health_label_overlaps(crop)
+        pixel_health_label = (None if friendly_overlap else self._enemy_pixel_health_label(
+            crop, (anchor[0] - roi.x, anchor[1] - roi.y)))
         resized = cv2.resize(
             crop,
             None,
@@ -441,7 +556,11 @@ class TargetDistanceReader:
                 roi=roi,
                 target_track_id=target_track_id,
                 captured_at=captured_at,
+                pixel_health_label=pixel_health_label,
             )
+            if observation is not None and friendly_overlap:
+                observation = replace(observation, accepted=False,
+                                      reject_reason="friendly_label_overlap")
             if observation is not None and (
                 best is None or observation.confidence > best.confidence
             ):
@@ -450,7 +569,7 @@ class TargetDistanceReader:
                 break
             if (
                 best is not None
-                and best.reject_reason == "target_health_anchor_missing"
+                and best.reject_reason in {"target_health_anchor_missing", "friendly_label_overlap"}
                 and best.confidence >= 0.90
             ):
                 break

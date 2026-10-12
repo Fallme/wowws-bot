@@ -200,6 +200,7 @@ def test_return_to_port_escapes_leftover_battle_type_selector():
         patch("main.classify_runtime_screen", side_effect=[ScreenState.UNKNOWN, ScreenState.PORT]),
         patch("main.operation_paused", return_value=False),
         patch("main.in_battle_type_selector", return_value=True),
+        patch("main.escape_close_hint", return_value=(10, 10)),
         patch("main.time.sleep", return_value=None),
     ):
         assert return_to_port(bot, attempts=2)
@@ -238,6 +239,7 @@ def test_return_to_port_tries_escape_three_times_for_unrecognized_pages():
         ),
         patch("main.operation_paused", return_value=False),
         patch("main.in_battle_type_selector", return_value=False),
+        patch("main.escape_close_hint", return_value=(10, 10)),
         patch("main.time.sleep", return_value=None),
     ):
         assert return_to_port(bot, attempts=4)
@@ -276,6 +278,7 @@ def test_return_to_port_escapes_post_battle_loading_blocker():
         patch("main.handle_post_battle"),
         patch("main.operation_paused", return_value=False),
         patch("main.in_battle_type_selector", return_value=False),
+        patch("main.escape_close_hint", return_value=(10, 10)),
         patch("main.is_battle_survey_page", return_value=False),
         patch("main.time.sleep", return_value=None),
     ):

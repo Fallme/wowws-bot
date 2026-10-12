@@ -61,13 +61,13 @@ def test_ocr_rejection_of_loading_survives_every_entry_gate(monkeypatch, state):
     assert main.wait_for_battle(bot, timeout=1)
 
 
-@pytest.mark.parametrize("tokens", [[], [SimpleNamespace(text="\u5f00\u59cb\u6218\u6597")]])
-def test_real_or_unreadable_loading_button_still_blocks_commands(tokens):
+@pytest.mark.parametrize("tokens,expected", [([], ScreenState.BATTLE), ([SimpleNamespace(text="\u5f00\u59cb\u6218\u6597")], ScreenState.LOADING)])
+def test_only_positive_loading_button_text_overrides_hud(tokens, expected):
     vision = SimpleNamespace(classify_screen=lambda _: ScreenState.LOADING,
         _has_battle_hud=lambda _: True, _has_loading_start_action=lambda _: True)
     bot = SimpleNamespace(vision=vision, distance_reader=SimpleNamespace(
         backend=SimpleNamespace(recognize=lambda _: tokens)))
-    assert main.classify_battle_continuity_screen(bot, np.zeros((90, 160, 3), np.uint8)) == ScreenState.LOADING
+    assert main.classify_battle_continuity_screen(bot, np.zeros((90, 160, 3), np.uint8)) == expected
 
 
 def test_actual_low_contrast_match_can_be_recovered():

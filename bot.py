@@ -15,6 +15,7 @@ from core.input import create_input_controller
 from core.feedback import MovementFeedbackMonitor, SafetyFault
 from core.intervention import UserInterventionMonitor
 from core.survival import HealthLossTracker
+from core.blockage_diagnostics import BlockageTrace
 from core.ocr import (
     DistanceOcrService,
     DistanceTrackFilter,
@@ -22,6 +23,8 @@ from core.ocr import (
     ViewportTargetTracker,
 )
 from core.terrain import confirm_terrain, extend_template
+from core.torpedo_hud import confirm_torpedo_reload, detect_main_gun_selected, detect_torpedo_weapon, inspect_torpedo_hud
+from core.window import get_client_rect, physical_click
 from core.minimap_geometry import confirm_capture_zones
 from core.tracking import ArrowHeadingFilter, ConsecutivePointFilter, NavigationTargetLock
 from core.ui import ScreenState
@@ -54,12 +57,14 @@ class BattleAnalysis:
     reload_ready: bool = False
     health: float = 1.0
     health_recognized: bool = False
+    hud_layout: dict = field(default_factory=dict)
     ended: bool = False
     in_battle: bool = False
     navigation_blocked: bool = False
     enemy_source: str = "none"
     visible_target: bool = False
     target_offset_x: float | None = None
+    target_viewport_point: tuple[int, int] | None = None
     target_track_id: str | None = None
     target_distance_km: float | None = None
     minimap_distance_km: float | None = None
@@ -95,6 +100,7 @@ class BattleAnalysis:
     island_avoidance_rudder: float | None = None
     kinematic_rudder: float | None = None
     kinematic_avoidance_required: bool = False
+    kinematic_all_paths_blocked: bool = False
     kinematic_collision_time_seconds: float | None = None
     kinematic_clearance_km: float | None = None
     kinematic_target: str = ""
@@ -326,6 +332,7 @@ class BattleBot:
         self.island_route_planner = IslandRoutePlanner()
         self.engagement_route_planner = IslandRoutePlanner()
         self._route_minimap_shape = None
+        self._route_minimap_geometry = None
         self.viewport_target_filter = ConsecutivePointFilter(match_radius=90)
         self.viewport_target_tracker = ViewportTargetTracker(match_radius=140)
         self.distance_filter = DistanceTrackFilter(
@@ -341,16 +348,27 @@ class BattleBot:
         self.last_fire = 0.0
         self.last_lock = 0.0
         self.last_torpedo = 0.0
+        self._last_torpedo_attempt = 0.0
+        self._last_torpedo_release = 0.0
+        self._torpedo_restore_pending = False
+        self._torpedo_restore_attempt_at = float("-inf")
+        self._torpedo_trace = None
+        self._torpedo_observed_frame = None
+        self._reset_torpedo_acquisition()
         self.last_damage_control = 0.0
+        self._last_damage_control_attempt = float("-inf")
         self.last_heal = 0.0
         self.heal_used = 0
         self.tick = 0
         self.battle_start_time = 0.0
         self._cached_health = 1.0
         self._health_ocr_valid = False
+        self._health_observed_at = float("-inf")
         self._health_loss_tracker = HealthLossTracker()
+        self._health_reading_trace = None
         self._cached_speed_knots: float | None = None
         self._cached_speed_observed_at = 0.0
+        self._last_speed_ocr_attempt_at = float("-inf")
         self._cached_player_pose_normalized: tuple[float, float] | None = None
         self._cached_player_heading: tuple[float, float] | None = None
         self._cached_player_pose_at = 0.0
@@ -360,6 +378,8 @@ class BattleBot:
         self._last_fire_anchors = (False, False)
         self._last_fire_status_anchor = False
         self._flood_samples = deque(maxlen=5)
+        self._flood_status_samples = deque(maxlen=2)
+        self._last_flood_status_anchor = False
         self._autopilot_hud_samples = deque(maxlen=3)
         self._autopilot_hud_absent_since: float | None = None
         # A single white minimap glyph must never end the native route.  The
@@ -416,6 +436,11 @@ class BattleBot:
         self.native_autopilot_abandoned = False
         self._opening_autopilot_attempted = False
         self._tactical_map_attempted_this_battle = False
+        self._tactical_map_attempts_used = 0
+        self._opening_autopilot_budget_active = False
+        self._tactical_map_prefer_message_click = False
+        self._opening_autopilot_retry_pending = False
+        self._opening_autopilot_pending_target = None
         self._tactical_map_left_open = False
         self._round_control_initialized = False
         self.generic_center_route_active = False
@@ -483,11 +508,18 @@ class BattleBot:
 
     def reset(self, *, preserve_movement=False, preserve_static_map=False):
         now = time.monotonic()
+        self._reset_torpedo_acquisition(preserve_budget=preserve_static_map)
         self._close_round_diagnostics()
         self.smoke_used = False
         self.last_fire = now
         self.last_lock = now
         self.last_torpedo = now
+        self._last_torpedo_attempt = 0.0
+        self._last_torpedo_release = 0.0
+        self._torpedo_restore_pending = False
+        self._torpedo_restore_attempt_at = float("-inf")
+        self._torpedo_trace = None
+        self._torpedo_observed_frame = None
         damage_control_cooldown = float(
             self.strategy.get("damage_control_cooldown_seconds", 80.0)
         )
@@ -498,6 +530,7 @@ class BattleBot:
             )
         )
         self.last_damage_control = now - damage_control_cooldown
+        self._last_damage_control_attempt = float("-inf")
         self.last_heal = now - other_consumable_cooldown
         self.heal_used = 0
         self.tick = 0
@@ -510,9 +543,12 @@ class BattleBot:
         self._native_contact_last = None
         self._cached_health = 1.0
         self._health_ocr_valid = False
+        self._health_observed_at = float("-inf")
         self._health_loss_tracker.reset()
+        self._health_reading_trace = None
         self._cached_speed_knots = None
         self._cached_speed_observed_at = 0.0
+        self._last_speed_ocr_attempt_at = float("-inf")
         self._cached_player_pose_normalized = None
         self._cached_player_heading = None
         self._cached_player_pose_at = 0.0
@@ -521,6 +557,8 @@ class BattleBot:
         self._fire_samples.clear()
         self._last_fire_status_anchor = False
         self._flood_samples.clear()
+        self._flood_status_samples.clear()
+        self._last_flood_status_anchor = False
         self._autopilot_hud_samples.clear()
         self._autopilot_hud_absent_since = None
         self._autopilot_arrival_samples.clear()
@@ -560,6 +598,11 @@ class BattleBot:
             # ``preserve_static_map=True`` and therefore retains this guard for
             # the same battle.
             self._tactical_map_attempted_this_battle = False
+            self._tactical_map_attempts_used = 0
+            self._opening_autopilot_budget_active = False
+            self._tactical_map_prefer_message_click = False
+            self._opening_autopilot_retry_pending = False
+            self._opening_autopilot_pending_target = None
         elif self._battle_capture_zone_layout:
             # Pixel coordinates belong to the previous framebuffer crop.
             # Re-materialize them from the frozen normalized layout so a
@@ -611,6 +654,7 @@ class BattleBot:
         self.island_route_planner.reset()
         self.engagement_route_planner.reset()
         self._route_minimap_shape = None
+        self._route_minimap_geometry = None
         self.viewport_target_filter.reset()
         self.viewport_target_tracker.reset()
         self.distance_filter.reset()
@@ -737,6 +781,36 @@ class BattleBot:
         self._static_map_source = ""
         self._island_layer_candidates.clear()
         self._zone_layer_candidates.clear()
+
+    def _synchronize_minimap_geometry(self, shape):
+        """Invalidate pixel/normalized evidence when the map viewport changes."""
+        bounds = getattr(self.vision, "minimap_bounds", None)
+        geometry = (tuple(shape[:2]), tuple(bounds) if bounds is not None else None,
+                    getattr(self.vision, "minimap_bounds_source", None))
+        previous = self._route_minimap_geometry
+        self._route_minimap_geometry = geometry
+        self._route_minimap_shape = tuple(shape[:2])
+        if previous is None or previous == geometry:
+            return
+        logger.info("小地图 UI 边界变化: %s -> %s；重新确认地图与玩家位置", previous, geometry)
+        self.begin_tactical_map_static_capture()
+        self.route_planner.reset()
+        self.island_route_planner.reset()
+        self.engagement_route_planner.reset()
+        self.minimap_target_filter.reset()
+        self.navigation_target_lock.reset()
+        self.arrow_heading_filter.reset()
+        self.map_motion = MapMotion()
+        self.yaw_motion = YawMotion()
+        self._cached_player_pose_normalized = None
+        self._cached_player_heading = None
+        self._cached_player_pose_at = 0.0
+        self._capture_zone = None
+        self._island_samples.clear()
+        self._island_avoidance_until = 0.0
+        self._island_avoidance_rudder = 0.0
+        self._native_spawn_position = None
+        self.native_route_watchdog = NativeRouteWatchdog()
 
     def capture_tactical_map_static_layer(self, image, *, begin=False) -> bool:
         """Sample immutable terrain and point geometry from the open M map.
@@ -1248,8 +1322,15 @@ class BattleBot:
         # throttle/rudder telegraph is left untouched.
         analysis.ended = self._ended_state_streak >= 2
         analysis.in_battle = state == ScreenState.BATTLE
+        layout_reader = getattr(self.vision, "hud_layout", None)
+        if analysis.in_battle and callable(layout_reader):
+            try:
+                analysis.hud_layout = layout_reader(image).diagnostics()
+            except Exception:
+                logger.debug("HUD 布局诊断暂不可用", exc_info=True)
 
         if not analysis.in_battle:
+            self._health_loss_tracker.reset()
             self._island_samples.clear()
             self.viewport_target_tracker.reset()
             self.distance_filter.reset()
@@ -1293,21 +1374,7 @@ class BattleBot:
             minimap_zones = []
             island_sample = None
             if minimap is not None:
-                shape = minimap.shape[:2]
-                if self._route_minimap_shape is not None and shape != self._route_minimap_shape:
-                    old_h, old_w = self._route_minimap_shape
-                    zone = self.route_planner.zone
-                    if zone is not None:
-                        self.route_planner.zone = replace(
-                            zone, center=(round(zone.center[0] * shape[1] / old_w),
-                                          round(zone.center[1] * shape[0] / old_h)),
-                            radius=zone.radius * min(shape) / min(old_h, old_w),
-                        )
-                    self.route_planner.replan()
-                    self._battle_capture_zones = []
-                    self.minimap_target_filter.reset()
-                    self._island_samples.clear()
-                self._route_minimap_shape = shape
+                self._synchronize_minimap_geometry(minimap.shape)
                 minimap_enemies, torpedoes_seen = (
                     self.vision.analyze_minimap(minimap)
                 )
@@ -1759,6 +1826,7 @@ class BattleBot:
                         ) if pixel_target is not None else None
                         if kinematic_plan is not None:
                             analysis.kinematic_rudder = kinematic_plan.rudder
+                            analysis.kinematic_all_paths_blocked = getattr(kinematic_plan, "all_paths_blocked", False)
                             analysis.kinematic_avoidance_required = (
                                 kinematic_plan.avoidance_required
                             )
@@ -1876,6 +1944,7 @@ class BattleBot:
                     min((nearest[0] - center_x) / max(center_x, 1), 1.0),
                 )
                 if target_track is not None:
+                    analysis.target_viewport_point = target_track.point
                     analysis.target_track_id = target_track.track_id
                     if stable_distance is not None:
                         analysis.target_distance_km = stable_distance.value_km
@@ -1896,7 +1965,7 @@ class BattleBot:
 
         health = None
         health_reader = getattr(self.vision, "read_health_fraction", None)
-        if health_reader is not None and self.tick % 3 == 0:
+        if analysis.in_battle and health_reader is not None and self.tick % 3 == 0:
             try:
                 health = health_reader(
                     image,
@@ -1907,12 +1976,19 @@ class BattleBot:
         # Health is calculated exclusively from the numeric ``current/max``
         # readout.  Never estimate it from the padded colour bar: on this HUD a
         # visually full bar occupies only about 88.8% of the old crop.
-        if self.tick % 3 == 0:
+        if health is not None and (
+            not math.isfinite(float(health)) or not 0.0 <= float(health) <= 1.0
+        ):
+            health = None
+        if analysis.in_battle and self.tick % 3 == 0:
             self._health_loss_tracker.observe(health, observed_at)
         if health is not None:
             health = max(0.0, min(float(health), 1.0))
+            if self._health_ocr_valid and abs(health - self._cached_health) >= .08:
+                self._record_health_transition(image, health, observed_at, analysis.hud_layout)
             self._cached_health = health
             self._health_ocr_valid = True
+            self._health_observed_at = observed_at
         # Decompose the fire HUD into its two anchors for diagnostics only
         # when the vision adapter uses the stock detector wholesale;
         # subclasses that override either hook (tests, custom adapters) must
@@ -1946,17 +2022,30 @@ class BattleBot:
             and all(self._fire_samples)
         )
         flooding_detector = getattr(self.vision, "is_flooding", None)
+        flood_status_detector = getattr(self.vision, "flooding_status_icon_visible", None)
+        self._last_flood_status_anchor = bool(
+            getattr(type(self.vision), "is_flooding", None) is Vision.is_flooding
+            and callable(flood_status_detector)
+            and flood_status_detector(image)
+        )
+        self._flood_status_samples.append(self._last_flood_status_anchor)
         self._flood_samples.append(
             bool(flooding_detector is not None and flooding_detector(image))
         )
-        # Blue HUD decorations caused repeated false flooding at 100% HP.
-        # Require four positive frames in a five-frame window plus confirmed
-        # numeric HP loss before spending damage control.
+        # A verified damage timer plus its independent ship-status icon can
+        # act after two frames, including before the first HP tick. The older
+        # blue-shape detector still requires four of five frames and HP loss.
         analysis.flooding = bool(
-            len(self._flood_samples) == self._flood_samples.maxlen
-            and sum(self._flood_samples) >= 4
-            and self._health_ocr_valid
-            and 0.0 < self._cached_health < 0.995
+            (
+                len(self._flood_status_samples) == self._flood_status_samples.maxlen
+                and all(self._flood_status_samples)
+            )
+            or (
+                len(self._flood_samples) == self._flood_samples.maxlen
+                and sum(self._flood_samples) >= 4
+                and self._health_ocr_valid
+                and 0.0 < self._cached_health < 0.995
+            )
         )
         if self._health_ocr_valid and self._cached_health <= 0.0:
             # Sunk ships can retain orange wreck/HP decoration in the status
@@ -1969,9 +2058,17 @@ class BattleBot:
                 self.vision.find_reload_bar(image)
             )
         analysis.health = self._cached_health
-        analysis.health_recognized = self._health_ocr_valid
+        analysis.health_recognized = self._health_ocr_valid and (
+            self._cached_health <= 0.0
+            or observed_at - self._health_observed_at <= 8.0
+        )
         speed_reader = getattr(self.vision, "read_speed_knots", None)
-        if speed_reader is not None and self.tick % 3 == 0:
+        # Expensive frames can take several seconds. A tick-count cadence
+        # let the four-second cache expire before its next scheduled read.
+        # Refresh on elapsed capture time, keeping the freshness bound intact.
+        if (analysis.in_battle and speed_reader is not None
+                and observed_at - self._last_speed_ocr_attempt_at >= 2.0):
+            self._last_speed_ocr_attempt_at = observed_at
             try:
                 speed_knots = speed_reader(
                     image,
@@ -2015,6 +2112,33 @@ class BattleBot:
             )
 
         return analysis
+
+    def _record_health_transition(self, image, health, observed_at, layout):
+        """Retain both frames of a large numeric change for OCR diagnosis."""
+        root = getattr(self, "blockage_diagnostic_root", None)
+        if root is None:
+            return
+        try:
+            trace = getattr(self, "_health_reading_trace", None)
+            if trace is None:
+                trace = self._health_reading_trace = BlockageTrace(
+                    root, "health_reading", maximum=60, context_frames=0,
+                    lossless=True,
+                )
+            details = {
+                "previous_health": self._cached_health, "health": health,
+                "previous_read_age_seconds": round(observed_at - self._health_observed_at, 3),
+                "source": "numeric_hp_change", "hud_layout": layout,
+            }
+            previous = self.last_analysis
+            if previous is not None and previous.in_battle:
+                trace.record(previous.image, state=ScreenState.BATTLE,
+                             action="health_change", attempt=self.tick + 1,
+                             phase="before", details={**details, "hud_layout": previous.hud_layout})
+            trace.record(image, state=ScreenState.BATTLE, action="health_change",
+                         attempt=self.tick + 1, phase="after", details=details)
+        except Exception:
+            logger.debug("血量变化诊断暂不可用，继续战斗", exc_info=True)
 
     def _stable_island_risk(self):
         """Accept three matching terrain observations from the latest five."""
@@ -2242,7 +2366,15 @@ class BattleBot:
 
     def mark_manual_pause(self):
         """Expose an already-observed keyboard/Web pause without input."""
+        if hasattr(self, "_torpedo_acquisition_samples"):
+            self._finish_torpedo_acquisition(None, "intervention", time.monotonic())
+            self._torpedo_acquisition_samples.clear()
+            self._torpedo_acquisition_last_sample = None
         self._health_loss_tracker.reset()
+        self._health_observed_at = float("-inf")
+        self._fire_samples.clear()
+        self._flood_samples.clear()
+        self._flood_status_samples.clear()
         self.stuck_recovery.cancel()
         self.native_route_watchdog.reset()
         self._pursuit_contact_samples.clear()
@@ -2357,6 +2489,24 @@ class BattleBot:
         # evaluated before the native-autopilot branch returns; otherwise R/T
         # could remain unused for the whole opening route.
         if not self._execute_survival_consumables(analysis, now):
+            return
+
+        # A torpedo attack is independent from rudder ownership: it may be
+        # performed while the game's native autopilot is steering. The action
+        # itself remains gated by live OCR distance, green launcher arc and a
+        # stable white prediction cone; a missing cue sends no fire click.
+        # Camera acquisition owns neither the helm nor the weapons. A single
+        # scan step invalidates this tick's old viewport/navigation sample.
+        if self._acquire_torpedo_target(analysis, now):
+            return
+        torpedo_started = time.monotonic()
+        self._try_torpedo_attack(analysis, now)
+        if getattr(self.intervention, "command_generation_paused", lambda: False)():
+            return
+        if time.monotonic() - torpedo_started > .5:
+            # Aiming changes the camera and may take several fresh frames.
+            # Keep the current helm until the next tick rebuilds navigation;
+            # never issue a new turn using the pre-aim viewport and map sample.
             return
 
         if self.opening_autopilot_active:
@@ -2502,6 +2652,7 @@ class BattleBot:
                 island_distance=analysis.island_distance,
                 island_avoidance_rudder=analysis.island_avoidance_rudder,
                 kinematic_rudder=analysis.kinematic_rudder,
+                kinematic_all_paths_blocked=analysis.kinematic_all_paths_blocked,
                 kinematic_avoidance_required=(
                     analysis.kinematic_avoidance_required
                 ),
@@ -2613,16 +2764,10 @@ class BattleBot:
         if analysis.visible_target and self.movement_verified:
             self._engage_visible_enemy(analysis, now)
 
-        torpedo_reload = self.ship.get("torpedo", {}).get("reload", 90)
-        if (
-            self.ship.get("has_torpedoes")
-            and analysis.visible_target
-            and command.mode in {MovementMode.BRAWL, MovementMode.CAPTURE}
-            and now - self.last_torpedo > torpedo_reload
-        ):
-            self.gamepad.torpedo()
-            self.last_torpedo = now
-            logger.info("[%03d] 鱼雷指令已派发", self.tick)
+        # Selecting slot 3 does not launch torpedoes. Blind selection also
+        # redirects subsequent main-gun clicks into the torpedo launcher.
+        # Resume automatic selection only when launcher readiness, target
+        # motion, firing arc and post-launch HUD feedback are available.
 
     def _execute_survival_consumables(
         self, analysis: BattleAnalysis, now: float
@@ -2631,28 +2776,48 @@ class BattleBot:
         damage_control_cooldown = float(
             self.strategy.get("damage_control_cooldown_seconds", 80.0)
         )
-        sustained_damage = self._health_loss_tracker.sustained_loss(now)
+        burst_damage = self._health_loss_tracker.burst_loss(
+            now,
+            minimum_loss=float(self.strategy.get("damage_control_burst_threshold", 0.08)),
+            window_seconds=float(self.strategy.get("damage_control_burst_window_seconds", 8.0)),
+        )
+        sustained_damage = self._health_loss_tracker.sustained_loss(
+            now,
+            minimum_loss=float(self.strategy.get("damage_control_sustained_threshold", 0.02)),
+            window_seconds=float(self.strategy.get("damage_control_sustained_window_seconds", 24.0)),
+        )
         if (
-            (analysis.on_fire or analysis.flooding or sustained_damage)
+            (analysis.on_fire or analysis.flooding or burst_damage or sustained_damage)
             and not (analysis.health_recognized and analysis.health <= 0)
             and now - self.last_damage_control >= damage_control_cooldown
+            and now - self._last_damage_control_attempt >= 2.0
             and hasattr(self.gamepad, "damage_control")
         ):
             if self.intervention.poll(self.gamepad, time.monotonic()):
                 self.mark_manual_pause()
                 return False
-            self.gamepad.damage_control()
-            self.last_damage_control = now
+            self._last_damage_control_attempt = now
+            try:
+                dispatched = self.gamepad.damage_control()
+            except (RuntimeError, OSError):
+                logger.warning("R 损管输入未完成，保留受损证据，稍后重新尝试", exc_info=True)
+                return False
+            if dispatched is False:
+                logger.warning("R 损管输入未发送，保留受损证据，稍后重新尝试")
+                return False
+            self.last_damage_control = max(now, time.monotonic())
             self._health_loss_tracker.reset()
             logger.info(
-                "检测到%s，使用 R 损害管制",
+                "检测到%s，尝试 R 损害管制",
                 "着火/漏水"
                 if analysis.on_fire and analysis.flooding
                 else "着火"
                 if analysis.on_fire
                 else "漏水"
                 if analysis.flooding
-                else "连续4次新鲜血量读数出现3次下降（疑似持续伤害）",
+                else "短时间大幅掉血（新鲜血量复核通过）"
+                if burst_damage
+                else "持续掉血（新鲜血量累计下降达到阈值）",
             )
 
         other_cooldown = float(
@@ -2722,6 +2887,622 @@ class BattleBot:
         # is not a secondary designation command; never dispatch it here.
         return
 
+    def _reset_torpedo_acquisition(self, *, preserve_budget=False):
+        self._torpedo_acquisition_samples = deque(maxlen=3)
+        self._torpedo_acquisition_last_sample = None
+        if not preserve_budget:
+            self._torpedo_acquisition_moves = 0
+            self._torpedo_acquisition_step = 0
+            self._torpedo_acquisition_started_at = None
+            self._torpedo_acquisition_retry_at = float("-inf")
+            self._torpedo_acquisition_attempt = 0
+            self._torpedo_acquisition_trace = None
+
+    def _record_target_acquisition_frame(self, frame, phase, **details):
+        try:
+            if getattr(self, "_torpedo_acquisition_trace", None) is None:
+                self._torpedo_acquisition_trace = BlockageTrace(
+                    "E:/aimemo/docs/screenshots/wows_torpedoes", "target_acquisition",
+                    maximum=60, interval=5.0, lossless=True,
+                )
+            self._torpedo_acquisition_trace.record(
+                frame, state="battle", action="target_acquisition",
+                attempt=details.pop("attempt", getattr(self, "_torpedo_acquisition_moves", 0)),
+                phase=phase, details=details,
+            )
+        except Exception:
+            logger.debug("鱼雷搜索视角诊断截图暂不可写", exc_info=True)
+
+    def _finish_torpedo_acquisition(self, frame, reason, now):
+        if getattr(self, "_torpedo_acquisition_started_at", None) is None:
+            return
+        self._record_target_acquisition_frame(frame, "result", cancel_reason=reason,
+            scan_step=self._torpedo_acquisition_step,
+            round_moves=self._torpedo_acquisition_moves)
+        self.events.publish("torpedo.target_acquisition", phase="result", reason=reason,
+                            round_moves=self._torpedo_acquisition_moves)
+        self._torpedo_acquisition_started_at = None
+        self._torpedo_acquisition_step = 0
+        self._torpedo_acquisition_retry_at = max(now, time.monotonic()) + 10.0
+        self._torpedo_acquisition_samples.clear()
+
+    def _fresh_torpedo_acquisition_contact(self, frame, analysis, minimum, maximum):
+        """Match the same close red contact without any cached player pose."""
+        minimap = self.vision.find_minimap(frame)
+        if minimap is None:
+            return None
+        pose = self.vision.find_player_pose_on_minimap(minimap)
+        if pose is None:
+            return None
+        height, width = minimap.shape[:2]
+        player = (pose.position[0] / width, pose.position[1] / height)
+        if (not all(math.isfinite(value) and 0 <= value <= 1 for value in player)
+                or math.dist(player, analysis.minimap_player_normalized) > .035
+                or not all(math.isfinite(value) for value in pose.heading)
+                or not .5 <= math.hypot(*pose.heading) <= 1.5):
+            return None
+        enemies, _ = self.vision.analyze_minimap(minimap)
+        if not 0 < len(enemies) <= 16:
+            return None
+        zones = list(getattr(self, "_battle_capture_zone_layout", ()))
+        zones.extend(analysis.capture_zones)
+        contacts = [(point[0] / width, point[1] / height) for point in enemies]
+        contacts = [point for point in contacts if all(
+            math.isfinite(value) and 0 <= value <= 1 for value in point) and not any(
+                math.dist(point, zone["position"]) <= .024
+                for zone in zones if zone.get("position") is not None)]
+        nearby = [point for point in contacts
+                  if math.dist(point, analysis.nearest_enemy_normalized) <= .035]
+        if len(nearby) != 1:
+            return None
+        distance = self._minimap_pixels_to_km(minimap,
+            math.dist(pose.position, (nearby[0][0] * width, nearby[0][1] * height)))
+        return nearby[0] if math.isfinite(distance) and minimum <= distance <= maximum else None
+
+    def _acquire_torpedo_target(self, analysis: BattleAnalysis, now: float):
+        """Take at most one guarded camera step; minimap range never permits fire.
+
+        There is no calibrated camera yaw sensor. This is a deliberately limited
+        horizontal search, not a conversion from the ship's heading to camera
+        angle. Any real viewport marker immediately hands control back to the
+        normal target/OCR/green-arc/white-lead firing gates.
+        """
+        if not hasattr(self, "_torpedo_acquisition_samples"):
+            self._reset_torpedo_acquisition()
+        if (analysis.visible_target or analysis.target_viewport_point is not None
+                or (analysis.enemy_source == "viewport" and analysis.enemies)):
+            self._finish_torpedo_acquisition(analysis.image, "viewport_target_visible", now)
+            self._torpedo_acquisition_samples.clear()
+            return False
+        maximum = min(6.0, max(.3, float(self.strategy.get("torpedo_close_distance_km", 6.0))))
+        if self.ship.get("has_torpedoes") and self.ship.get("torpedo", {}).get("range"):
+            maximum = min(maximum, float(self.ship["torpedo"]["range"]))
+        minimum = max(.15, float(self.strategy.get("torpedo_min_distance_km", .25)))
+        contact, player = analysis.nearest_enemy_normalized, analysis.minimap_player_normalized
+        distance = analysis.minimap_distance_km
+        eligible = bool(self.strategy.get("auto_torpedo", True)
+            and self.strategy.get("torpedo_camera_acquisition", True)
+            and analysis.in_battle and not analysis.ended
+            and not getattr(self, "_torpedo_restore_pending", False)
+            and not analysis.player_pose_cached and player is not None and contact is not None
+            and distance is not None and math.isfinite(distance) and minimum <= distance <= maximum
+            and analysis.health_recognized and analysis.health is not None
+            and math.isfinite(analysis.health) and 0 < analysis.health <= 1
+            and all(math.isfinite(value) and 0 <= value <= 1 for value in (*player, *contact))
+            and any(item.get("kind") == "enemy" and item.get("position") is not None
+                    and math.dist(item["position"], contact) <= .01
+                    for item in analysis.minimap_contacts)
+            and callable(getattr(self.gamepad, "aim_relative", None)))
+        if not eligible:
+            self._finish_torpedo_acquisition(analysis.image, "close_contact_unconfirmed", now)
+            self._torpedo_acquisition_samples.clear()
+            self._torpedo_acquisition_last_sample = None
+            return False
+        previous = self._torpedo_acquisition_last_sample
+        if (previous is None or not 0 < now - previous[0] <= 8.0
+                or math.dist(previous[1], contact) > .025
+                or math.dist(previous[2], player) > .025):
+            self._torpedo_acquisition_samples.clear()
+        self._torpedo_acquisition_last_sample = (now, contact, player)
+        self._torpedo_acquisition_samples.append(True)
+        if (len(self._torpedo_acquisition_samples) < 3 or self._torpedo_acquisition_moves >= 24
+                or now < self._torpedo_acquisition_retry_at):
+            return False
+        started = self._torpedo_acquisition_started_at
+        if started is not None and (self._torpedo_acquisition_step >= 8 or now - started >= 30.0):
+            self._finish_torpedo_acquisition(analysis.image, "scan_budget_exhausted", now)
+            return False
+        if self._torpedo_paused():
+            self._finish_torpedo_acquisition(None, "intervention", now)
+            self._torpedo_acquisition_samples.clear()
+            return False
+        if started is None:
+            self._torpedo_acquisition_started_at = now
+            self._torpedo_acquisition_attempt += 1
+        size = (analysis.width, analysis.height)
+        # Include recognition and evidence writing in the input deadline.
+        deadline = time.monotonic() + 4.0
+        frame = None
+        try:
+            frame = self._torpedo_frame(size)
+            if frame is None:
+                self._finish_torpedo_acquisition(getattr(self, "_torpedo_observed_frame", None),
+                    getattr(self, "_torpedo_frame_reject_reason", None) or "capture_failed", now)
+                return False
+            if self.vision.find_enemies_in_viewport(frame):
+                self._finish_torpedo_acquisition(frame, "viewport_target_visible", now)
+                # This tick's earlier empty viewport is obsolete, even though
+                # no movement was needed. Let the next analysis adopt its track.
+                return True
+            if self._fresh_torpedo_acquisition_contact(frame, analysis, minimum, maximum) is None:
+                self._finish_torpedo_acquisition(frame, "fresh_contact_unconfirmed", now)
+                return False
+            if detect_torpedo_weapon(frame, getattr(self.distance_reader, "backend", None)) is not True:
+                self._finish_torpedo_acquisition(frame, "capability_not_confirmed", now)
+                return False
+            dx = min(240, max(40, round(analysis.width * .10)))
+            # Search one side, return through it and cover the opposite side.
+            # Do not mistake the minimap ship bearing for the current camera yaw.
+            if self._torpedo_acquisition_moves >= 8:
+                dx = -dx
+            self._record_target_acquisition_frame(frame, "before", dx=dx,
+                minimap_distance_km=distance, contact=contact,
+                attempt=self._torpedo_acquisition_moves + 1)
+            if not self._torpedo_input_allowed(size, deadline):
+                self._finish_torpedo_acquisition(frame, "input_guard_rejected", now)
+                return False
+            # Count dispatch attempts too: an uncertain adapter ACK must never
+            # buy another camera movement after pause/resume.
+            self._torpedo_acquisition_moves += 1
+            self._torpedo_acquisition_step += 1
+            moved = self.gamepad.aim_relative(dx, 0)
+            self.events.publish("torpedo.target_acquisition", phase="step", dx=dx,
+                round_moves=self._torpedo_acquisition_moves, input_accepted=moved is not False)
+            logger.info("鱼雷搜索视角：相对移动 %s，单次第 %s/8 步，本局 %s/24 步",
+                        dx, self._torpedo_acquisition_step, self._torpedo_acquisition_moves)
+            if moved is False:
+                self._finish_torpedo_acquisition(frame, "camera_input_rejected", time.monotonic())
+                return True
+            after = self._torpedo_frame(size)
+            if after is None:
+                self._finish_torpedo_acquisition(getattr(self, "_torpedo_observed_frame", None),
+                    getattr(self, "_torpedo_frame_reject_reason", None) or "capture_failed", time.monotonic())
+            else:
+                self._record_target_acquisition_frame(after, "after", dx=dx,
+                    round_moves=self._torpedo_acquisition_moves)
+                if self.vision.find_enemies_in_viewport(after):
+                    self._finish_torpedo_acquisition(after, "viewport_target_visible", time.monotonic())
+                elif self._torpedo_acquisition_moves >= 24 or self._torpedo_acquisition_step >= 8:
+                    self._finish_torpedo_acquisition(after, "scan_budget_exhausted", time.monotonic())
+            return True
+        except Exception:
+            self._finish_torpedo_acquisition(frame, "recognition_failed", time.monotonic())
+            logger.debug("鱼雷搜索视角识别失败，保留现有航线", exc_info=True)
+            # Capture/recognition failure after a possible input also invalidates
+            # this tick; sending no further controls is the conservative choice.
+            return True
+
+    def _torpedo_paused(self):
+        if self.intervention.poll(self.gamepad, time.monotonic()):
+            self.mark_manual_pause()
+            return True
+        return self.intervention.command_generation_paused()
+
+    def _torpedo_frame(self, size=None):
+        """Capture anew and reject menus, sunk ships and resized clients."""
+        self._torpedo_frame_reject_reason = "intervention"
+        if self._torpedo_paused():
+            return None
+        self._torpedo_frame_reject_reason = "capture_failed"
+        frame = self.vision.grab(self.hwnd, allow_stale=True)
+        self._torpedo_frame_captured_at = time.monotonic()
+        self._torpedo_observed_frame = frame
+        height, width = frame.shape[:2]
+        if size is not None and (width, height) != size:
+            self._torpedo_frame_reject_reason = "capture_size_changed"
+            return None
+        classifier = getattr(self, "runtime_screen_classifier", self.vision.classify_screen)
+        if classifier(frame) != ScreenState.BATTLE:
+            self._torpedo_frame_reject_reason = "battle_frame_unconfirmed"
+            return None
+        rect = get_client_rect(self.hwnd)
+        if (rect["width"], rect["height"]) != (width, height):
+            self._torpedo_frame_reject_reason = "client_size_changed"
+            return None
+        reader = getattr(self.vision, "read_health_fraction", None)
+        if reader is None:
+            self._torpedo_frame_reject_reason = "health_reader_missing"
+            return None
+        health = reader(frame, getattr(self.distance_reader, "backend", None))
+        if health is None or not math.isfinite(health) or not 0 < health <= 1:
+            self._torpedo_frame_reject_reason = "alive_health_unconfirmed"
+            return None
+        if self._torpedo_paused():
+            self._torpedo_frame_reject_reason = "intervention"
+            return None
+        self._torpedo_frame_reject_reason = None
+        return frame
+
+    def _torpedo_target(self, frame, previous, analysis, minimum, maximum):
+        """Associate fresh viewport and distance evidence with this close target."""
+        self._torpedo_target_reject_reason = "viewport_target_missing_or_ambiguous"
+        points = self.vision.find_enemies_in_viewport(frame)
+        if not points or len(points) > 8:
+            return None
+        nearby = sorted(points, key=lambda point: math.dist(point, previous))
+        point = nearby[0]
+        if (abs(point[0] - previous[0]) > analysis.width * .14
+                or abs(point[1] - previous[1]) > analysis.height * .09):
+            self._torpedo_target_reject_reason = "viewport_target_moved"
+            return None
+        # A camera pan must not silently adopt an overlapping enemy label.
+        if len(nearby) > 1 and (
+            math.dist(nearby[1], previous) - math.dist(point, previous)
+            < max(12, analysis.width * .025)
+        ):
+            self._torpedo_target_reject_reason = "viewport_target_ambiguous"
+            return None
+        observation = self.distance_reader.read(frame, point, analysis.target_track_id)
+        if observation is None or not observation.accepted:
+            self._torpedo_target_reject_reason = (getattr(observation, "reject_reason", None)
+                                                  or "target_distance_unconfirmed")
+            return None
+        if getattr(observation, "target_track_id", analysis.target_track_id) != analysis.target_track_id:
+            self._torpedo_target_reject_reason = "target_track_changed"
+            return None
+        distance = observation.value_km
+        if not math.isfinite(distance) or not minimum <= distance <= maximum:
+            self._torpedo_target_reject_reason = "target_outside_torpedo_range"
+            return None
+        if (not math.isfinite(observation.confidence)
+                or observation.confidence < float(self.strategy.get("distance_ocr_min_confidence", .78))):
+            self._torpedo_target_reject_reason = "target_distance_low_confidence"
+            return None
+        previous_distance = getattr(self, "_torpedo_fresh_distance", None)
+        if previous_distance is not None and abs(distance - previous_distance) > .6:
+            self._torpedo_target_reject_reason = "target_distance_changed"
+            return None
+        self._torpedo_fresh_distance = distance
+        self._torpedo_target_reject_reason = None
+        return point, distance
+
+    def _torpedo_frame_fresh(self):
+        now = time.monotonic()
+        maximum_age = min(6.0, max(1.0, float(
+            self.strategy.get("torpedo_input_max_frame_age_seconds", 4.0))))
+        return now - getattr(self, "_torpedo_frame_captured_at", now) <= maximum_age
+
+    def _torpedo_input_allowed(self, size, deadline):
+        if time.monotonic() > deadline or not self._torpedo_frame_fresh() or self._torpedo_paused():
+            return False
+        rect = get_client_rect(self.hwnd)
+        return (rect["width"], rect["height"]) == size
+
+    def _record_torpedo_frame(self, frame, phase, **details):
+        """Bound evidence per battle while preserving the latest attempt pair."""
+        try:
+            if self._torpedo_trace is None:
+                self._torpedo_trace = BlockageTrace(
+                    "E:/aimemo/docs/screenshots/wows_torpedoes", "torpedo",
+                    maximum=60, interval=.15, lossless=True,
+                )
+            self._torpedo_trace.record(
+                frame, state="battle", action="torpedo_aim",
+                attempt=round(self._last_torpedo_attempt * 1000), phase=phase,
+                details=details,
+            )
+        except Exception:
+            logger.debug("鱼雷诊断截图暂不可写", exc_info=True)
+
+    def _record_torpedo_preparation_skip(self, frame, analysis, reason, **details):
+        """Make a real close candidate's pre-switch rejection reviewable."""
+        metadata = {"preparing": True, "cancel_reason": reason,
+                    "target": analysis.target_viewport_point,
+                    "target_track_id": analysis.target_track_id,
+                    "distance_km": analysis.target_distance_km, **details}
+        self._record_torpedo_frame(frame, "result", **metadata)
+        self.events.publish("torpedo.preparation_skipped", reason=reason,
+                            target_track_id=analysis.target_track_id,
+                            target_distance_km=analysis.target_distance_km)
+        logger.info("鱼雷预备检查跳过：%s（候选距离 %.1fkm）", reason, analysis.target_distance_km)
+
+    def _restore_torpedo_guns(self):
+        if not getattr(self, "_torpedo_restore_pending", False):
+            return True
+        if time.monotonic() - getattr(self, "_torpedo_restore_attempt_at", float("-inf")) < 1.0:
+            return False
+        # Do not restore during user takeover or send a weapon key to results.
+        try:
+            frame = self._torpedo_frame()
+            if frame is None or self._torpedo_paused():
+                return False
+            self._torpedo_restore_attempt_at = time.monotonic()
+            if self.gamepad.main_gun() is False:
+                return False
+            time.sleep(.15)
+            after = self._torpedo_frame((frame.shape[1], frame.shape[0]))
+            if after is None:
+                return False
+            selected = detect_main_gun_selected(after, getattr(self.distance_reader, "backend", None))
+            self._record_torpedo_frame(after, "after", restoring_guns=True,
+                                       main_gun_selected=selected)
+            if selected is True:
+                self._torpedo_restore_pending = False
+                return True
+        except Exception:
+            logger.debug("恢复主炮尚未确认，下次新鲜战斗画面再试", exc_info=True)
+        return False
+
+    def _try_torpedo_attack(self, analysis: BattleAnalysis, now: float):
+        if getattr(self, "_torpedo_restore_pending", False):
+            self._restore_torpedo_guns()
+            return
+        if not self.strategy.get("auto_torpedo", True):
+            return
+        torpedo_config = self.ship.get("torpedo", {})
+        maximum = min(6.0, max(.3, float(self.strategy.get("torpedo_close_distance_km", 6.0))))
+        # Only known ship data constrains range; custom profiles do not borrow
+        # Pommern's torpedo characteristics. Actual slot-3 evidence is required.
+        if self.ship.get("has_torpedoes") and torpedo_config.get("range"):
+            maximum = min(maximum, float(torpedo_config["range"]))
+        minimum = max(.15, float(self.strategy.get("torpedo_min_distance_km", .25)))
+        distance = analysis.target_distance_km
+        if not (analysis.in_battle and distance is not None
+                and math.isfinite(distance) and minimum <= distance <= maximum):
+            return
+        if (now - self._last_torpedo_release < 3.0
+                or now - self._last_torpedo_attempt < max(3.0, float(self.strategy.get("torpedo_retry_seconds", 8.0)))):
+            return
+        self._last_torpedo_attempt = now
+        if not (analysis.visible_target and analysis.target_track_id
+                and analysis.target_viewport_point is not None and analysis.enemies):
+            self._record_torpedo_preparation_skip(analysis.image, analysis, "viewport_track_unconfirmed")
+            return
+        if (not math.isfinite(analysis.distance_confidence)
+                or analysis.distance_confidence < float(self.strategy.get("distance_ocr_min_confidence", .78))):
+            self._record_torpedo_preparation_skip(analysis.image, analysis, "target_distance_low_confidence")
+            return
+        if analysis.health_recognized and analysis.health <= 0:
+            self._record_torpedo_preparation_skip(analysis.image, analysis, "alive_health_unconfirmed")
+            return
+        # The navigation minimap contact is not associated with this viewport
+        # track. Only fresh, accepted OCR of this same track can confirm range.
+        if not all(callable(getattr(self.gamepad, method, None)) for method in (
+            "torpedo", "main_gun", "aim_relative", "fire_torpedo", "lock",
+        )):
+            self._record_torpedo_preparation_skip(analysis.image, analysis, "input_methods_unavailable")
+            return
+        target = analysis.target_viewport_point
+        # Match the geometry detector's supported domain. An edge label such
+        # as x=.944 is visible but supplies no supported lead/aim geometry.
+        if not (.10 * analysis.width < target[0] < .90 * analysis.width
+                and .18 * analysis.height < target[1] < .87 * analysis.height):
+            self._record_torpedo_preparation_skip(
+                analysis.image, analysis, "target_outside_aim_region",
+                supported_region=(.10, .18, .90, .87))
+            return
+        if self._torpedo_paused():
+            self._record_torpedo_preparation_skip(analysis.image, analysis, "intervention")
+            return
+
+        backend = getattr(self.distance_reader, "backend", None)
+        size = (analysis.width, analysis.height)
+        before = None
+        last_frame = None
+        fired = False
+        # The asynchronous median triggers a check, never authorizes firing.
+        # Start with current range, then compare consecutive current images.
+        self._torpedo_fresh_distance = None
+        cancel_reason = "capability_not_confirmed"
+        try:
+            # Configuration or a digit 3 alone never authorizes a weapon switch.
+            for index in range(2):
+                before = self._torpedo_frame(size)
+                if before is None:
+                    rejected_frame = getattr(self, "_torpedo_observed_frame", None)
+                    self._record_torpedo_preparation_skip(
+                        analysis.image if rejected_frame is None else rejected_frame,
+                        analysis, getattr(self, "_torpedo_frame_reject_reason", None)
+                        or "battle_frame_unconfirmed")
+                    return
+                capability = detect_torpedo_weapon(before, backend)
+                if capability is not True:
+                    self._record_torpedo_preparation_skip(before, analysis, cancel_reason, weapon=capability)
+                    return
+                observed = self._torpedo_target(before, target, analysis, minimum, maximum)
+                if observed is None:
+                    self._record_torpedo_preparation_skip(
+                        before, analysis, getattr(self, "_torpedo_target_reject_reason", None)
+                        or "target_lost_or_changed")
+                    return
+                target, distance = observed
+                if index == 0:
+                    time.sleep(.15)
+            self._record_torpedo_frame(before, "before", target=target, distance_km=distance)
+            cancel_reason = "intervention"
+            if self._torpedo_paused():
+                return
+            self._torpedo_restore_pending = True
+            cancel_reason = "selection_failed"
+            if self.gamepad.torpedo() is False:
+                return
+            time.sleep(.25)
+            # Several fresh OCR/geometry cycles take ~3 s each on the live
+            # client. Bound the whole attempt separately from each frame's
+            # input freshness, so a six-second budget cannot prevent all aim.
+            deadline = time.monotonic() + min(30.0, max(2.0, float(
+                self.strategy.get("torpedo_alignment_timeout_seconds", 30.0),
+            )))
+            previous_aligned = None
+            locked = False
+            previous_error = None
+            worsening = 0
+            moves = 0
+            for _ in range(12):
+                cancel_reason = "alignment_timeout"
+                if time.monotonic() > deadline:
+                    break
+                cancel_reason = "battle_frame_unconfirmed"
+                frame = self._torpedo_frame(size)
+                last_frame = frame
+                if frame is None:
+                    cancel_reason = getattr(self, "_torpedo_frame_reject_reason", None) or cancel_reason
+                    return
+                cancel_reason = "target_lost_or_changed"
+                observed = self._torpedo_target(frame, target, analysis, minimum, maximum)
+                if observed is None:
+                    cancel_reason = getattr(self, "_torpedo_target_reject_reason", None) or cancel_reason
+                    return
+                target, distance = observed
+                status = inspect_torpedo_hud(frame, before, target, backend)
+                if time.monotonic() > deadline:
+                    cancel_reason = "alignment_timeout"
+                    break
+                if not self._torpedo_frame_fresh():
+                    cancel_reason = "recognition_frame_stale"
+                    return
+                self._record_torpedo_frame(
+                    frame, "observation", target=target, distance_km=distance,
+                    selected=status.selected, loaded=status.loaded_arc,
+                    bearing_available=getattr(status, "bearing_available", True),
+                    cooldown=status.cooldown_seconds, aim=status.aim_point,
+                    lead=status.lead_point, error_px=status.alignment_error_px,
+                    aligned=status.safe_to_fire,
+                    frame_age_seconds=time.monotonic() - self._torpedo_frame_captured_at,
+                )
+                if (status.weapon_is_torpedo is not True or not status.selected
+                        or not status.loaded_arc or (status.cooldown_seconds or 0) > 0):
+                    cancel_reason = "weapon_not_ready"
+                    return
+                if status.safe_to_fire:
+                    previous_error = None
+                    worsening = 0
+                    if previous_aligned is not None and math.dist(
+                        previous_aligned.lead_point, status.lead_point,
+                    ) <= max(18, analysis.width * .02):
+                        if self._torpedo_paused():
+                            cancel_reason = "intervention"
+                            return
+                        rect = get_client_rect(self.hwnd)
+                        if (rect["width"], rect["height"]) != size:
+                            cancel_reason = "client_resized"
+                            return
+                        self._record_torpedo_frame(frame, "before", aligned=True, firing=True)
+                        cancel_reason = "fire_input_cancelled"
+                        if (not self._torpedo_input_allowed(size, deadline)
+                                or self.gamepad.fire_torpedo() is False):
+                            return
+                        fired = True
+                        self._last_torpedo_release = time.monotonic()
+                        self.last_torpedo = self._last_torpedo_release
+                        self.events.publish(
+                            "torpedo.launch_attempt", target_distance_km=distance,
+                            lead_point=status.lead_point, aim_point=status.aim_point,
+                            alignment_error_px=status.alignment_error_px,
+                        )
+                        logger.info("鱼雷对齐复核后发射已派发：距离 %.1fkm，偏差 %.1fpx", distance, status.alignment_error_px)
+                        time.sleep(.2)
+                        after = self._torpedo_frame(size)
+                        last_frame = after
+                        if after is not None:
+                            confirmation = inspect_torpedo_hud(after, before, target, backend)
+                            confirmed = (confirmation.weapon_is_torpedo is True
+                                         and confirmation.selected
+                                         and (confirmation.cooldown_seconds or 0) > 0)
+                            cooldown = confirmation.cooldown_seconds
+                            if not confirmed:
+                                cooldown = confirm_torpedo_reload(after, status, backend)
+                                confirmed = cooldown is not None and cooldown > 0
+                            self._record_torpedo_frame(
+                                after, "after", fired=True, confirmed=confirmed,
+                                cooldown=cooldown,
+                            )
+                            if confirmed:
+                                self.events.publish("torpedo.launch_confirmed", cooldown_seconds=cooldown)
+                            else:
+                                logger.info("鱼雷发射输入已派发，装填反馈未确认；等待下次 HUD 复核")
+                        return
+                    previous_aligned = status
+                    time.sleep(.18)
+                    continue
+                previous_aligned = None
+                if moves >= 8:
+                    cancel_reason = "alignment_step_limit"
+                    break
+                if status.ready_to_align:
+                    error = status.lead_point[0] - status.aim_point[0]
+                    if previous_error is not None and abs(error) > abs(previous_error) + max(4, analysis.width * .004):
+                        worsening += 1
+                        if worsening >= 2:
+                            cancel_reason = "alignment_not_converging"
+                            break
+                    else:
+                        worsening = 0
+                    previous_error = error
+                else:
+                    # A target-centering or lock frame has no comparable
+                    # launch/lead error. Start a new convergence sequence
+                    # when both independently measured axes return.
+                    previous_error = None
+                    worsening = 0
+                    # X is used only for torpedo targeting, never as secondary
+                    # designation. Refuse ambiguous enemies around the reticle.
+                    reticle = getattr(status, "reticle_point", None)
+                    if reticle is None or status.lead_point is not None:
+                        cancel_reason = "prediction_or_aim_missing"
+                        return
+                    error = target[0] - reticle[0]
+                    if abs(error) <= max(15, analysis.width * .04):
+                        central = [p for p in self.vision.find_enemies_in_viewport(frame)
+                                   if abs(p[0] - reticle[0]) <= analysis.width * .07]
+                        if (locked or len(central) != 1
+                                or not self._torpedo_input_allowed(size, deadline)):
+                            cancel_reason = "target_lock_unconfirmed"
+                            return
+                        if self.gamepad.lock() is False:
+                            return
+                        locked = True
+                        time.sleep(.2)
+                        continue
+                # Bringing a side target into the firing view needs larger
+                # bounded steps; once both axes exist, use fine alignment.
+                limit = max(8, round(analysis.width * (.024 if status.ready_to_align else .04)))
+                dx = round(max(-limit, min(limit, error * .35)))
+                if dx == 0:
+                    # The launcher may still be traversing. Observe instead of
+                    # firing while its highlight has not caught up with aim.
+                    time.sleep(.18)
+                    continue
+                if (not self._torpedo_input_allowed(size, deadline)
+                        or self.gamepad.aim_relative(dx, 0) is False):
+                    cancel_reason = "aim_input_cancelled"
+                    return
+                moves += 1
+                time.sleep(.18)
+            else:
+                cancel_reason = ("bearing_unavailable"
+                                 if getattr(status, "bearing_available", True) is False
+                                 else "alignment_observation_limit")
+            logger.info("鱼雷瞄准未在限时内连续对齐，本次取消发射")
+        except Exception:
+            cancel_reason = "recognition_or_input_failed"
+            logger.exception("鱼雷瞄准检查失败；本次不再尝试发射")
+            if not getattr(self, "_torpedo_restore_pending", False):
+                self._record_torpedo_preparation_skip(
+                    analysis.image if before is None else before, analysis,
+                    getattr(self, "_torpedo_frame_reject_reason", None) or cancel_reason)
+        finally:
+            if last_frame is None and getattr(self, "_torpedo_restore_pending", False):
+                last_frame = getattr(self, "_torpedo_observed_frame", None)
+            if last_frame is not None:
+                self._record_torpedo_frame(last_frame, "result", fired=fired,
+                                           cancel_reason=None if fired else cancel_reason)
+            if not fired and getattr(self, "_torpedo_restore_pending", False):
+                self.events.publish("torpedo.aim_cancelled", reason=cancel_reason,
+                                    target_distance_km=distance)
+            if getattr(self, "_torpedo_restore_pending", False):
+                self._restore_torpedo_guns()
+
     def _finish_tick(self, analysis: BattleAnalysis):
         command = self.last_movement_command
         if self.opening_autopilot_active:
@@ -2744,11 +3525,13 @@ class BattleBot:
             in_battle=analysis.in_battle,
             health=analysis.health,
             health_recognized=analysis.health_recognized,
+            hud_layout=analysis.hud_layout,
             on_fire=analysis.on_fire,
             flooding=analysis.flooding,
             fire_anchor_dial=self._last_fire_anchors[0],
             fire_anchor_ship=self._last_fire_anchors[1],
             fire_anchor_status=self._last_fire_status_anchor,
+            flood_anchor_status=self._last_flood_status_anchor,
             enemies=max(len(analysis.enemies), analysis.minimap_enemy_count),
             target_track_id=analysis.target_track_id,
             # Keep the public/control distance aligned with movement logic.
@@ -2857,7 +3640,11 @@ class BattleBot:
         cooldown = float(
             self.strategy.get("damage_control_cooldown_seconds", 80.0)
         )
-        return time.monotonic() - self.last_damage_control >= cooldown
+        now = time.monotonic()
+        return (
+            now - self.last_damage_control >= cooldown
+            and now - self._last_damage_control_attempt >= 2.0
+        )
 
     @property
     def heal_ready(self) -> bool:

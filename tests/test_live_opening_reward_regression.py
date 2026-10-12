@@ -16,6 +16,20 @@ def reader():
     return ResultRewardReader()
 
 
+@pytest.mark.parametrize("filename,expected", [
+    ("battle_port_color_conflict.png", ScreenState.BATTLE),
+    ("port_ship_selected.png", ScreenState.PORT),
+    ("port_with_ship_tooltip.png", ScreenState.PORT),
+    ("loading_tips_live.png", ScreenState.LOADING),
+    ("results_live_1494.png", ScreenState.RESULTS),
+])
+def test_numeric_hud_conflict_resolution_with_real_ocr(reader, filename, expected):
+    image = cv2.imread("tests/fixtures/" + filename)
+    assert image is not None
+    bot = SimpleNamespace(vision=Vision(), distance_reader=SimpleNamespace(backend=reader.backend))
+    assert classify_battle_continuity_screen(bot, image) == expected
+
+
 @pytest.mark.parametrize("vertical_shift", [0, 80])
 def test_real_reward_row_and_moved_panel(reader, vertical_shift):
     image = cv2.imread("tests/fixtures/results_live_1494.png")

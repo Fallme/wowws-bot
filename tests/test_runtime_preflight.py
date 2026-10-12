@@ -9,6 +9,7 @@ import main
 from core.calibration import AUTOMATIC_PREFLIGHT_KEY, CalibrationStore
 from core.frame_guard import CaptureFault
 from core.ocr import OcrToken
+from core.tactical_geometry import TacticalMapGeometry
 from core.ui import ScreenState
 from main import (
     automatic_input_preflight,
@@ -27,6 +28,13 @@ from main import (
     wait_for_recognized_screen,
 )
 from core.vision import CaptureZone, PlayerPose
+
+
+def mock_tactical_grid(_image):
+    # These lifecycle tests stub all visual recognition. Supply the same
+    # verified grid explicitly rather than treating their blank frames as M.
+    return TacticalMapGeometry((1000, 1600),
+                               ((395, 95), (1205, 95), (1205, 905), (395, 905)), 810)
 
 
 class FakeVision:
@@ -381,21 +389,20 @@ def test_new_round_waits_for_loading_then_fresh_upper_right_clock():
             self.index += 1
             return state
 
-        @staticmethod
-        def read_battle_clock_seconds(_image, _backend):
-            return 19 * 60 + 49
+        def read_battle_clock_seconds(self, _image, _backend):
+            return 1200 - self.index
 
     vision = NewRoundVision()
-    bot = SimpleNamespace(hwnd=1, vision=vision)
-    with patch("main.time.sleep", return_value=None):
+    bot = SimpleNamespace(hwnd=1, vision=vision, distance_reader=SimpleNamespace(backend=object()))
+    with patch("main.time.sleep", return_value=None), patch("main.time.monotonic", side_effect=(i * 0.05 for i in range(100))):
         assert wait_for_battle(bot, timeout=2, require_new_round=True)
 
     # The first battle-looking frame is rejected because no loading transition
     # had been observed; the new round is accepted only after the full chain.
-    assert vision.index == 4
+    assert vision.index == 5
 
 
-def test_first_battle_hud_frame_starts_engine_before_clock_and_autopilot_finish():
+def test_confirmed_active_phase_starts_engine_before_autopilot_finish():
     class OpeningVision:
         def __init__(self):
             self.states = [
@@ -435,6 +442,7 @@ def test_first_battle_hud_frame_starts_engine_before_clock_and_autopilot_finish(
         patch("main.time.sleep", return_value=None),
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot", return_value=False),
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
     ):
         assert wait_for_battle(bot, timeout=2, require_new_round=True)
 
@@ -489,6 +497,7 @@ def test_loading_like_battle_frame_waits_for_player_pose_before_opening_commands
         patch("main.time.sleep", return_value=None),
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot") as configure,
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
     ):
         assert wait_for_battle(bot, timeout=2, require_new_round=True)
 
@@ -496,6 +505,53 @@ def test_loading_like_battle_frame_waits_for_player_pose_before_opening_commands
     assert controller.reassertions == 1
     assert bot.vision.pose_calls == 2
     assert bot._opening_autopilot_attempted
+
+
+def test_wait_for_battle_keeps_round_when_user_switches_during_map_verification():
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    paused = False
+
+    class Vision:
+        def grab(self, _hwnd, *, allow_stale=False):
+            if paused:
+                raise CaptureFault("游戏画面连续3次截取失败")
+            return frame
+
+        @staticmethod
+        def find_minimap(_image):
+            return frame
+
+        @staticmethod
+        def find_player_pose_on_minimap(_minimap):
+            return object()
+
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            return 1198
+
+    def configure(_bot):
+        nonlocal paused
+        paused = True
+        return False
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=Vision(),
+        gamepad=SimpleNamespace(reassert_full_speed=lambda: None),
+        intervention=None,
+    )
+    with (
+        patch("main.time.sleep", return_value=None),
+        patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.operation_paused", side_effect=lambda _bot: paused),
+        patch("main.classify_battle_continuity_screen", return_value=ScreenState.BATTLE),
+        patch("main.loading_start_confirmed", return_value=False),
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
+        patch("main.configure_opening_autopilot", side_effect=configure),
+    ):
+        assert not wait_for_battle(bot, timeout=2, require_new_round=True,
+                                   loading_already_seen=True)
+    assert paused
 
 
 def test_missing_pose_does_not_deadlock_confirmed_battle_or_consume_map_attempt():
@@ -525,6 +581,7 @@ def test_missing_pose_does_not_deadlock_confirmed_battle_or_consume_map_attempt(
         patch("main.time.sleep", return_value=None),
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot") as configure,
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
     ):
         assert wait_for_battle(bot, timeout=2, require_new_round=True)
     assert bot.vision.frames == 5
@@ -572,6 +629,7 @@ def test_loading_start_action_blocks_full_speed_and_map_until_it_disappears():
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot", return_value=False) as configure,
         patch("main.click_loading_start_action", return_value=True) as start_click,
+        patch("main.observe_battle_phase", return_value=main.BattlePhase.ACTIVE),
     ):
         assert wait_for_battle(
             bot,
@@ -694,6 +752,9 @@ def _run_stuck_pre_battle(*, flicker):
         vision=_StuckRosterVision(flicker=flicker),
         gamepad=controller,
         intervention=None,
+        distance_reader=SimpleNamespace(backend=SimpleNamespace(
+            recognize=lambda _: [OcrToken("开始战斗", 0.99)],
+        )),
     )
     clock = _AdvancingClock()
     with (
@@ -736,7 +797,7 @@ def test_flickering_pre_battle_detector_never_arms_the_rescue():
     assert clock.now >= 400
 
 
-def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing():
+def test_confirmed_loading_boundary_does_not_accept_hud_when_clock_is_missing():
     class ClocklessBattleVision:
         @staticmethod
         def grab(_hwnd, *, allow_stale=False):
@@ -762,7 +823,7 @@ def test_confirmed_loading_boundary_accepts_stable_hud_when_clock_ocr_is_missing
         patch("main.ensure_capture_foreground", return_value=True),
         patch("main.configure_opening_autopilot", return_value=False),
     ):
-        assert wait_for_battle(
+        assert not wait_for_battle(
             bot,
             timeout=2,
             require_new_round=True,
@@ -882,6 +943,44 @@ def test_resumed_battle_reasserts_full_speed_without_reopening_map():
         "center_route",
         "analyze",
     ]
+
+
+def test_resumed_battle_preserves_confirmed_native_route_without_throttle_or_map():
+    events = []
+
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return np.zeros((90, 160, 3), dtype=np.uint8)
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+        @staticmethod
+        def read_autopilot_enabled_text(_image, _backend):
+            return True
+
+    bot = SimpleNamespace(
+        hwnd=1,
+        vision=BattleVision(),
+        distance_reader=SimpleNamespace(backend=object()),
+        gamepad=SimpleNamespace(reassert_full_speed=lambda: events.append("full_speed")),
+        intervention=None,
+        last_movement_reason="",
+        combat_tick=lambda: events.append("analyze") or "ended",
+    )
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot") as configure,
+        patch("main.time.sleep", return_value=None),
+    ):
+        assert run_battle(bot, resume_existing=True)
+
+    configure.assert_not_called()
+    assert events == ["analyze"]
+    assert bot.opening_autopilot_active
+    assert bot._native_autopilot_confirmed
 
 
 def test_resumed_stalled_route_ignores_lingering_green_autopilot_hud():
@@ -1130,7 +1229,8 @@ def test_quick_battle_timeout_is_counted_only_inside_confirmed_battle():
         assert run_battle(QuickBot(), quick_battle=True) == "quick_timeout"
 
 
-def test_quick_battle_death_immediately_requests_next_round():
+@pytest.mark.parametrize("tick_result", ["waiting", "ended"])
+def test_quick_battle_death_immediately_requests_next_round(tick_result):
     class BattleVision:
         @staticmethod
         def grab(_hwnd, *, allow_stale=False):
@@ -1153,7 +1253,7 @@ def test_quick_battle_death_immediately_requests_next_round():
 
         def combat_tick(self):
             self.last_analysis = SimpleNamespace(in_battle=True, health=0.0)
-            return "waiting"
+            return tick_result
 
     with (
         patch("main.ensure_bound_game_foreground", return_value=True),
@@ -1404,7 +1504,7 @@ def test_stale_tactical_map_flag_never_opens_map_on_normal_battle_screen():
     assert not bot._tactical_map_left_open
 
 
-def test_escape_and_exit_overlays_use_esc_until_battle_is_restored():
+def test_overlay_escape_uses_a_fresh_text_verified_menu_instead_of_old_state():
     states = iter([ScreenState.ESCAPE_MENU, ScreenState.BATTLE])
     escapes = []
 
@@ -1425,6 +1525,7 @@ def test_escape_and_exit_overlays_use_esc_until_battle_is_restored():
     )
     with (
         patch("main.ensure_capture_foreground", return_value=True),
+        patch("main.battle_overlay_text_confirmed", return_value=True),
         patch("main.time.sleep", return_value=None),
     ):
         restored = dismiss_battle_overlay(
@@ -1433,7 +1534,7 @@ def test_escape_and_exit_overlays_use_esc_until_battle_is_restored():
         )
 
     assert restored == ScreenState.BATTLE
-    assert escapes == ["esc", "esc"]
+    assert escapes == ["esc"]
 
 
 def test_prepare_battle_cancels_port_actions_when_second_frame_is_battle():
@@ -1513,6 +1614,7 @@ def test_opening_autopilot_crosses_center_not_unstable_capture_circle():
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
         ),
         patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
+        patch("main.detect_tactical_map_geometry", side_effect=mock_tactical_grid),
     ):
         assert configure_opening_autopilot(bot)
         assert not configure_opening_autopilot(bot)
@@ -1577,6 +1679,7 @@ def test_opening_autopilot_captures_and_freezes_five_tactical_map_frames():
         ),
         patch("main.physical_click", return_value=True),
         patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
+        patch("main.detect_tactical_map_geometry", side_effect=mock_tactical_grid),
     ):
         assert configure_opening_autopilot(bot)
 
@@ -1709,6 +1812,7 @@ def test_opening_autopilot_uses_only_one_enemy_biased_destination():
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
         ),
         patch("main.tactical_map_is_open", side_effect=[True] * 5 + [False]),
+        patch("main.detect_tactical_map_geometry", side_effect=mock_tactical_grid),
     ):
         assert configure_opening_autopilot(bot, retrying=True)
 
@@ -1757,13 +1861,23 @@ def test_opening_autopilot_never_clicks_until_map_is_stably_confirmed():
     assert not bot._tactical_map_left_open
 
 
-def test_opening_autopilot_requires_lower_left_game_confirmation():
+@pytest.mark.parametrize("message_recovers", [False, True])
+def test_opening_autopilot_requires_lower_left_game_confirmation(message_recovers):
     minimap = np.zeros((200, 200, 3), dtype=np.uint8)
     enabled = []
     toggles = []
     clicks = []
+    clocks = iter([30, 29, 1200, 1200, 1199])
+    observed_clocks = []
 
     class UnconfirmedAutopilotVision:
+        @staticmethod
+        def read_battle_clock_seconds(_image, _backend):
+            value = next(clocks)
+            observed_clocks.append(value)
+            assert not toggles, "Preparation must not consume any M-map attempt"
+            return value
+
         @staticmethod
         def grab(_hwnd, *, allow_stale=False):
             return np.zeros((1000, 1600, 3), dtype=np.uint8)
@@ -1782,7 +1896,7 @@ def test_opening_autopilot_requires_lower_left_game_confirmation():
 
         @staticmethod
         def read_autopilot_enabled_text(_image, _backend):
-            return False
+            return message_recovers and len(clicks) >= 2
 
     bot = SimpleNamespace(
         hwnd=1,
@@ -1796,22 +1910,33 @@ def test_opening_autopilot_requires_lower_left_game_confirmation():
     )
     with (
         patch("main.time.sleep", return_value=None),
-        patch("main.get_client_rect", return_value={"left": 0, "top": 0}),
+        patch("main.time.monotonic", side_effect=(i * 0.1 for i in range(1000))),
+        patch("main.get_client_rect", return_value={"left": 0, "top": 0, "width": 1600, "height": 1000}),
         patch(
             "main.tactical_map_is_open",
             side_effect=([True] * 5 + [False]) * 3,
         ),
+        patch("main.detect_tactical_map_geometry", side_effect=mock_tactical_grid),
         patch(
             "main.physical_click",
             side_effect=lambda x, y, **_kwargs: clicks.append((x, y)) or True,
-        ),
+        ) as physical,
+        patch(
+            "main.window_message_click",
+            side_effect=lambda hwnd, x, y, **_kwargs: clicks.append((x, y)) or True,
+        ) as message,
     ):
-        assert not configure_opening_autopilot(bot)
+        assert configure_opening_autopilot(bot) == message_recovers
 
-    assert enabled == []
-    assert toggles == ["m"] * 6
-    assert len(clicks) == 3
-    assert len(set(clicks)) == 3
+    attempts = 2 if message_recovers else 3
+    assert observed_clocks == [30, 29, 1200, 1200, 1199]
+    assert not bot._autopilot_waiting_for_start
+    assert enabled == ([True] if message_recovers else [])
+    assert toggles == ["m"] * (attempts * 2)
+    assert len(clicks) == attempts
+    assert len(set(clicks)) == attempts
+    assert physical.call_count == 1
+    assert message.call_count == attempts - 1
 
 
 def test_refresh_game_window_rebinds_recreated_hwnd_and_maximizes():

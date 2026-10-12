@@ -19,6 +19,7 @@ import time
 
 KEYEVENTF_KEYUP = 0x0002
 INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
@@ -32,6 +33,7 @@ VK = {
     "w": 0x57,
     "x": 0x58,
     "3": 0x33,
+    "2": 0x32,
     "4": 0x34,
     "t": 0x54,
     "r": 0x52,
@@ -124,6 +126,19 @@ class SendInputBackend:
         if sent != 2:
             raise ctypes.WinError()
         self._mark_injected()
+
+    def move_relative(self, dx, dy):
+        """Move the game's aim by a relative mouse event without cursor warps."""
+        event = _INPUT(
+            type=INPUT_MOUSE,
+            mi=_MOUSEINPUT(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, 0),
+        )
+        events = (_INPUT * 1)(event)
+        sent = self.user32.SendInput(1, events, ctypes.sizeof(_INPUT))
+        if sent != 1:
+            raise ctypes.WinError()
+        self._mark_injected()
+        return True
 
 
 @dataclass(frozen=True)
@@ -351,6 +366,28 @@ class KeyboardController:
         self._ensure_target_focus()
         self.device.tap("3")
         self._record("torpedo", self._throttle_notch / self.MAX_NOTCH, 0.0)
+
+    def main_gun(self):
+        """Restore the usual battery after a bounded torpedo inspection."""
+        self._ensure_target_focus()
+        self.device.tap("2")
+        self._record("main_gun_select", self._throttle_notch / self.MAX_NOTCH, 0.0)
+
+    def aim_relative(self, dx, dy):
+        """Dispatch one bounded aim step; screenshot feedback confirms alignment."""
+        self._ensure_target_focus()
+        if self.device.move_relative(dx, dy) is False:
+            return False
+        self._record("torpedo_aim", self._throttle_notch / self.MAX_NOTCH, 0.0)
+        return True
+
+    def fire_torpedo(self):
+        """Fire at the current verified aim without moving or restoring the cursor."""
+        self._ensure_target_focus()
+        if self.device.left_click() is False:
+            return False
+        self._record("torpedo_launch", self._throttle_notch / self.MAX_NOTCH, 0.0)
+        return True
 
     def smoke(self):
         self._ensure_target_focus()

@@ -11,6 +11,10 @@ class ConfigLoaderTests(unittest.TestCase):
         self.assertEqual(ship["name"], "Pommern")
         self.assertGreater(ship["secondary"]["range"], 0)
 
+    def test_presets_default_to_six_km_torpedo_attempts(self):
+        for name in ("pommern", "napoli"):
+            self.assertEqual(load_ship_config(name)["strategy"]["torpedo_close_distance_km"], 6.0)
+
     def test_unknown_ship_lists_available_choices(self):
         with self.assertRaisesRegex(KeyError, "available ships"):
             load_ship_config("missing")
@@ -38,6 +42,9 @@ class ConfigLoaderTests(unittest.TestCase):
         self.assertEqual(ship["display_name"], "大选帝侯")
         self.assertEqual(ship["secondary"]["range"], 12.1)
         self.assertFalse(ship["has_torpedoes"])
+        self.assertNotIn("torpedo", ship)
+        self.assertTrue(ship["strategy"]["auto_torpedo"])
+        self.assertEqual(ship["strategy"]["torpedo_close_distance_km"], 6.0)
         self.assertFalse(ship["has_smoke"])
         self.assertLess(
             ship["strategy"]["secondary_target_distance_km"],

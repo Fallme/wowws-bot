@@ -25,7 +25,7 @@ def test_secondary_lock_never_dispatches_input():
     pad.lock.assert_not_called()
 
 
-@pytest.mark.parametrize("words,expected", [("开始战斗", ScreenState.LOADING), ("R T Y", ScreenState.BATTLE), ("", ScreenState.LOADING)])
+@pytest.mark.parametrize("words,expected", [("开始战斗", ScreenState.LOADING), ("R T Y", ScreenState.BATTLE), ("", ScreenState.BATTLE)])
 def test_loading_colour_conflict_requires_button_text(words, expected):
     image = cv2.imread("tests/fixtures/battle_long_run.png")
     vision = SimpleNamespace(

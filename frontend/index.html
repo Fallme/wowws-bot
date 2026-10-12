@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#081116" />
     <meta name="description" content="战舰世界本地自动作战控制台" />
     <title>战舰自动化控制台</title>
-    <link rel="stylesheet" href="/styles.css?v=20260901_1" />
-    <link rel="stylesheet" href="/custom_ship.css?v=20260829_1" />
+    <link rel="stylesheet" href="/styles.css?v=20260927_2" />
+    <link rel="stylesheet" href="/custom_ship.css?v=20260927_2" />
   </head>
   <body>
     <main class="app-shell">
@@ -38,7 +38,7 @@
               <button class="ship-selector-tab" id="customShipTab" data-ship-tab="custom" role="tab" aria-controls="customShipFields" aria-selected="false">自定义舰船</button>
             </div>
             <div class="ship-tab-panel" id="shipPresetPanel" role="tabpanel" aria-labelledby="presetShipTab">
-              <div class="ship-list ship-preset-scroll" id="shipList"></div>
+              <div class="ship-list ship-preset-scroll" id="shipList" tabindex="0" role="region" aria-label="舰船列表，可上下滚动"></div>
             </div>
             <div class="custom-ship-fields ship-tab-panel" id="customShipFields" role="tabpanel" aria-labelledby="customShipTab" hidden>
               <label for="customShipName">完整舰船名称</label>
@@ -136,6 +136,6 @@
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260902_1" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260927_2" defer></script>
   </body>
 </html>

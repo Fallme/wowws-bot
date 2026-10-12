@@ -33,13 +33,47 @@
 }
 
 .ship-preset-scroll {
-  max-height: 154px;
+  max-height: 240px;
+  max-height: clamp(144px, 30vh, 240px);
+  min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-color: #936b32 #091418;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
   scrollbar-width: thin;
-  padding-right: 3px;
+  scrollbar-color: #8a652f #071115;
+  padding: 2px 4px 2px 2px;
+  align-content: start;
 }
+.ship-preset-scroll > * { min-width: 0; }
+.ship-preset-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ship-preset-scroll::-webkit-scrollbar { width: 6px; }
+.ship-preset-scroll::-webkit-scrollbar-track { background: #071115; border-radius: 6px; }
+.ship-preset-scroll::-webkit-scrollbar-thumb { background: #8a652f; border-radius: 6px; }
+
+.ship-page-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 28px;
+  margin-top: 5px;
+  color: #8399a0;
+  font: 10px Consolas, monospace;
+}
+
+.ship-page-controls[hidden] { display: none; }
+.ship-page-controls button {
+  width: 30px;
+  height: 24px;
+  border: 1px solid #344951;
+  border-radius: 6px;
+  background: #0c1b20;
+  color: #d4dfdd;
+  cursor: pointer;
+}
+.ship-page-controls button:disabled { opacity: .35; cursor: default; }
+.ship-page-controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .ship-preset-row {
   position: relative;

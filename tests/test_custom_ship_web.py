@@ -14,7 +14,7 @@ class CustomShipWebTests(unittest.TestCase):
         self.assertIn("custom_ship_name", javascript)
         self.assertIn("custom_secondary_range", javascript)
 
-    def test_custom_ship_uses_tabs_and_saved_presets_scroll_inside_panel(self):
+    def test_custom_ship_uses_tabs_and_scrollable_complete_presets(self):
         html = (self.ROOT / "index.html").read_text(encoding="utf-8")
         javascript = (self.ROOT / "app.js").read_text(encoding="utf-8")
         stylesheet = (self.ROOT / "custom_ship.css").read_text(encoding="utf-8")
@@ -26,6 +26,13 @@ class CustomShipWebTests(unittest.TestCase):
         self.assertIn("custom_ship_presets", javascript)
         self.assertIn(".ship-preset-scroll", stylesheet)
         self.assertIn("overflow-y: auto", stylesheet)
+        self.assertIn("max-height: clamp(144px, 30vh, 240px)", stylesheet)
+        self.assertIn('id="shipList" tabindex="0"', html)
+        self.assertNotIn('id="shipPageControls"', html)
+        self.assertNotIn("pageSize=2", javascript)
+        self.assertIn('shipList.innerHTML=shipItems.join("")', javascript)
+        self.assertIn("shipList.scrollTop=previousShipScroll", javascript)
+        self.assertNotIn('class="history-resume"', javascript)
 
     def test_saved_presets_have_delete_action_and_stop_is_terminal(self):
         html = (self.ROOT / "index.html").read_text(encoding="utf-8")

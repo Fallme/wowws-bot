@@ -82,13 +82,23 @@ pommern:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
+    damage_control_burst_threshold: 0.08 # 8秒内掉最大血量8%，下一次新鲜读数复核
+    damage_control_burst_window_seconds: 8
+    damage_control_sustained_threshold: 0.02 # 24秒内至少3次下降，累计掉最大血量2%
+    damage_control_sustained_window_seconds: 24
     heal_threshold: 0.50            # 兼容旧配置
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段
     other_consumable_cooldown_seconds: 30
     other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
     heal_max_uses: 3                # 兼容旧配置
-    torpedo_fire_distance: 6000      # 鱼雷发射距离 (米)
+    auto_torpedo: true              # 实际识别3号鱼雷图标后才会尝试
+    torpedo_close_distance_km: 6.0   # 6公里内（含边界）尝试；已知舰船还受鱼雷射程限制
+    torpedo_min_distance_km: 0.25    # 避免过近；可按本舰鱼雷引信距离调整
+    torpedo_retry_seconds: 8.0      # 不锁死整舰装填时间，复查当前发射器HUD
+    torpedo_alignment_timeout_seconds: 30.0 # 总尝试限时；每次输入仍须新截图，连续两帧对齐再射击
+    torpedo_input_max_frame_age_seconds: 4.0
+    torpedo_fire_distance: 6000      # 兼容旧字段；新流程使用上方近距离阈值
     torpedo_avoid_distance: 3000     # 鱼雷规避距离 (米)
     main_gun_shoot_threshold: 0.8    # 准心偏移容差
 
@@ -167,6 +177,10 @@ napoli:
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
     damage_control_cooldown_seconds: 80
+    damage_control_burst_threshold: 0.08
+    damage_control_burst_window_seconds: 8
+    damage_control_sustained_threshold: 0.02
+    damage_control_sustained_window_seconds: 24
     heal_threshold: 0.55            # 兼容旧配置
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段
@@ -174,6 +188,12 @@ napoli:
     other_consumable_health_threshold: 0.80 # 轻微掉血不使用；80%及以下每30秒尝试
     heal_max_uses: 3                # 兼容旧配置
     auto_smoke: true
+    auto_torpedo: true
+    torpedo_close_distance_km: 6.0
+    torpedo_min_distance_km: 0.25
+    torpedo_retry_seconds: 8.0
+    torpedo_alignment_timeout_seconds: 30.0
+    torpedo_input_max_frame_age_seconds: 4.0
     main_gun_shoot_threshold: 0.8
     torpedo_avoid_distance: 3000
     smoke_threshold: 0.5    # 血量<50%放烟

@@ -29,9 +29,31 @@ class IslandRoutePlanner:
 
     @staticmethod
     def _clear(mask, start, end):
-        line = np.zeros_like(mask)
-        cv2.line(line, tuple(start), tuple(end), 1, 1)
-        return not np.any(mask & line)
+        # Supercover traversal checks both cells at a diagonal corner. A thin
+        # Bresenham line skipped them, undoing A*'s no-corner-cutting rule when
+        # smoothing its path into long waypoints.
+        x, y = map(int, start)
+        end_x, end_y = map(int, end)
+        height, width = mask.shape
+        if not (0 <= x < width and 0 <= y < height
+                and 0 <= end_x < width and 0 <= end_y < height) or mask[y, x]:
+            return False
+        nx, ny = abs(end_x - x), abs(end_y - y)
+        sx, sy = (1 if end_x > x else -1), (1 if end_y > y else -1)
+        ix = iy = 0
+        while ix < nx or iy < ny:
+            decision = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx
+            if decision == 0:
+                if mask[y, x + sx] or mask[y + sy, x]:
+                    return False
+                x, y, ix, iy = x + sx, y + sy, ix + 1, iy + 1
+            elif decision < 0:
+                x, ix = x + sx, ix + 1
+            else:
+                y, iy = y + sy, iy + 1
+            if mask[y, x]:
+                return False
+        return True
 
     def waypoint(
         self,
@@ -82,11 +104,16 @@ class IslandRoutePlanner:
         # relaxed. Actual land remains impassable, including next to the ship.
         local = np.zeros_like(mask)
         cv2.circle(local, start, radius, 1, -1)
-        # The live white arrow can overlap a coastline by a few pixels. Treat
-        # that tiny neighbourhood as the ship's known water, but keep every
-        # other land cell blocked.
-        land[local > 0] = 0
-        mask[local > 0] = 0
+        # A mistaken arrow on land is not permission to carve a passage.
+        # Relax only inflated water cells around a genuinely waterborne start.
+        if land[start[1], start[0]]:
+            self.reset()
+            return None
+        mask[(local > 0) & (land == 0)] = 0
+        mask[[0, -1], :] = 1
+        mask[:, [0, -1]] = 1
+        if mask[start[1], start[0]]:
+            return None
         if self.goal is not None and math.dist(goal, self.goal) <= 2 and key == self.key:
             while len(self.path) > 1 and math.dist(start, self.path[0]) <= 2:
                 self.path.pop(0)

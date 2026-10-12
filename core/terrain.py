@@ -61,7 +61,9 @@ def extend_template(existing, confirmed):
         return confirmed
     old, new = rasterize(existing), rasterize(confirmed)
     smaller_area = min(int(old.sum()), int(new.sum()))
-    if not smaller_area or np.count_nonzero(old & new) / smaller_area < 0.65:
+    overlap = np.count_nonzero(old & new)
+    union = np.count_nonzero(old | new)
+    if not smaller_area or overlap / smaller_area < 0.65 or overlap / max(union, 1) < 0.25:
         return existing
     return outlines_from_mask(old | new)
 

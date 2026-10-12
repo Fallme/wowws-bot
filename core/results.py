@@ -75,6 +75,13 @@ class BattleRewards:
     raw_text: dict[str, str] = field(default_factory=dict)
     outcome: str = "unknown"
 
+    def explicit_zero(self, field: str) -> bool:
+        """Distinguish a confidently read zero from the missing-value default."""
+        groups = re.findall(r"\d+", self.raw_text.get(field, ""))
+        return bool(groups and all(int(group) == 0 for group in groups)
+                    and self.confidence.get(field, 0.0) >= 0.80
+                    and self.resource_values().get(field) == 0)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -478,32 +485,168 @@ class ResultRewardReader:
         )
         return float(np.mean(vivid_green)) >= 0.012
 
-    def _anchored_reward_regions(self, image, regions):
-        """Locate the numeric row below its label, independent of window height.
+    def _anchored_reward_regions(self, image, regions, *, return_heading=False):
+        """Locate rewards from their heading and rendered resource icons.
 
-        Keep the calibrated horizontal columns; moving the panel vertically
-        must not make the reader repeatedly OCR the caption instead of credits.
-        The next section's damage total is outside this narrow anchored row.
+        The heading supplies both position and local UI scale. The three
+        icons terminate the actual numeric fields, including when OCR merges
+        the entire row into one token. Account totals have no nearby heading.
         """
         height, width = image.shape[:2]
         left, top = int(width * 0.04), int(height * 0.20)
-        crop = image[top:int(height * 0.65), left:int(width * 0.65)]
-        for token in self.backend.recognize(crop):
-            if "在战斗中获得" not in re.sub(r"\s+", "", token.text):
+        searches = [(left, top, int(width * 0.65), int(height * 0.65)),
+                    (0, 0, width, height)]
+        seen_heading = None
+        for left, top, right, bottom in searches:
+            crop = image[top:bottom, left:right]
+            for token in self.backend.recognize(crop) or ():
+                text = re.sub(r"\s+", "", token.text)
+                if not any(label in text for label in ("在战斗中获得", "在戰鬥中獲得")):
+                    continue
+                bounds = self._token_bounds(token)
+                if token.confidence < 0.75 or bounds is None:
+                    continue
+                x1, y1, x2, y2 = bounds
+                label = (left + x1, top + y1, left + x2, top + y2)
+                if y2 - y1 < 6:
+                    continue
+                seen_heading = label
+                anchored = self._reward_icon_regions(image, label)
+                if anchored is not None:
+                    return (anchored, label) if return_heading else anchored
+                anchored = self._reward_number_regions(image, label)
+                if anchored is not None:
+                    return (anchored, label) if return_heading else anchored
+        return (None, seen_heading) if return_heading else None
+
+    @staticmethod
+    def _reward_icon_regions(image, label, *, brightness=155):
+        """Separate credits/XP using the coin and white/green star glyphs."""
+        height, width = image.shape[:2]
+        lx, _ly, _rx, bottom = label
+        unit = label[3] - label[1]
+        left = max(0, int(lx - unit))
+        top = max(0, int(bottom + unit * 0.05))
+        end = min(height, int(bottom + unit * 3.0))
+        row = image[top:end, left:]
+        if row.size == 0:
+            return None
+        hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)
+        white = (hsv[:, :, 1] < 85) & (hsv[:, :, 2] >= brightness)
+        green = ((hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 95)
+                 & (hsv[:, :, 1] >= 75) & (hsv[:, :, 2] >= 130))
+        mask = ((white | green).astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        icons = []
+        for contour in contours:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            # Numerals are narrow; the coin and star outlines are near-square.
+            if not (unit * .45 <= ch <= unit * 2.5 and .78 <= cw / max(ch, 1) <= 1.35):
                 continue
-            if token.confidence < 0.75 or len(token.box) < 4:
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            circularity = 4 * np.pi * area / max(perimeter * perimeter, 1)
+            icons.append((x, y, cw, ch, circularity,
+                          float(np.mean(green[y:y + ch, x:x + cw]))))
+        # An interrupted coin outline can expose its inner emblem as a
+        # second external contour. It occupies the same glyph, not a fourth
+        # reward column. Keep the larger enclosing outline before pairing
+        # the coin with the two stars.
+        separate_icons = []
+        for candidate in sorted(icons, key=lambda item: item[2] * item[3], reverse=True):
+            x, y, cw, ch = candidate[:4]
+            duplicate = False
+            for ox, oy, ow, oh, *_ in separate_icons:
+                overlap = max(0, min(x + cw, ox + ow) - max(x, ox)) * max(
+                    0, min(y + ch, oy + oh) - max(y, oy)
+                )
+                if (overlap / min(cw * ch, ow * oh) >= .50
+                        and abs(x + cw / 2 - ox - ow / 2) <= .55 * min(cw, ow)
+                        and abs(y + ch / 2 - oy - oh / 2) <= .55 * min(ch, oh)):
+                    duplicate = True
+                    break
+            if not duplicate:
+                separate_icons.append(candidate)
+        icons = separate_icons
+        icons.sort()
+        for coin, star, free_star in zip(icons, icons[1:], icons[2:]):
+            if coin[0] > (label[2] - label[0]) + unit * 8 or free_star[0] > unit * 32:
                 continue
-            ys = [point[1] for point in token.box]
-            label_height = max(ys) - min(ys)
-            if label_height < 8:
+            if (coin[4] < .45 or star[4] > .50 or free_star[4] > .50
+                    or star[5] > .15 or free_star[5] < .12):
                 continue
-            y1 = (top + max(ys) + label_height * 0.10) / height
-            y2 = min(1.0, (top + max(ys) + label_height * 2.5) / height)
+            # A round digit in the XP value must not replace the earlier
+            # credits coin. That coin belongs to the heading's first column.
+            if coin[0] > label[2] - left + unit * 2:
+                continue
+            if max(abs(coin[1] - star[1]), abs(star[1] - free_star[1])) > unit:
+                continue
+            starts = [0, coin[0] + coin[2], star[0] + star[2]]
+            ends = [coin[0], star[0], free_star[0]]
+            if any(b - a < unit * .4 for a, b in zip(starts, ends)):
+                continue
             return {
-                name: RelativeRegion(region.left, y1, region.right, y2)
-                for name, region in regions.items()
+                name: RelativeRegion((left + a) / width, top / height,
+                                     (left + b) / width, end / height)
+                for name, a, b in zip(("credits", "ship_xp", "free_xp"), starts, ends)
             }
+        if brightness == 155:
+            # Antialiased inner emblems can touch the coin outline in a raw
+            # lossless frame; JPEG may misleadingly separate those pixels.
+            # Retry bounded highlight levels, retaining the same caption,
+            # round coin, two distinct stars, and column-geometry checks.
+            for threshold in (170, 200, 225):
+                regions = ResultRewardReader._reward_icon_regions(
+                    image, label, brightness=threshold,
+                )
+                if regions is not None:
+                    return regions
         return None
+
+    def _reward_number_regions(self, image, label):
+        """Use separately detected numeric boxes when icons are washed out."""
+        height, width = image.shape[:2]
+        unit = label[3] - label[1]
+        left = max(0, int(label[0] - unit))
+        top = max(0, int(label[3] + unit * .05))
+        bottom = min(height, int(label[3] + unit * 3.0))
+        candidates = []
+        for token in self.backend.recognize(image[top:bottom, left:]) or ():
+            bounds = self._token_bounds(token)
+            if bounds is None or token.confidence < self.minimum_confidence:
+                continue
+            if not re.fullmatch(r"[\d\s]+[☆★⚓]*", token.text.strip()):
+                continue
+            candidates.append((token, self._leading_digit_group(token.text)))
+        candidates = self._deduplicate_numeric_tokens(candidates)
+        groups = []
+        for token, digits in candidates:
+            box = self._token_bounds(token)
+            if groups and len(digits) == 3:
+                prior = groups[-1]
+                gap = box[0] - prior[2]
+                glyph_height = max(box[3] - box[1], prior[3] - prior[1])
+                if 0 <= gap <= glyph_height * .55:
+                    prior[2] = box[2]
+                    prior[3] = max(prior[3], box[3])
+                    continue
+            groups.append(list(box))
+        if len(groups) != 3:
+            return None
+        if (groups[0][0] > (label[2] - label[0]) + unit * 2
+                or groups[-1][2] - groups[0][0] > unit * 32):
+            return None
+        centers = [(box[1] + box[3]) / 2 for box in groups]
+        if max(centers) - min(centers) > unit:
+            return None
+        pad = max(2, unit * .10)
+        return {
+            name: RelativeRegion(max(0, left + box[0] - pad) / width,
+                                 max(0, top + box[1] - pad) / height,
+                                 min(width, left + box[2] + pad) / width,
+                                 min(height, top + box[3] + pad) / height)
+            for name, box in zip(("credits", "ship_xp", "free_xp"), groups)
+        }
 
     def read(self, image) -> BattleRewards:
         height, width = image.shape[:2]
@@ -520,13 +663,30 @@ class ResultRewardReader:
         # images, locate the row first. This also avoids expensive numeric
         # fallback retries against a caption that cannot contain any credits.
         anchored = None
-        if isinstance(self.backend, RapidOcrBackend):
+        heading = None
+        # Legacy numeric-only adapters do not expose text geometry. Backends
+        # with UI-anchor support must prove the earned-reward heading before
+        # any profile is allowed to read numbers.
+        anchors_supported = isinstance(self.backend, RapidOcrBackend) or getattr(
+            self.backend, "supports_ui_anchors", False
+        )
+        if anchors_supported:
             try:
-                anchored = self._anchored_reward_regions(image, regions)
+                anchored, heading = self._anchored_reward_regions(
+                    image, regions, return_heading=True
+                )
             except Exception:
                 logger.debug("结算收益标题定位失败", exc_info=True)
-        rewards = self._read_regions(image, anchored or regions)
-        if anchored is not None and not rewards.recognized:
+        # A caption alone cannot prove the old numeric crops after independent
+        # UI scaling. A clipped value may have high OCR confidence and repeat
+        # consistently, so geometry-aware backends require measured columns.
+        profile_allowed = not anchors_supported
+        rewards = BattleRewards(provider=str(
+            getattr(self.backend, "execution_provider", "custom") or "custom"
+        ))
+        if anchored is not None or profile_allowed:
+            rewards = self._read_regions(image, anchored or regions)
+        if anchored is not None and not rewards.recognized and profile_allowed:
             rewards = self._read_regions(image, regions)
         if rewards.recognized or not self._looks_like_port_reward_card(image):
             return rewards

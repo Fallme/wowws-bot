@@ -233,6 +233,7 @@ def test_action_bindings_use_native_keyboard_and_mouse():
     controller.fire()
     controller.lock()
     controller.torpedo()
+    controller.main_gun()
     controller.smoke()
     controller.damage_control()
     controller.heal()
@@ -241,6 +242,7 @@ def test_action_bindings_use_native_keyboard_and_mouse():
         ("click", "left"),
         ("tap", "x"),
         ("tap", "3"),
+        ("tap", "2"),
         ("tap", "4"),
         ("tap", "r"),
         ("tap", "t"),

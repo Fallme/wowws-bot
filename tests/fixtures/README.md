@@ -12,3 +12,23 @@ loaded by the production runtime.
 2026-09-12. The minimap contrast is below the old fixed HUD threshold despite
 a visible player marker and independent HUD anchors. It reproduces the
 PORT/LOADING recovery loop without sending game input.
+
+`battle_port_color_conflict.png` is the unmodified 2560x1494 `full_0040.png`
+from the local `run_20260921_124701_1789966021467861100` archive. It shows
+an active match at 14:43, but broad port/button colours veto the ordinary
+HUD detector. The continuity regression requires independent numeric HP
+and match-clock evidence to recover BATTLE, without changing port navigation.
+
+`assets/ui/fire_warning_mask.png` is a 40x40 binary glyph reference extracted
+from the own-ship HP warning in the 2026-10-05 Rupprecht trial's retained
+`health_reading_20261005_180808` lossless capture. It includes the triangle and
+the internal flame, without the surrounding account or battle information.
+The detector compares both the whole shape and its interior in two HUD
+regions; one warning or a different triangle symbol is insufficient.
+
+`torpedo_prediction_live_2560.png` is the unmodified 2560x1600 observation
+from the 2026-10-06 11:34 Rupprecht co-op trial. The visible faint white
+prediction fan crosses shell trails; raw foreground/background correlation
+previously rejected it. Geometry-only regressions inject weapon identity and
+verify the native and 75% images recover the lead while remaining unaligned
+and unsafe to fire. Production still requires actual weapon/cooldown evidence.

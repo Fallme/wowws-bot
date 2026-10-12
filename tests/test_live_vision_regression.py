@@ -26,9 +26,11 @@ def test_live_viewport_groups_target_strokes(live_frame):
     assert len(enemies) == 1
 
 
-def test_low_contrast_1440p_grid_detector_abstains_when_grid_is_hidden():
+def test_low_contrast_1440p_grid_uses_visible_interrupted_lines():
     frame = cv2.imread(str(Path("tests") / "fixtures" / "battle_low_contrast_1440.png"))
-    assert minimap_grid_bounds(frame) is None
+    # The grid is faint/interrupted by terrain, not absent. These are its
+    # measured outer lines, independent of the old fixed-ratio crop.
+    assert minimap_grid_bounds(frame) == pytest.approx((1882, 762, 2554, 1434), abs=3)
 
 
 def test_live_health_uses_ship_status_gauge(live_frame):
@@ -74,8 +76,10 @@ def test_live_player_arrow_uses_range_ring(live_frame):
     minimap = vision.find_minimap(live_frame)
     player = vision.find_player_on_minimap(minimap)
     assert player is not None
-    assert player[0] == pytest.approx(157, abs=4)
-    assert player[1] == pytest.approx(153, abs=4)
+    # Assert the same physical arrow in the source frame, not an offset tied
+    # to the superseded proportional crop.
+    assert player[0] + vision.minimap_bounds[0] == pytest.approx(2026, abs=4)
+    assert player[1] + vision.minimap_bounds[1] == pytest.approx(1057, abs=4)
 
 
 def test_live_player_pose_exposes_a_normalized_heading(live_frame):
@@ -302,8 +306,8 @@ def test_live_nearest_capture_circle_rejects_player_range_ring(live_frame):
     zone = vision.find_nearest_capture_zone(minimap, player)
 
     assert zone is not None
-    assert zone.center[0] == pytest.approx(133, abs=6)
-    assert zone.center[1] == pytest.approx(353, abs=6)
+    assert zone.center[0] + vision.minimap_bounds[0] == pytest.approx(2002, abs=6)
+    assert zone.center[1] + vision.minimap_bounds[1] == pytest.approx(1257, abs=6)
 
 
 def test_live_capture_letters_keep_their_visible_ownership_state(live_frame):
@@ -379,8 +383,8 @@ def test_live_arrow_without_yellow_range_ring(width):
     minimap = vision.find_minimap(image)
     pose = vision.find_player_pose_on_minimap(minimap)
     assert pose is not None
-    assert pose.position[0] / minimap.shape[1] == pytest.approx(177 / 691, abs=0.008)
-    assert pose.position[1] / minimap.shape[0] == pytest.approx(88 / 650, abs=0.008)
+    assert (pose.position[0] + vision.minimap_bounds[0]) / image.shape[1] == pytest.approx(2046 / 2560, abs=0.003)
+    assert (pose.position[1] + vision.minimap_bounds[1]) / image.shape[0] == pytest.approx(932 / 1494, abs=0.003)
     assert pose.heading[1] > 0.9
 
 

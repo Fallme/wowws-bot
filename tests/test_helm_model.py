@@ -49,6 +49,33 @@ def test_game_scale_changes_forecast_travel_distance():
     assert (game.predicted_endpoint[0] - 250/499) / (real.predicted_endpoint[0] - 250/499) == pytest.approx(5.22)
 
 
+def test_simulated_endpoint_stops_at_land_instead_of_tunneling_through():
+    land = [{"points": [[.30, 0], [.33, 0], [.33, 1], [.30, 1]]}]
+    plan = Vision.plan_kinematic_rudder(
+        (400, 400), PlayerPose((100, 200), (1, 0)), (380, 200), land,
+        speed_scale=20, map_span_km=5, rudder_shift_seconds=10000,
+        turning_radius_km=1000, horizon_seconds=30,
+    )
+    assert plan.all_paths_blocked
+    assert plan.avoidance_required
+    assert plan.predicted_endpoint[0] <= .305
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_nonfinite_motion_cannot_produce_a_safe_forecast(value):
+    assert Vision.plan_kinematic_rudder((400, 400), PlayerPose((200, 200), (1, 0)),
+                                       (350, 200), [], observed_speed_km_s=value) is None
+
+
+def test_no_clear_path_uses_low_speed_and_does_not_claim_safety():
+    command = SecondaryMovementController().plan(SecondaryMovementInput(
+        elapsed=60, health=1, visible_target=False, kinematic_rudder=-1, kinematic_avoidance_required=True,
+        kinematic_all_paths_blocked=True, kinematic_collision_time_seconds=10))
+    assert command.mode == MovementMode.AVOID_ISLAND
+    assert command.throttle == .25
+    assert "未找到满足净空" in command.reason
+
+
 def test_map_span_changes_physical_distance():
     bot = BattleBot(1, {'strategy': {'map_span_km': 42}}, vision=Vision(), gamepad=object())
     assert bot._minimap_pixels_to_km(np.zeros((420,420,3)), 42) == pytest.approx(4.2)
