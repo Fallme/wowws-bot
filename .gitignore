@@ -11,6 +11,7 @@ env/
 
 # Logs & snapshots
 *.log
+!tests/fixtures/wgc_cold_start_20261012.log
 snapshots/
 debug/
 data/

@@ -78,7 +78,7 @@ def _session_matches_process(pid: int, center: Path, line: str) -> bool:
 
 
 def wgc_backend_ready(center: Path, directory: Path) -> bool:
-    """Require initialization and this installation's Ready state in a live session.
+    """Require postload and this installation's Ready state in a live session.
 
     A running process alone is insufficient: the native engine exits while
     WG is still initializing. Old sessions and other games cannot authorize
@@ -113,6 +113,7 @@ def wgc_backend_ready(center: Path, directory: Path) -> bool:
             continue
         seen.add(pid)
         initialized = False
+        postloaded = False
         closed = False
         latest = ""
         try:
@@ -120,6 +121,8 @@ def wgc_backend_ready(center: Path, directory: Path) -> bool:
                 for line in stream:
                     if "GameCenter initialization finished" in line:
                         initialized = True
+                    if "Postload initialization" in line:
+                        postloaded = True
                     if f"Log session {pid} finished" in line:
                         closed = True
                     if "[GameCtl] Game state detected as [" not in line or "] for [" not in line:
@@ -129,7 +132,7 @@ def wgc_backend_ready(center: Path, directory: Path) -> bool:
                         latest = line
         except OSError:
             continue
-        if initialized and not closed and latest:
+        if initialized and postloaded and not closed and latest:
             if ("canStart = true" in latest and "launchForbidden = false" in latest
                     and "condition = Ready(0)" in latest
                     and "running = false" in latest and "processStarting = none" in latest):
@@ -138,12 +141,36 @@ def wgc_backend_ready(center: Path, directory: Path) -> bool:
 
 
 def wait_for_wgc_backend(center: Path, directory: Path, *, timeout: float = 30.0,
-                         should_stop=None) -> bool:
+                         should_stop=None, stable_seconds: float = 2.0) -> bool:
+    """Wait for one live process set to remain ready within the total budget.
+
+    Postload and a settling interval reduce the observed cold-start race; they
+    are not proof that the native SDK handshake will succeed. A failed native
+    retry must still be handled by the caller rather than reported as success.
+    """
     deadline = time.monotonic() + timeout
+    settle_time = max(0.0, float(stable_seconds))
+    stable_since = None
+    stable_pids = frozenset()
     while time.monotonic() < deadline:
         if should_stop is not None and should_stop():
             return False
-        if wgc_backend_ready(center, directory):
-            return True
+        pids = frozenset(running_wgc_process_ids())
+        ready = bool(pids) and wgc_backend_ready(center, directory)
+        # A process may restart while its log is being read. Do not carry the
+        # previous process's settling time over to its replacement.
+        ready = ready and pids == frozenset(running_wgc_process_ids())
+        now = time.monotonic()
+        if should_stop is not None and should_stop():
+            return False
+        if now >= deadline:
+            return False
+        if ready:
+            if stable_since is None or pids != stable_pids:
+                stable_since, stable_pids = now, pids
+            if now - stable_since >= settle_time:
+                return True
+        else:
+            stable_since, stable_pids = None, frozenset()
         time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     return False

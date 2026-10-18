@@ -163,7 +163,7 @@ def test_cold_native_exit_retries_engine_once_without_launcher_command(tmp_path,
     popen = Mock(side_effect=[early, running])
     result = launch_game(client="wgc", popen=popen)
     assert result.started
-    assert "已重试一次" in result.detail
+    assert "已重试1次" in result.detail
     assert popen.call_count == 2
     assert all(call.args[0] == [str(native)] for call in popen.call_args_list)
     assert all(call.kwargs["cwd"] == str(tmp_path.resolve()) for call in popen.call_args_list)

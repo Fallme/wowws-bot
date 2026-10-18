@@ -1,5 +1,10 @@
 # Curated visual regression fixtures
 
+`wgc_cold_start_20261012.log` is a separate nonvisual startup fixture. It retains
+only the session header, target installation Ready state, initialization and
+postload timestamps from the October 12 WG log. The failed retry occurred
+between initialization and postload. It contains no account or login payloads.
+
 These seven frames are copied from the local historical capture archive and
 are the minimum portable set used by the automated regression suite. They
 cover port selection, mode selection, loading, battle HUD, escape menu, and

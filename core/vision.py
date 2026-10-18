@@ -10,7 +10,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.terrain import repair_overlay_gaps
+from core.terrain import exclude_player_land, repair_overlay_gaps
 from core.minimap_geometry import minimap_grid_bounds
 from core.hud_layout import detect_hud_layout
 from core.tactical_geometry import detect_tactical_map_geometry
@@ -83,6 +83,16 @@ class CaptureZone:
     # points are intentionally not selected as an opening destination when a
     # neutral white or hostile red lettered point is available.
     state: str = "unknown"
+
+
+def terrain_value_floor(ocean_value: float) -> int:
+    """Brightness floor that follows the minimap's lighting palette.
+
+    Night maps draw islands barely brighter than the sea, so the historical
+    fixed floor of 125 misses nearly every coastline.  Keep the conservative
+    daytime floor while adapting to dark palettes.
+    """
+    return int(min(125, max(45, float(ocean_value) + 25)))
 
 
 class Vision:
@@ -733,6 +743,10 @@ class Vision:
             # A match's coastline is immutable.  Rasterize the frozen browser
             # layer instead of re-segmenting animated rings, contacts or smoke
             # on every control frame.
+            island_outlines = exclude_player_land(
+                island_outlines,
+                (pose.position[0] / max(width, 1), pose.position[1] / max(height, 1)),
+            )
             terrain = np.zeros((height, width), dtype=np.uint8)
             for outline in island_outlines:
                 points = outline.get("points", []) if isinstance(outline, dict) else []
@@ -755,6 +769,9 @@ class Vision:
         value = hsv[:, :, 2]
         ocean_samples = hue[(saturation > 25) & (value > 25)]
         ocean_hue = float(np.median(ocean_samples)) if ocean_samples.size else 100.0
+        ocean_value = float(np.median(value[(saturation > 25) & (value > 25)])) \
+            if ocean_samples.size else 80.0
+        value_floor = terrain_value_floor(ocean_value)
         hue_delta = np.minimum(
             np.abs(hue - ocean_hue),
             180.0 - np.abs(hue - ocean_hue),
@@ -773,6 +790,7 @@ class Vision:
         )
         colored_land[ui_overlay] = 0
         capture_zone = self.find_nearest_capture_zone(minimap, pose.position)
+        capture_disk = None
         if capture_zone is not None:
             yy, xx = np.indices(colored_land.shape)
             capture_disk = (
@@ -789,7 +807,7 @@ class Vision:
         )
         neutral_bright = cv2.inRange(
             hsv,
-            np.array([0, 0, 125]),
+            np.array([0, 0, value_floor]),
             np.array([180, 145, 255]),
         )
         neutral_bright = cv2.morphologyEx(
@@ -912,6 +930,10 @@ class Vision:
         turn_speed_retention = max(0.0, min(float(turn_speed_retention), 1.0))
 
         terrain = np.zeros((height, width), dtype=np.uint8)
+        island_outlines = exclude_player_land(
+            island_outlines,
+            (pose.position[0] / width, pose.position[1] / height),
+        )
         for outline in island_outlines or ():
             points = (
                 outline.get("points", ())
@@ -1192,6 +1214,9 @@ class Vision:
         value = hsv[:, :, 2]
         ocean_samples = hue[(saturation > 25) & (value > 25)]
         ocean_hue = float(np.median(ocean_samples)) if ocean_samples.size else 100.0
+        ocean_value = float(np.median(value[(saturation > 25) & (value > 25)])) \
+            if ocean_samples.size else 80.0
+        value_floor = terrain_value_floor(ocean_value)
         hue_delta = np.minimum(
             np.abs(hue - ocean_hue),
             180.0 - np.abs(hue - ocean_hue),
@@ -1201,13 +1226,14 @@ class Vision:
             & (saturation > 22)
             & (value > 28)
         ).astype(np.uint8) * 255
-        # Snow maps encode most coastlines as bright, low-saturation shapes.
-        # The old hue-only mask therefore produced no terrain at all.  Keep a
-        # second neutral layer and filter its thin grid/range components below.
+        # Snow/night maps encode most coastlines as low-saturation shapes.
+        # The floor follows the palette: a fixed 125 missed nearly every
+        # island on dark maps.  Grey-blue island fill still stays below 110
+        # saturation while the ocean sits near 200+.
         neutral_terrain = (
             (saturation <= 145)
-            & (value >= 125)
-            & ((saturation <= 22) | (hue_delta > 16) | (value >= 180))
+            & (value >= value_floor)
+            & ((saturation <= 110) | (hue_delta > 16) | (value >= 180))
         ).astype(np.uint8) * 255
         # Red/green team marks, capture circles and smoke overlays are not
         # coastlines.  Remove them before connected-component extraction.

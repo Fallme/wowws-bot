@@ -314,15 +314,24 @@ def configure_logging():
     )
 
 
-def wait_for_game_window(timeout: float = 60.0, poll_interval: float = 1.0, should_stop=None):
+def wait_for_game_window(timeout: float = 60.0, poll_interval: float = 1.0, should_stop=None,
+                         launch_process=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if should_stop is not None and should_stop():
             return None
+        code = launch_process.poll() if launch_process is not None else None
+        if isinstance(code, int):
+            logger.error("等待游戏窗口期间，本体已退出(%s)，停止等待", code)
+            return None
         windows = find_game_window()
         if windows:
+            code = launch_process.poll() if launch_process is not None else None
+            if isinstance(code, int):
+                logger.error("发现窗口时，本体已退出(%s)，不接受过期窗口", code)
+                return None
             return windows[0]
-        time.sleep(poll_interval)
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
     return None
 
 
@@ -1561,12 +1570,61 @@ def run_battle(
         control_state = classify_battle_continuity_screen(bot, control_frame)
         if control_state != ScreenState.BATTLE:
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
+            bot._battle_phase_unconfirmed_since = None
             return "resume_state"
         if loading_start_confirmed(bot, control_frame):
             logger.warning("战斗动作互锁：最新画面仍带开始战斗按钮，撤销驾驶并重新分流")
+            bot._battle_phase_unconfirmed_since = None
             return "resume_state"
         if callable(getattr(bot.vision, "read_battle_clock_seconds", None)):
-            if observe_battle_phase(bot, control_frame, control_state) != BattlePhase.ACTIVE:
+            phase = observe_battle_phase(bot, control_frame, control_state)
+            if phase == BattlePhase.UNKNOWN:
+                # A port close-up / hub page can satisfy the broad battle-HUD
+                # anchors while carrying no match clock. Waiting forever keeps
+                # re-entering this same branch. After a bounded observation,
+                # use the verified corner Esc hint (numeric-HUD veto included)
+                # to back out instead of looping.
+                now_monotonic = time.monotonic()
+                since = getattr(bot, "_battle_phase_unconfirmed_since", None)
+                if since is None:
+                    bot._battle_phase_unconfirmed_since = since = now_monotonic
+                wait_seconds = max(8.0, float(
+                    getattr(bot, "strategy", {}).get(
+                        "battle_phase_unconfirmed_escape_seconds", 12.0,
+                    )
+                ))
+                if now_monotonic - since >= wait_seconds:
+                    attempts = int(getattr(bot, "_battle_phase_escape_attempts", 0))
+                    hint = None
+                    if attempts < 3 and not operation_paused(bot):
+                        hint = recovery_escape_hint(
+                            bot, control_frame, ScreenState.UNKNOWN,
+                        )
+                    escape = getattr(bot.gamepad, "escape", None)
+                    if hint is not None and escape is not None:
+                        logger.warning(
+                            "战斗 HUD 已出现但 %.0f 秒无法确认开战，画面带角落 Esc "
+                            "关闭提示；发送 Esc 退回上一页",
+                            now_monotonic - since,
+                        )
+                        escape()
+                        acknowledge_automation_input(bot)
+                        bot._battle_phase_escape_attempts = attempts + 1
+                        bot._battle_phase_unconfirmed_since = None
+                        return "resume_state"
+                    logger.info(
+                        "HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令（Esc %s/3）",
+                        attempts,
+                    )
+                else:
+                    logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
+                return "resume_state"
+            if phase == BattlePhase.ACTIVE:
+                bot._battle_phase_unconfirmed_since = None
+                bot._battle_phase_escape_attempts = 0
+            else:
+                # PREPARING is the legitimate pre-battle countdown.
+                bot._battle_phase_unconfirmed_since = None
                 logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
                 return "resume_state"
         # A run can be restarted while the previous match is still in the
@@ -3468,6 +3526,7 @@ def run():
         reporter.update("launching_game", "正在启动游戏本体，等待后台初始化"
                         if launcher_client == "wgc"
                         else f"正在通过 {launcher_name} 启动战舰世界")
+        launch_started = time.monotonic()
         result = launch_game(client=launcher_client, should_stop=limits.stop_requested)
         if limits.stop_requested():
             reporter.update("stopped", "已按用户要求停止启动")
@@ -3485,7 +3544,16 @@ def run():
                         if result.method == "wgc_direct"
                         else f"正在通过 {launcher_name} 启动战舰世界")
         launch_timeout = float(os.environ.get("WOWS_GAME_LAUNCH_TIMEOUT", "300"))
-        window = wait_for_game_window(timeout=launch_timeout, should_stop=limits.stop_requested)
+        remaining = max(0.0, launch_timeout - (time.monotonic() - launch_started))
+        window = wait_for_game_window(timeout=remaining, should_stop=limits.stop_requested,
+                                      launch_process=getattr(result, "process", None))
+        if window is None and not limits.stop_requested():
+            process = getattr(result, "process", None)
+            code = process.poll() if process is not None else None
+            if isinstance(code, int):
+                reporter.update("failed", f"游戏本体已退出({code})，未进入游戏窗口",
+                                error="game_process_exited")
+                return 1
     if limits.stop_requested():
         reporter.update("stopped", "已按用户要求停止启动")
         return 0

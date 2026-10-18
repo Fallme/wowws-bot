@@ -101,6 +101,31 @@ def test_weak_green_line_and_white_triangle_do_not_prove_safe_torpedo_hud():
     assert not inspect_torpedo_hud(before, before, (500, 300)).safe_to_fire
 
 
+def test_centered_target_without_white_band_proves_alignment_on_two_fresh_frames(policy):
+    # The game tints the white lead band green where it overlaps the loaded
+    # fan, so an aligned shot can have no detectable lead_point at all.
+    policy.states = [hud(lead=None, aim=(509, 305)),
+                     hud(lead=None, aim=(509, 305)),
+                     hud(loaded=False, cooldown=90)]
+    run(policy)
+    policy.bot.gamepad.fire_torpedo.assert_called_once()
+    policy.bot.gamepad.aim_relative.assert_not_called()
+
+
+def test_offset_target_without_white_band_does_not_fire(policy):
+    policy.states = [hud(lead=None, aim=(560, 305), reticle=(560, 300)),
+                     hud(lead=None, aim=(560, 305), reticle=(560, 300))]
+    run(policy)
+    policy.bot.gamepad.fire_torpedo.assert_not_called()
+
+
+def test_centered_target_cannot_replace_a_visible_but_unaligned_lead(policy):
+    policy.states = [hud(aligned=False, lead=(560, 305), aim=(509, 305)),
+                     hud(aligned=False, lead=(560, 305), aim=(509, 305))]
+    run(policy)
+    policy.bot.gamepad.fire_torpedo.assert_not_called()
+
+
 def test_unaligned_hud_requires_relative_aim_and_two_fresh_aligned_frames(policy):
     policy.states = [hud(aligned=False, aim=(490, 305), lead=(580, 305)),
                      hud(), hud(), hud(loaded=False, cooldown=90)]

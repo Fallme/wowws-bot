@@ -1,6 +1,7 @@
 """Recognize explicit Esc-to-close hints in the two upper game-window corners."""
 
 import logging
+import math
 import re
 import unicodedata
 
@@ -66,12 +67,15 @@ def escape_close_hint(image, backend) -> tuple[int, int] | None:
     if top_height < 1:
         return None
     candidates = set()
+    corner_candidates = set()
     for start, end in ((0, int(width * .26)), (int(width * .72), width)):
         crop = image[:top_height, start:end]
         if crop.size == 0:
             return None
         try:
-            tokens = _tokens_in_crop(backend.recognize(crop), end - start, top_height)
+            tokens = _tokens_in_crop(
+                backend.recognize(crop), end - start, top_height,
+            )
         except Exception:
             logger.debug("顶部 Esc 关闭提示 OCR 暂不可用", exc_info=True)
             return None
@@ -85,7 +89,43 @@ def escape_close_hint(image, backend) -> tuple[int, int] | None:
             nearby = [token for token in tokens if _adjacent(key, token)]
             if any(word in token[0] for token in nearby for word in _FORBIDDEN_WORDS):
                 continue
-            closes = [key] if remainder in _CLOSE_WORDS else [token for token in nearby if token[0] in _CLOSE_WORDS]
+            if remainder in _CLOSE_WORDS:
+                closes = [key]
+            else:
+                closes = [token for token in nearby if token[0] in _CLOSE_WORDS]
+                # The stock close badge is a painted Esc keycap plus a ×
+                # glyph that OCR often misses. The keycap sits at the far
+                # right of the top bar (0.84–0.97 of the width on different
+                # pages), so accept a lone ESC there and at the far left;
+                # anything closer to the middle stays unverified.
+                _, x1, y1, x2, y2 = key
+                in_outer_corner = (
+                    start + x2 >= width * .84 or start + x1 <= width * .08
+                ) and (y1 + y2) / 2 <= top_height * .55
+                if in_outer_corner:
+                    corner_candidates.add((
+                        round(start + (x1 + x2) / 2), round((y1 + y2) / 2),
+                    ))
             for close in closes:
                 candidates.add((round(start + (close[1] + close[3]) / 2), round((close[2] + close[4]) / 2)))
-    return next(iter(candidates)) if len(candidates) == 1 else None
+    points = list(candidates or corner_candidates)
+    if not points:
+        return None
+    # Key and × can both answer for the same badge; nearby centers count as
+    # one close action, while separated centers remain ambiguous evidence.
+    threshold = max(24, width * .02)
+    clusters = []
+    for point in points:
+        for cluster in clusters:
+            if any(math.dist(point, other) <= threshold for other in cluster):
+                cluster.append(point)
+                break
+        else:
+            clusters.append([point])
+    if len(clusters) != 1:
+        return None
+    cluster = clusters[0]
+    return (
+        round(sum(point[0] for point in cluster) / len(cluster)),
+        round(sum(point[1] for point in cluster) / len(cluster)),
+    )

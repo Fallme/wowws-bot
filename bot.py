@@ -3,6 +3,8 @@
 import json
 import logging
 import math
+import os
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -44,6 +46,60 @@ logger = logging.getLogger("bot")
 DEFAULT_DEBUG_ROOT = (
     Path("E:/aimemo/docs/screenshots/wows_driving_trials")
 )
+DEFAULT_KEEP_DEBUG_RUNS = 200
+DEBUG_MIN_FREE_BYTES = 5 * 1024 ** 3
+
+
+def debug_retention_limit() -> int:
+    try:
+        value = int(os.environ.get("WOWS_DEBUG_KEEP_RUNS", DEFAULT_KEEP_DEBUG_RUNS))
+    except (TypeError, ValueError):
+        return DEFAULT_KEEP_DEBUG_RUNS
+    return max(0, value)
+
+
+def prune_debug_runs(root: Path, keep: int) -> int:
+    """Delete the oldest completed run directories beyond a retention cap.
+
+    Each run can hold dozens of full-resolution frames (~50 MB), and an
+    unbounded history filled the disk during a live session.  Only directories
+    with completed.json are removed; pending or in-progress evidence stays.
+    """
+    if keep <= 0:
+        return 0
+    try:
+        runs = [
+            entry for entry in Path(root).iterdir()
+            if entry.is_dir() and entry.name != "pending"
+            and (entry / "completed.json").exists()
+        ]
+    except OSError:
+        return 0
+    if len(runs) <= keep:
+        return 0
+    runs.sort(key=lambda entry: entry.stat().st_mtime)
+    removed = 0
+    for entry in runs[: len(runs) - keep]:
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    if removed:
+        logger.info(
+            "诊断截图保留最近 %s 局，已清理最旧 %s 局 (%s)",
+            keep, removed, root,
+        )
+    return removed
+
+
+def report_debug_disk_budget(path: Path) -> None:
+    try:
+        free = shutil.disk_usage(Path(path)).free
+    except OSError:
+        return
+    if free < DEBUG_MIN_FREE_BYTES:
+        logger.warning(
+            "诊断截图磁盘余量不足: 剩余 %.1fGB (%s)；建议清理旧 run 目录",
+            free / 1024 ** 3, path,
+        )
 
 
 @dataclass
@@ -387,6 +443,7 @@ class BattleBot:
         # fresh player-arrow samples agree that the waypoint was reached.
         self._autopilot_arrival_samples = deque(maxlen=3)
         self._autopilot_zero_speed_since: float | None = None
+        self._autopilot_stall_since: float | None = None
         # Set on the first control frame after the M-map click.  The game can
         # spend several seconds spawning the ship and rendering its minimap;
         # low speed during that hand-off is not a native-route failure.
@@ -449,6 +506,7 @@ class BattleBot:
         self._last_ocr_at = 0.0
         self._ocr_failures = 0
         self._debug_dir = DEFAULT_DEBUG_ROOT / "pending"
+        report_debug_disk_budget(DEFAULT_DEBUG_ROOT)
         self.events = EventBus()
         self._event_recorder = None
         self._round_log_handler: logging.Handler | None = None
@@ -563,6 +621,7 @@ class BattleBot:
         self._autopilot_hud_absent_since = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._autopilot_stall_since = None
         self._native_autopilot_started_at = None
         self._native_spawn_position = None
         self._island_samples.clear()
@@ -959,6 +1018,7 @@ class BattleBot:
         self._autopilot_hud_absent_since = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._autopilot_stall_since = None
         self._native_autopilot_started_at = None
         self.last_movement_command = None
         self.last_movement_reason = (
@@ -1002,6 +1062,8 @@ class BattleBot:
             encoding="utf-8",
         )
         self._round_diagnostics_completed = True
+        prune_debug_runs(self._debug_dir.parent, debug_retention_limit())
+        report_debug_disk_budget(self._debug_dir.parent)
         return self._debug_dir
 
     def enable_generic_center_route(self, reason: str = ""):
@@ -1015,6 +1077,7 @@ class BattleBot:
         self.opening_autopilot_target_normalized = None
         self._autopilot_arrival_samples.clear()
         self._autopilot_zero_speed_since = None
+        self._autopilot_stall_since = None
         self._autopilot_hud_absent_since = None
         self._native_autopilot_started_at = None
         self.generic_center_route_active = True
@@ -1036,6 +1099,7 @@ class BattleBot:
         self._native_autopilot_confirmed = False
         self.generic_center_route_active = False
         self._autopilot_zero_speed_since = None
+        self._autopilot_stall_since = None
         self._autopilot_hud_absent_since = None
         self.autopilot_retry_pending = True
         # The game's green route indicator can remain visible after a manual
@@ -2453,6 +2517,12 @@ class BattleBot:
             self._recovery_waiting_for_pose = True
             self.stuck_recovery.reverse_until = None
             reason = "倒船完成，停车并清除旧航路，等待新船位重新规划"
+        if recovery.phase == "reverse_clear" and self.stuck_recovery.recovery_loops:
+            forced_side = self.stuck_recovery.forced_turn(time.monotonic())
+            reason += (
+                f"；检测到重复脱困位置（第 {self.stuck_recovery.recovery_loops} 次），"
+                f"倒船后强制向{'右' if forced_side > 0 else '左'}换向"
+            )
         self._record_applied_helm(0.0, time.monotonic())
         self.last_movement_command = None
         self.last_movement_reason = reason
@@ -2575,17 +2645,32 @@ class BattleBot:
                     if throttle_only is not None:
                         throttle_only(0.5)
                         self.movement._contact_slowdown = True
-            if self.native_route_watchdog.stalled(
+            stalled = self.native_route_watchdog.stalled(
                 now, analysis.minimap_player_normalized, analysis.speed_knots,
                 cached=analysis.player_pose_cached,
                 grace=route_age < float(self.strategy.get("autopilot_start_grace_seconds", 30.0)),
                 timeout=float(self.strategy.get("autopilot_confirmed_stall_seconds", 20.0)),
                 low_speed=float(self.strategy.get("autopilot_stall_speed_knots", 1.5)),
-            ):
+            )
+            if stalled:
+                if self._autopilot_stall_since is None:
+                    self._autopilot_stall_since = now
+                elif now - self._autopilot_stall_since >= max(4.0, float(
+                        self.strategy.get("autopilot_stall_takeover_seconds", 10.0))):
+                    # The green autopilot indicator can stay visible while the
+                    # ship is pinned against terrain or the game stopped the
+                    # route.  Waiting forever forfeits the whole battle.
+                    self.request_autopilot_retry(
+                        "原生自动航行持续无位移，切换小地图闭环驾驶接管"
+                    )
+                    return
                 self.last_movement_command = None
-                self.last_movement_reason = "原生自动航行暂时无位移，保留航线等待；禁止Q/E及倒船接管"
+                self.last_movement_reason = (
+                    "原生自动航行暂时无位移，倒计时后切换闭环驾驶"
+                )
                 self._last_movement_mode = "autopilot_route"
                 return
+            self._autopilot_stall_since = None
             self.last_movement_command = None
             self.last_movement_reason = "游戏自动航行中；等待确认接敌后仅调速，禁止Q/E、避山及脱困接管"
             if self.movement._contact_slowdown:
@@ -2718,6 +2803,17 @@ class BattleBot:
         if recovery is not None:
             self._apply_recovery(recovery, now)
             return
+
+        forced_turn = self.stuck_recovery.forced_turn(now)
+        if forced_turn and not analysis.kinematic_avoidance_required:
+            command = replace(
+                command,
+                rudder=float(forced_turn),
+                reason=(
+                    f"{command.reason}；同一位置重复脱困，"
+                    f"强制向{'右' if forced_turn > 0 else '左'}换向"
+                ),
+            )
 
         if self.intervention.poll(self.gamepad, time.monotonic()):
             self.mark_manual_pause()
@@ -3334,6 +3430,7 @@ class BattleBot:
                 self.strategy.get("torpedo_alignment_timeout_seconds", 30.0),
             )))
             previous_aligned = None
+            previous_centered_at = None
             locked = False
             previous_error = None
             worsening = 0
@@ -3374,12 +3471,34 @@ class BattleBot:
                         or not status.loaded_arc or (status.cooldown_seconds or 0) > 0):
                     cancel_reason = "weapon_not_ready"
                     return
-                if status.safe_to_fire:
+                # The game draws the white lead band inside the translucent
+                # green launch fan, which tints it green. The white detector
+                # then cannot see the band exactly when the shot is aligned.
+                # Two consecutive fresh frames that hold the target under the
+                # reticle with a loaded, bearing-available launcher are the
+                # same alignment proof the band would have supplied.
+                centered_tolerance = max(10, analysis.width * .008)
+                centered_proof = (
+                    status.lead_point is None
+                    and status.weapon_is_torpedo is True and status.selected
+                    and status.loaded_arc and status.bearing_available is True
+                    and not (status.cooldown_seconds or 0) > 0
+                    and status.aim_point is not None
+                    and status.reticle_point is not None
+                    and abs(target[0] - status.reticle_point[0]) <= centered_tolerance
+                )
+                if status.safe_to_fire or centered_proof:
                     previous_error = None
                     worsening = 0
-                    if previous_aligned is not None and math.dist(
-                        previous_aligned.lead_point, status.lead_point,
-                    ) <= max(18, analysis.width * .02):
+                    if status.safe_to_fire:
+                        stable = (previous_aligned is not None and math.dist(
+                            previous_aligned.lead_point, status.lead_point,
+                        ) <= max(18, analysis.width * .02))
+                    else:
+                        stable = (previous_centered_at is not None
+                                  and abs(previous_centered_at - target[0])
+                                  <= centered_tolerance)
+                    if stable:
                         if self._torpedo_paused():
                             cancel_reason = "intervention"
                             return
@@ -3400,7 +3519,9 @@ class BattleBot:
                             lead_point=status.lead_point, aim_point=status.aim_point,
                             alignment_error_px=status.alignment_error_px,
                         )
-                        logger.info("鱼雷对齐复核后发射已派发：距离 %.1fkm，偏差 %.1fpx", distance, status.alignment_error_px)
+                        logger.info("鱼雷对齐复核后发射已派发：距离 %.1fkm，%s", distance,
+                                    "准星锁定目标" if status.alignment_error_px is None
+                                    else f"偏差 {status.alignment_error_px:.1f}px")
                         time.sleep(.2)
                         after = self._torpedo_frame(size)
                         last_frame = after
@@ -3422,10 +3543,12 @@ class BattleBot:
                             else:
                                 logger.info("鱼雷发射输入已派发，装填反馈未确认；等待下次 HUD 复核")
                         return
-                    previous_aligned = status
+                    previous_aligned = status if status.safe_to_fire else None
+                    previous_centered_at = None if status.safe_to_fire else target[0]
                     time.sleep(.18)
                     continue
                 previous_aligned = None
+                previous_centered_at = None
                 if moves >= 8:
                     cancel_reason = "alignment_step_limit"
                     break

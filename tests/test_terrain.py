@@ -3,7 +3,14 @@ from collections import deque
 import cv2
 import numpy as np
 
-from core.terrain import confirm_terrain, extend_template, rasterize, repair_overlay_gaps
+from core.terrain import (
+    confirm_terrain,
+    exclude_player_land,
+    extend_template,
+    player_land_depth,
+    rasterize,
+    repair_overlay_gaps,
+)
 from core.vision import PlayerPose, Vision
 from strategy.island_route import IslandRoutePlanner
 
@@ -114,3 +121,36 @@ def test_island_route_planner_snaps_a_coarse_objective_to_nearby_water():
     assert waypoint is not None
     assert not (.38 * 320 <= waypoint[0] <= .62 * 320
                 and .25 * 320 <= waypoint[1] <= .75 * 320)
+
+
+def test_land_outline_enclosing_the_live_player_is_rejected():
+    false_island = rectangle(.3, .5, .7, .9)
+
+    assert player_land_depth(false_island, (.5, .77)) > .02
+    assert exclude_player_land([false_island], (.5, .77)) == []
+    # A marker beside the coast, or a ship near the shoreline, stays valid.
+    assert exclude_player_land([false_island], (.9, .2)) == [false_island]
+    assert exclude_player_land([false_island], (.305, .77)) == [false_island]
+
+
+def test_route_planner_recovers_from_a_false_island_around_the_spawn():
+    false_island = rectangle(.3, .5, .7, .9)
+    planner = IslandRoutePlanner()
+
+    waypoint = planner.waypoint(
+        (400, 400), (200, 308), (100, 280), [false_island],
+        clearance_ratio=.01,
+    )
+
+    assert waypoint is not None
+
+
+def test_dark_minimap_grey_islands_survive_the_adaptive_value_floor():
+    image = np.zeros((400, 400, 3), np.uint8)
+    image[:, :] = (45, 10, 5)  # dark blue sea; V stays far below the old 125
+    cv2.rectangle(image, (120, 120), (220, 190), (100, 100, 100), -1)
+    cv2.rectangle(image, (260, 240), (300, 300), (85, 85, 85), -1)
+
+    outlines = Vision().find_minimap_island_outlines(image)
+
+    assert len(outlines) >= 2

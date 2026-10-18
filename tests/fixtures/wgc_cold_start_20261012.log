@@ -1,0 +1,4 @@
+ INFO  | 20156 | 12 12:39:33.026 | Starting log session 30600 at 2026-10-12, Time Zone = GMT+0800
+ INFO  | 20156 | 12 12:39:34.586 | [GameCtl] Game state detected as [canStart = true, launchForbidden = false, running = false, processStarting = none, condition = Ready(0), error = n/a, updatesAccessStatus = 0] for [WOWS.WW.PRODUCTION | 909148281 | E:\Games\World_of_Warships]
+ INFO  | 20156 | 12 12:39:34.710 | GameCenter initialization finished
+ INFO  | 20156 | 12 12:39:35.273 | Postload initialization

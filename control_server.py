@@ -33,7 +33,7 @@ logger = logging.getLogger("control")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "control_panel.db"
+DB_PATH = Path(os.environ.get("WOWS_CONTROL_DB", DATA_DIR / "control_panel.db"))
 STATE_PATH = DATA_DIR / "runtime_state.json"
 STOP_PATH = DATA_DIR / "stop.request"
 PAUSE_PATH = DATA_DIR / "pause.request"
@@ -501,6 +501,26 @@ class ControlStore:
                 """UPDATE runs SET duration_seconds = MAX(0, ended_at - started_at)
                    WHERE duration_seconds = 0 AND ended_at IS NOT NULL"""
             )
+            # The saved settlement ledger is authoritative for the round count.
+            # A crashed or resumed runner used to leave completed_rounds below
+            # the rows actually recorded, so the dashboard showed too few 局.
+            self.connection.execute(
+                """UPDATE runs SET completed_rounds =
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id)
+                   WHERE completed_rounds <
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id)"""
+            )
+            # Poll replays inflated the AUTOINCREMENT counters far past the
+            # real row count; reset them to the highest live id.
+            for table in ("battle_history", "resource_entries"):
+                self.connection.execute(
+                    f"""UPDATE sqlite_sequence
+                        SET seq = (SELECT COALESCE(MAX(id), 0) FROM {table})
+                        WHERE name = '{table}'
+                          AND seq > (SELECT COALESCE(MAX(id), 0) FROM {table})"""
+                )
 
     def close(self):
         with self.lock:
@@ -601,8 +621,14 @@ class ControlStore:
 
     def finish_run(self, run_id, status, *, error=""):
         with self.lock, self.connection:
+            # The recorded settlement count is authoritative. A crashed or
+            # resumed runner can report fewer rounds than its own ledger.
             self.connection.execute(
-                "UPDATE runs SET status = ?, ended_at = ?, last_error = ? WHERE id = ?",
+                """UPDATE runs SET status = ?, ended_at = ?, last_error = ?,
+                   completed_rounds = MAX(completed_rounds,
+                     (SELECT COUNT(*) FROM battle_history h
+                      WHERE h.run_id = runs.id))
+                   WHERE id = ?""",
                 (status, time.time(), str(error or "")[:500], run_id),
             )
 
@@ -641,19 +667,26 @@ class ControlStore:
                 logger.info("快速战斗不写入收益: run=%s round=%s", run_id, round_no)
                 return None
             existing = self.connection.execute(
-                """SELECT id FROM resource_entries
+                """SELECT id, credits, ship_xp, commander_xp, coal, steel,
+                          doubloons, free_xp, elite_xp
+                   FROM resource_entries
                    WHERE run_id = ? AND round_no = ? AND source = 'auto_result_ocr'
                    LIMIT 1""",
                 (run_id, round_no),
             ).fetchone()
             if existing:
-                self.connection.execute(
-                    """UPDATE resource_entries SET
-                       credits=?, ship_xp=?, commander_xp=?, coal=?, steel=?,
-                       doubloons=?, free_xp=?, elite_xp=?, created_at=?
-                       WHERE id=?""",
-                    (*amounts, time.time(), existing["id"]),
-                )
+                current = [existing[name] for name in RESOURCES]
+                if current != amounts:
+                    self.connection.execute(
+                        """UPDATE resource_entries SET
+                           credits=?, ship_xp=?, commander_xp=?, coal=?, steel=?,
+                           doubloons=?, free_xp=?, elite_xp=?
+                           WHERE id=?""",
+                        (*amounts, existing["id"]),
+                    )
+                # created_at marks the first observation of this settlement;
+                # the control panel replays the whole ledger on every poll and
+                # must not rewrite history timestamps.
                 return existing["id"]
             cursor = self.connection.execute(
                 """INSERT INTO resource_entries
@@ -702,20 +735,44 @@ class ControlStore:
             if run and bool(run["quick_battle"]):
                 logger.info("快速战斗不写入胜负/收益历史: run=%s round=%s", run_id, round_no)
                 return None
-            self.connection.execute(
+            # The control panel replays the complete reward ledger on every
+            # poll.  A UPSERT would bump the AUTOINCREMENT sequence and rewrite
+            # created_at on each replay (the sequence had grown past 400k for a
+            # few hundred rows).  Update only real changes instead.
+            existing = self.connection.execute(
+                """SELECT id, outcome, credits, ship_xp, free_xp,
+                          rewards_recognized
+                   FROM battle_history
+                   WHERE run_id = ? AND round_no = ?""",
+                (run_id, round_no),
+            ).fetchone()
+            if existing is not None:
+                merged_outcome = (
+                    existing["outcome"] if outcome == "unknown" else outcome
+                )
+                current = (
+                    existing["credits"], existing["ship_xp"], existing["free_xp"],
+                )
+                recognized = 1 if rewards_recognized else 0
+                if (
+                    merged_outcome == existing["outcome"]
+                    and current == amounts
+                    and recognized == existing["rewards_recognized"]
+                ):
+                    return existing["id"]
+                self.connection.execute(
+                    """UPDATE battle_history SET
+                       outcome=?, credits=?, ship_xp=?, free_xp=?,
+                       rewards_recognized=?
+                       WHERE id=?""",
+                    (merged_outcome, *amounts, recognized, existing["id"]),
+                )
+                return existing["id"]
+            cursor = self.connection.execute(
                 """INSERT INTO battle_history
                    (run_id, round_no, outcome, credits, ship_xp, free_xp,
                     rewards_recognized, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(run_id, round_no) DO UPDATE SET
-                     outcome=CASE WHEN excluded.outcome = 'unknown'
-                                  THEN battle_history.outcome
-                                  ELSE excluded.outcome END,
-                     credits=excluded.credits,
-                     ship_xp=excluded.ship_xp,
-                     free_xp=excluded.free_xp,
-                     rewards_recognized=excluded.rewards_recognized,
-                     created_at=excluded.created_at""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     round_no,
@@ -725,12 +782,7 @@ class ControlStore:
                     time.time(),
                 ),
             )
-            row = self.connection.execute(
-                """SELECT id FROM battle_history
-                   WHERE run_id = ? AND round_no = ?""",
-                (run_id, round_no),
-            ).fetchone()
-            return row["id"] if row else None
+            return cursor.lastrowid
 
     def dashboard(self):
         with self.lock:

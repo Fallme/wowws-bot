@@ -4,11 +4,58 @@ Templates are local to a battle. Never load another map's coastlines without
 an independently verified map identity and viewport transform.
 """
 
+import math
+
 import cv2
 import numpy as np
 
 
 SIZE = 512
+
+
+def player_land_depth(outline, player):
+    """Return how deep a normalized point lies inside a normalized outline."""
+    points = np.asarray(outline.get("points", ()), dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] != 2:
+        return 0.0
+    if not np.all(np.isfinite(points)):
+        return 0.0
+    depth = cv2.pointPolygonTest(
+        np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 1, 2),
+        (float(player[0]), float(player[1])),
+        True,
+    )
+    return max(0.0, float(depth))
+
+
+def exclude_player_land(outlines, player, *, minimum_depth=0.022, minimum_area=0.002):
+    """Drop large outlines that put the live player marker deep inside land.
+
+    A ship arrow can never sit inland.  A coastline that encloses it by more
+    than a ship margin is UI (own marker, ally labels, rings) misread as
+    terrain.  Keeping that polygon froze IslandRoutePlanner into a permanent
+    navigation block around the spawn.
+
+    The thresholds stay conservative: a small polygon around a mislocated
+    arrow means the arrow itself is suspect, and navigation must keep refusing
+    to carve a passage through that real coastline.
+    """
+    if not outlines or player is None:
+        return outlines
+    try:
+        x, y = float(player[0]), float(player[1])
+    except (TypeError, ValueError, IndexError):
+        return outlines
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return outlines
+    kept = []
+    for item in outlines:
+        depth = player_land_depth(item, (x, y))
+        area = float(item.get("area", 0.0) or 0.0)
+        if depth > minimum_depth and area >= minimum_area:
+            continue
+        kept.append(item)
+    return kept
 
 
 def rasterize(outlines, size=SIZE):

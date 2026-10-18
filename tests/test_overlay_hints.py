@@ -51,21 +51,34 @@ def test_adjacent_forbidden_text_vetoes_even_an_esc_cross_pair(phrase):
     assert escape_close_hint(image(), backend) is None
 
 
-@pytest.mark.parametrize("cue", [[token("ESC")], [token("×")], [token("Close")]])
-def test_key_or_close_semantics_alone_are_insufficient(cue):
+@pytest.mark.parametrize("cue", [[token("×")], [token("Close")]])
+def test_close_semantics_alone_are_insufficient(cue):
     backend = Mock(recognize=Mock(side_effect=[cue, []]))
     assert escape_close_hint(image(), backend) is None
 
 
-@pytest.mark.parametrize("close", [token("×", x=180, width=10), token("×", x=45, y=80, width=10)])
+def test_lone_corner_esc_keycap_authorizes_the_stock_close_badge():
+    # The in-game browser/news pages paint just an "ESC" keycap beside an
+    # unreadable × glyph in the extreme top-right corner.
+    backend = Mock(recognize=Mock(side_effect=[[], [token("ESC", x=348, y=12, width=40, height=22)]]))
+    assert escape_close_hint(image(), backend) == (1520, 23)
+
+
+def test_lone_esc_away_from_the_corner_stays_unverified():
+    backend = Mock(recognize=Mock(side_effect=[[token("ESC", x=200, y=10, width=40, height=18)], []]))
+    assert escape_close_hint(image(), backend) is None
+
+
+@pytest.mark.parametrize("close", [token("×", x=380, width=10), token("×", x=245, y=80, width=10)])
 def test_close_glyph_must_be_adjacent_and_on_the_same_line(close):
-    backend = Mock(recognize=Mock(side_effect=[[token("ESC"), close], []]))
+    backend = Mock(recognize=Mock(side_effect=[[token("ESC", x=200), close], []]))
     assert escape_close_hint(image(), backend) is None
 
 
 @pytest.mark.parametrize("key_confidence,close_confidence", [(.74, .99), (.99, .74), (float("nan"), .99)])
 def test_low_or_invalid_confidence_is_rejected(key_confidence, close_confidence):
-    cue = [token("ESC", confidence=key_confidence), token("×", x=45, width=10, confidence=close_confidence)]
+    cue = [token("ESC", x=200, confidence=key_confidence),
+           token("×", x=245, width=10, confidence=close_confidence)]
     backend = Mock(recognize=Mock(side_effect=[cue, []]))
     assert escape_close_hint(image(), backend) is None
 

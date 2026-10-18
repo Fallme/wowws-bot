@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import logging
 from pathlib import Path
 import re
 import subprocess
+import time
 import winreg
 import xml.etree.ElementTree as ET
 
@@ -45,6 +46,7 @@ class LaunchResult:
     detail: str
     game_directory: str = ""
     launcher_path: str = ""
+    process: object | None = field(default=None, repr=False, compare=False)
 
 
 def normalize_launch_client(value: str | None) -> str:
@@ -314,16 +316,25 @@ def find_wgc_direct_game_executable(game_directory: Path) -> Path | None:
     return resolve_wgc_version(game_directory).executable
 
 
-def _early_process_exit(process) -> int | None:
+def _early_process_exit(process, *, timeout: float = 4.0) -> int | None:
     """Catch the WG SDK's immediate restart request, before a window exists."""
     wait = getattr(process, "wait", None)
     if not callable(wait):
         return None
     try:
-        code = wait(timeout=4)
+        code = wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         return None
     return code if isinstance(code, int) else None
+
+
+def _wait_launch_delay(seconds: float, *, deadline: float, should_stop=None) -> bool:
+    end = min(time.monotonic() + seconds, deadline)
+    while time.monotonic() < end:
+        if should_stop is not None and should_stop():
+            return False
+        time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+    return (should_stop is None or not should_stop()) and time.monotonic() < deadline
 
 
 def wait_for_wgc_ready(directory: Path, *, timeout: float = 30.0, should_stop=None) -> bool:
@@ -413,37 +424,52 @@ def launch_game(
         if should_stop is not None and should_stop():
             return LaunchResult(False, "wgc_direct", "已按用户要求停止启动", str(directory))
         retry_detail = ""
+        # One bounded recovery budget; both backend settling and retry delays
+        # count toward it. Never keep spawning while an engine is still alive.
+        deadline = time.monotonic() + 45.0
         try:
             # Mirror WG's native command and keep the user's shared profile,
             # graphics/UI settings and selected realm at the installation root.
             options = {"cwd": str(directory),
                        "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-            process = popen(command, **options)
-            code = _early_process_exit(process)
-            if code is not None:
-                # Cold WG SDK initialization can start its background service
-                # and exit the engine. Retry that same engine once; never
-                # invoke a launcher command or wait for a launcher button.
+            process = None
+            for attempt in range(1, 4):
+                if should_stop is not None and should_stop():
+                    return LaunchResult(False, "wgc_direct", "已按用户要求停止启动", str(directory))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return LaunchResult(False, "wgc_direct",
+                                        f"{selection.detail}；游戏冷启动恢复超过45秒，已停止重试", str(directory))
+                logger.info("直接启动游戏本体，第%s/3次: %s", attempt, native)
+                process = popen(command, **options)
+                code = _early_process_exit(process, timeout=min(4.0, remaining))
+                if code is None:
+                    break
+                # -1 is the observed cold WG SDK exit. A settled backend can
+                # still require another handshake, so allow one delayed retry.
+                # Other repeated failure codes are not retryable.
+                if attempt == 3 or (attempt > 1 and code not in (-1, 0, 0xFFFFFFFF)):
+                    return LaunchResult(False, "wgc_direct",
+                                        f"{selection.detail}；游戏本体连续提前退出({code})，已停止重试",
+                                        str(directory))
                 logger.info("游戏本体提前退出(%s)，等待 WG 后台初始化完成后重试本体: %s", code, native)
-                ready = wait_for_wgc_ready(directory, should_stop=should_stop)
+                wait_budget = max(0.0, min(30.0, deadline - time.monotonic()))
+                ready = wait_for_wgc_ready(directory, timeout=wait_budget, should_stop=should_stop)
                 if should_stop is not None and should_stop():
                     return LaunchResult(False, "wgc_direct", "已按用户要求停止启动", str(directory))
                 if not ready:
                     return LaunchResult(False, "wgc_direct",
-                                        f"{selection.detail}；本体提前退出({code})，WG 后台在30秒内未就绪，未重复启动",
+                                        f"{selection.detail}；本体提前退出({code})，WG 后台未完成后续加载或未稳定就绪，已停止重试",
                                         str(directory))
-                retry_detail = f"；本体提前退出({code})，WG 后台就绪后已重试一次"
+                if attempt > 1 and not _wait_launch_delay(3.0, deadline=deadline, should_stop=should_stop):
+                    detail = "已按用户要求停止启动" if should_stop and should_stop() else "游戏冷启动恢复超过45秒，已停止重试"
+                    return LaunchResult(False, "wgc_direct", detail, str(directory))
+                retry_detail = f"；本体提前退出({code})，WG 后台稳定后已重试{attempt}次"
                 logger.info("WG 后台已就绪，直接重试游戏本体: %s", native)
-                process = popen(command, **options)
-                code = _early_process_exit(process)
-                if code is not None:
-                    return LaunchResult(False, "wgc_direct",
-                                        f"{selection.detail}；游戏本体连续提前退出({code})，已停止重试",
-                                        str(directory))
         except OSError as error:
             return LaunchResult(False, "wgc_direct", f"无法直接启动游戏本体: {error}", str(directory))
         remember_launch_client(selected)
-        return LaunchResult(True, "wgc_direct", f"{selection.detail}{retry_detail}；已直接启动游戏本体: {native}；等待真实游戏窗口", str(directory))
+        return LaunchResult(True, "wgc_direct", f"{selection.detail}{retry_detail}；已直接启动游戏本体: {native}；等待真实游戏窗口", str(directory), process=process)
 
     steam = find_steam_executable()
     if steam is not None:

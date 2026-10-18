@@ -149,3 +149,52 @@ def test_low_throttle_or_missing_speed_cannot_create_false_low_speed_stall():
             )
             is None
         )
+
+
+def test_same_spot_recovery_forces_the_opposite_turn():
+    controller = StuckRecoveryController(
+        reverse_seconds=3,
+        cooldown_seconds=2,
+        escape_turn_seconds=6,
+    )
+    position = (0.5, 0.6)
+    controller.begin_reverse(10.0, escape_rudder=1.0)
+    assert controller.update(13.0, position, 1.0).phase == "replan"
+    assert controller.recovery_loops == 0
+    assert controller.forced_turn(13.0) == 0
+
+    controller.update(19.0, (0.5004, 0.6), 1.0)
+    controller.begin_reverse(20.0, escape_rudder=1.0)
+
+    assert controller.recovery_loops == 1
+    assert controller.forced_turn(20.0) == -1
+    assert controller.forced_turn(26.5) == 0
+
+
+def test_recovery_at_a_new_position_does_not_force_a_turn():
+    controller = StuckRecoveryController(
+        reverse_seconds=3,
+        cooldown_seconds=2,
+        escape_turn_seconds=6,
+    )
+    controller.begin_reverse(10.0, escape_rudder=1.0)
+    assert controller.update(13.0, (0.5, 0.6), 1.0).phase == "replan"
+    controller.update(19.0, (0.6, 0.6), 1.0)
+
+    controller.begin_reverse(20.0, escape_rudder=1.0)
+
+    assert controller.recovery_loops == 0
+    assert controller.forced_turn(20.0) == 0
+
+
+def test_reset_clears_the_forced_turn_state():
+    controller = StuckRecoveryController(reverse_seconds=3, escape_turn_seconds=6)
+    controller.begin_reverse(10.0, escape_rudder=1.0)
+    controller.update(13.0, (0.5, 0.6), 1.0)
+    controller.begin_reverse(20.0, escape_rudder=1.0)
+    assert controller.forced_turn(20.0) != 0
+
+    controller.reset()
+
+    assert controller.recovery_loops == 0
+    assert controller.forced_turn(20.0) == 0

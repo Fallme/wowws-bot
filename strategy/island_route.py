@@ -8,7 +8,7 @@ from pathfinding.core.diagonal_movement import DiagonalMovement
 from pathfinding.core.grid import Grid
 from pathfinding.finder.a_star import AStarFinder
 
-from core.terrain import rasterize
+from core.terrain import exclude_player_land, rasterize
 
 
 class IslandRoutePlanner:
@@ -73,6 +73,12 @@ class IslandRoutePlanner:
         coords = np.array([player, target], dtype=float) / [width, height]
         if not np.all(np.isfinite(coords)) or np.any(coords < 0) or np.any(coords >= 1):
             return None
+        if not islands:
+            self.reset()
+            return target
+        islands = exclude_player_land(
+            islands, (player[0] / width, player[1] / height),
+        )
         if not islands:
             self.reset()
             return target

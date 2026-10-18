@@ -1,4 +1,5 @@
 """September 21: live battle mistaken for loading/port blocks all driving."""
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -69,3 +70,72 @@ def test_port_recovery_requires_both_numeric_anchors(monkeypatch, clock, health)
     monkeypatch.setattr(vision, "read_battle_clock_seconds", lambda *_: clock)
     monkeypatch.setattr(vision, "read_health_fraction", lambda *_: health)
     assert not vision.has_numeric_battle_hud(image, object())
+
+
+def unconfirmed_battle_bot():
+    return SimpleNamespace(
+        hwnd=1,
+        vision=SimpleNamespace(
+            grab=lambda *args, **kwargs: np.zeros((90, 160, 3), np.uint8),
+            read_battle_clock_seconds=lambda *_: None,
+        ),
+        distance_reader=SimpleNamespace(
+            backend=SimpleNamespace(recognize=lambda _: []),
+        ),
+        gamepad=SimpleNamespace(escape=Mock()),
+        intervention=None,
+        strategy={},
+        _battle_phase_unconfirmed_since=None,
+        _battle_phase_escape_attempts=0,
+    )
+
+
+@pytest.fixture
+def unconfirmed_battle_environment(monkeypatch):
+    monkeypatch.setattr(main, "ensure_bound_game_foreground", lambda bot: True)
+    monkeypatch.setattr(main, "normalize_tactical_map_overlay", lambda bot: True)
+    monkeypatch.setattr(
+        main, "classify_battle_continuity_screen",
+        lambda bot, image: ScreenState.BATTLE,
+    )
+    monkeypatch.setattr(main, "loading_start_confirmed", lambda bot, image: False)
+    monkeypatch.setattr(main, "acknowledge_automation_input", lambda bot: None)
+
+
+def test_unconfirmed_battle_with_corner_hint_escapes_after_timeout(
+    monkeypatch, unconfirmed_battle_environment,
+):
+    bot = unconfirmed_battle_bot()
+    bot._battle_phase_unconfirmed_since = time.monotonic() - 30
+    monkeypatch.setattr(main, "observe_battle_phase", lambda *args: BattlePhase.UNKNOWN)
+    monkeypatch.setattr(main, "recovery_escape_hint", lambda *args: (100, 20))
+
+    assert main.run_battle(bot) == "resume_state"
+    bot.gamepad.escape.assert_called_once()
+    assert bot._battle_phase_escape_attempts == 1
+
+
+def test_unconfirmed_battle_without_verified_hint_never_escapes(
+    monkeypatch, unconfirmed_battle_environment,
+):
+    bot = unconfirmed_battle_bot()
+    bot._battle_phase_unconfirmed_since = time.monotonic() - 30
+    monkeypatch.setattr(main, "observe_battle_phase", lambda *args: BattlePhase.UNKNOWN)
+    monkeypatch.setattr(main, "recovery_escape_hint", lambda *args: None)
+
+    assert main.run_battle(bot) == "resume_state"
+    bot.gamepad.escape.assert_not_called()
+    assert bot._battle_phase_escape_attempts == 0
+
+
+def test_legitimate_preparation_countdown_never_escapes(
+    monkeypatch, unconfirmed_battle_environment,
+):
+    bot = unconfirmed_battle_bot()
+    bot._battle_phase_unconfirmed_since = time.monotonic() - 30
+    monkeypatch.setattr(main, "observe_battle_phase", lambda *args: BattlePhase.PREPARING)
+    monkeypatch.setattr(main, "recovery_escape_hint", lambda *args: (100, 20))
+
+    assert main.run_battle(bot) == "resume_state"
+    bot.gamepad.escape.assert_not_called()
+    assert bot._battle_phase_unconfirmed_since is None

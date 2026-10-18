@@ -90,7 +90,7 @@ def test_arrival_and_failure_establish_control_once_and_disable_native_rearm():
     assert controls.takeovers == 2
 
 
-def test_confirmed_native_route_cannot_be_interrupted_by_stall():
+def test_confirmed_native_route_survives_the_startup_grace_and_stall_timeout():
     bot, controls = make_bot()
     bot.enable_opening_autopilot("test")
     bot._native_autopilot_confirmed = True
@@ -105,3 +105,21 @@ def test_confirmed_native_route_cannot_be_interrupted_by_stall():
     assert controls.reversals == 0
     assert not bot.autopilot_retry_pending
     assert bot.opening_autopilot_active
+
+
+def test_persistent_confirmed_native_stall_hands_off_to_generic_steering():
+    bot, controls = make_bot()
+    bot.enable_opening_autopilot("test")
+    bot._native_autopilot_confirmed = True
+    analysis = BattleAnalysis(image=None, width=1000, height=1000,
+                              speed_knots=0, player_position=(400, 400),
+                              minimap_player_normalized=(.4, .4))
+
+    for t in range(90):
+        bot._execute_rules(analysis, float(t))
+        if not bot.opening_autopilot_active:
+            break
+
+    assert not bot.opening_autopilot_active
+    assert controls.takeovers >= 1
+    assert bot.native_autopilot_abandoned
