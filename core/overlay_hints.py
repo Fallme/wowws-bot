@@ -5,6 +5,7 @@ import math
 import re
 import unicodedata
 
+import cv2
 import numpy as np
 
 
@@ -49,6 +50,80 @@ def _adjacent(key, other):
         and abs((y1 + y2 - oy1 - oy2) / 2) <= max(y2 - y1, oy2 - oy1) * .6
     )
     return same_line and gap <= (x2 - x1) * 3
+
+
+def port_subpage_title(image, backend) -> str | None:
+    """Identify known port subpages before their artwork acquires battle control.
+
+    A painted keycap is only a cheap OCR prefilter. A back link and a known
+    page title must both be read; Esc authorization remains with the separate
+    ``escape_close_hint`` and live numeric-HUD veto.
+    """
+    if (backend is None or not callable(getattr(backend, "recognize", None))
+            or not isinstance(image, np.ndarray) or image.ndim != 3
+            or image.shape[2] != 3 or image.size == 0):
+        return None
+    height, width = image.shape[:2]
+    badge = image[:round(height * .07), round(width * .82):]
+    if badge.size == 0:
+        return None
+    hsv = cv2.cvtColor(badge, cv2.COLOR_BGR2HSV)
+    pale = np.uint8((hsv[:, :, 1] < 65) & (hsv[:, :, 2] > 165)) * 255
+    _, _, components, _ = cv2.connectedComponentsWithStats(pale)
+    if not any(
+        8 <= w <= width * .06 and 6 <= h <= height * .05
+        and 1.25 <= w / h <= 3.8 and area / (w * h) >= .52
+        and y + h / 2 <= height * .055
+        for _, y, w, h, area in components[1:]
+    ):
+        return None
+    try:
+        left = image[:round(height * .10), :round(width * .26)]
+        left_text = "".join(token[0] for token in _tokens_in_crop(
+            backend.recognize(left), left.shape[1], left.shape[0],
+        ))
+        port_back = any(word in left_text for word in (
+            "返回港口", "回到港口", "backtoport", "returntoport",
+        ))
+        if port_back:
+            right = image[:round(height * .18), round(width * .72):]
+            right_text = "".join(token[0] for token in _tokens_in_crop(
+                backend.recognize(right), right.shape[1], right.shape[0],
+            ))
+            if any(word in right_text for word in ("补给箱", "補給箱", "containers")):
+                return "补给箱"
+        if not port_back and not any(word in left_text for word in ("返回", "back")):
+            return None
+        heading = image[:round(height * .12), round(width * .35):round(width * .65)]
+        heading_text = "".join(token[0] for token in _tokens_in_crop(
+            backend.recognize(heading), heading.shape[1], heading.shape[0],
+        ))
+        if any(word in heading_text for word in ("经济加成", "經濟加成", "economicbonuses")):
+            return "经济加成"
+        # Shop artwork changes often. Read persistent shell controls rather
+        # than product names or prices, which must never become actions.
+        shop = image[:round(height * .12), round(width * .38):round(width * .86)]
+        shop_text = "".join(token[0] for token in _tokens_in_crop(
+            backend.recognize(shop), shop.shape[1], shop.shape[0],
+        ))
+        search = any(word in shop_text for word in (
+            "按名称搜索", "按名稱搜尋", "按名稱搜索", "searchbyname",
+        ))
+        commerce = any(word in shop_text for word in (
+            "优惠券", "優惠券", "coupons", "购买达布隆", "購買達布隆",
+            "buydoubloons", "purchasedoubloons", "钱包", "錢包", "wallet",
+        ))
+        if search and commerce:
+            return "商店"
+        return None
+    except Exception:
+        logger.debug("港口子页面返回链接/标题 OCR 暂不可用", exc_info=True)
+        return None
+
+
+def is_port_container_page(image, backend) -> bool:
+    """Compatibility predicate for the positively identified container page."""
+    return port_subpage_title(image, backend) == "补给箱"
 
 
 def escape_close_hint(image, backend) -> tuple[int, int] | None:

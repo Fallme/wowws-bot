@@ -12,7 +12,12 @@ class HealthLossTracker:
         self.samples.clear()
 
     def observe(self, health, now):
-        if health is None or not math.isfinite(health) or not 0 < health <= 1:
+        # A missed OCR frame is not a recovery. Keep the last independent
+        # readings for their bounded freshness window so one unreadable frame
+        # cannot repeatedly erase a real damage streak.
+        if health is None or not math.isfinite(health):
+            return
+        if not 0 < health <= 1:
             self.reset()
             return
         if self.samples:
@@ -46,9 +51,10 @@ class HealthLossTracker:
             and samples[-1][1] <= samples[-2][1] + 0.0005
         )
 
-    def sustained_loss(self, now, *, minimum_loss=0.003, window_seconds=24.0):
+    def sustained_loss(self, now, *, minimum_loss=0.003, window_seconds=8.0,
+                       minimum_seconds=2.0):
         samples = self._recent_samples(now, window_seconds)
-        if len(samples) < 4:
+        if len(samples) < 3:
             return False
         decreases = [
             current_time
@@ -57,7 +63,8 @@ class HealthLossTracker:
             if previous_health - current_health >= 0.0005 - 1e-9
         ]
         return (
-            len(decreases) >= 3
+            len(decreases) >= 2
+            and samples[-1][0] - samples[0][0] >= minimum_seconds
             and now - decreases[-1] <= 8
             and samples[0][1] - samples[-1][1] >= minimum_loss - 1e-9
         )

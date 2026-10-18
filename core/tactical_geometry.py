@@ -109,7 +109,42 @@ def _intersection(horizontal, vertical):
     return x, horizontal[0] * x + horizontal[1]
 
 
-def _measure_tactical_map_geometry(image):
+def _supported_row_groups(horizontal, vertical, height, scale):
+    """Use a measured column family to discard unrelated short row edges.
+
+    Snow textures and HUD text can exceed the row-search budget even when
+    all eleven real columns are visible. A bounded column fit supplies their
+    shared horizontal extent; it does not authorize a grid or a click. Every
+    resulting row group still needs the normal two-axis/border verification.
+    """
+    columns = _cluster([
+        (slope, intercept, slope * height / 2 + intercept, lower, upper)
+        for slope, intercept, lower, upper in vertical
+    ], 2)
+    columns = [model for model in columns if sum(
+        row[3] - 3 <= model[2] <= row[4] + 3 for row in horizontal
+    ) >= 8]
+    if not 8 <= len(columns) <= MAX_AXIS_MODELS:
+        return []
+    if columns[-1][2] - columns[0][2] < scale * .30:
+        return []
+    groups, seen = [], set()
+    for _, selected, matches in _axes(columns, scale * .30, scale * 1.10):
+        expected = np.linspace(selected[0][0], selected[-1][0], 11)
+        coherent = matches & (abs(np.asarray([item[0] for item in selected]) - expected) <= .017)
+        if coherent.sum() < 8:
+            continue
+        left, right = selected[0][2], selected[-1][2]
+        rows = [model for model in horizontal
+                if min(model[4], right) - max(model[3], left) >= (right - left) * .45]
+        signature = tuple(rows)
+        if 8 <= len(rows) <= MAX_AXIS_MODELS and signature not in seen:
+            groups.append(rows)
+            seen.add(signature)
+    return groups
+
+
+def _measure_tactical_map_geometry(image, *, minimum_line_ratio=.15):
     """Return a measured large 10x10 grid, never a guessed central crop.
 
     Both axes need at least eight repeated lines including the outer borders.
@@ -130,7 +165,7 @@ def _measure_tactical_map_geometry(image):
         edges = cv2.Canny(gray, 18, 54)
         raw = cv2.HoughLinesP(edges, 1, np.pi / 720,
                               threshold=max(25, round(scale * .035)),
-                              minLineLength=max(30, round(scale * .15)),
+                              minLineLength=max(30, round(scale * minimum_line_ratio)),
                               maxLineGap=max(4, round(scale * .025)))
         if raw is None:
             return None
@@ -149,11 +184,15 @@ def _measure_tactical_map_geometry(image):
                 intercept = x1 - slope * y1
                 vertical.append((slope, intercept, min(y1, y2), max(y1, y2)))
         horizontal = _cluster(horizontal, 2)
-        if not 8 <= len(horizontal) <= MAX_AXIS_MODELS or len(vertical) < 8:
+        if len(horizontal) < 8 or len(vertical) < 8:
             return None
+        row_groups = ([horizontal] if len(horizontal) <= MAX_AXIS_MODELS else
+                      _supported_row_groups(horizontal, vertical, small_height, scale))
+        row_axes = [candidate for group in row_groups
+                    for candidate in _axes(group, scale * .30, scale * 1.10, perspective=True)]
+        row_axes.sort(key=lambda item: item[0], reverse=True)
         best = None
-        for row_score, rows, row_matches in _axes(horizontal, scale * .30, scale * 1.10,
-                                                perspective=True):
+        for row_score, rows, row_matches in row_axes[:12]:
             top, bottom = rows[0][2], rows[-1][2]
             grid_height = bottom - top
             middle = (top + bottom) / 2
@@ -233,7 +272,15 @@ def _measure_tactical_map_geometry(image):
                         len(supported_rows), int(coherent_columns.sum()),
                     )
                     best = score, geometry
-        return None if best is None else best[1]
+        if best is not None:
+            return best[1]
+        if (minimum_line_ratio == .15 and len(horizontal) > MAX_AXIS_MODELS
+                and row_groups):
+            # Only a measured repeated column family can justify this one
+            # extra pass. Longer segments remove snow/HUD fragments; every
+            # geometric and complete-border gate above remains mandatory.
+            return _measure_tactical_map_geometry(image, minimum_line_ratio=.25)
+        return None
     except (cv2.error, ValueError, ZeroDivisionError):
         return None
 

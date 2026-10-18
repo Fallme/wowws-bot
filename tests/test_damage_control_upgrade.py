@@ -25,7 +25,7 @@ def make_bot(**strategy):
 def analysis(health=.9, **flags):
     return BattleAnalysis(
         image=None, width=2560, height=1494, health=health,
-        health_recognized=True, **flags,
+        health_recognized=True, in_battle=True, **flags,
     )
 
 
@@ -70,8 +70,9 @@ def test_single_ocr_collapse_followed_by_recovery_never_uses_damage_control():
     assert bot.last_damage_control == 0
 
 
-def test_three_real_decreases_with_stable_frames_and_two_percent_total_loss_trigger():
-    bot = make_bot()
+def test_custom_three_real_decreases_with_stable_frames_reach_total_loss_threshold():
+    bot = make_bot(damage_control_sustained_threshold=.02,
+                   damage_control_sustained_window_seconds=24)
     samples = ((100, 1.0), (103, .994), (106, .994), (109, .988), (112, .975))
     for now, health in samples[:-1]:
         observe(bot, health, now)
@@ -80,9 +81,9 @@ def test_three_real_decreases_with_stable_frames_and_two_percent_total_loss_trig
     bot.gamepad.damage_control.assert_called_once()
 
 
-def test_small_repeated_decreases_below_total_damage_threshold_do_not_trigger():
+def test_repeated_decreases_below_total_damage_threshold_do_not_trigger():
     bot = make_bot()
-    for now, health in ((100, 1.0), (103, .998), (106, .996), (109, .994)):
+    for now, health in ((100, 1.0), (101, .9995), (102, .999), (103, .9985)):
         observe(bot, health, now)
     bot.gamepad.damage_control.assert_not_called()
 
@@ -97,21 +98,23 @@ def test_custom_burst_and_sustained_thresholds_are_used_instead_of_defaults():
     burst_bot.gamepad.damage_control.assert_called_once()
 
     sustained_bot = make_bot(damage_control_sustained_threshold=.04)
-    for now, health in ((100, 1.0), (103, .99), (106, .98), (109, .97)):
+    for now, health in ((100, 1.0), (101, .99), (102, .98), (103, .97)):
         observe(sustained_bot, health, now)
     sustained_bot.gamepad.damage_control.assert_not_called()
-    observe(sustained_bot, .95, 112)
+    observe(sustained_bot, .95, 104)
     sustained_bot.gamepad.damage_control.assert_called_once()
 
 
-def test_cooldown_blocks_confirmed_hazards_until_the_configured_interval_expires():
-    bot = make_bot(damage_control_cooldown_seconds=80)
+def test_sent_r_does_not_assume_an_unconfirmed_eighty_second_game_cooldown():
+    bot = make_bot(damage_control_cooldown_seconds=80, damage_control_retry_seconds=3)
     bot.last_damage_control = 100
-    execute(bot, analysis(on_fire=True), 179.9)
+    execute(bot, analysis(on_fire=True), 102.9)
     bot.gamepad.damage_control.assert_not_called()
-    execute(bot, analysis(on_fire=True), 180)
+    execute(bot, analysis(on_fire=True), 103)
     bot.gamepad.damage_control.assert_called_once()
-    assert bot.last_damage_control == 180
+    assert bot.last_damage_control == 103
+    execute(bot, analysis(), 106)
+    assert bot.gamepad.damage_control.call_count == 1
 
 
 def test_remaining_at_low_hp_does_not_repeat_damage_control_after_cooldown():
@@ -135,9 +138,9 @@ def test_failed_input_preserves_timer_and_damage_evidence_and_retries_after_back
         assert list(bot._health_loss_tracker.samples) == original
         execute(bot, analysis(), 103)
         assert bot.gamepad.damage_control.call_count == 1
-        execute(bot, analysis(), 104)
+        execute(bot, analysis(), 105)
         assert bot.gamepad.damage_control.call_count == 2
-        assert bot.last_damage_control == 104
+        assert bot.last_damage_control == 105
         assert not bot._health_loss_tracker.samples
 
 
@@ -185,8 +188,55 @@ def test_analyze_observes_only_fresh_numeric_hp_not_cached_control_ticks():
     with patch.object(tracker, "observe", wraps=tracker.observe) as fresh_observe:
         for tick in range(7):
             bot.tick = tick
-            bot.analyze()
+            with patch("bot.time.monotonic", return_value=100 + tick * .4):
+                bot.analyze()
 
     assert [item.args[0] for item in fresh_observe.call_args_list] == [1.0, .9, None]
-    assert not tracker.samples
+    assert [hp for _, hp in tracker.samples] == [1.0, .9]
     bot.gamepad.damage_control.assert_not_called()
+
+
+def test_two_seconds_of_confirmed_small_losses_try_r_without_waiting_for_two_percent():
+    bot = make_bot()
+    observe(bot, 1.0, 100)
+    observe(bot, .998, 101)
+    bot.gamepad.damage_control.assert_not_called()
+    observe(bot, .996, 102)
+    bot.gamepad.damage_control.assert_called_once()
+
+
+def test_one_missing_ocr_frame_keeps_a_confirmable_large_loss():
+    bot = make_bot()
+    for now, health in ((100, 1.0), (101, .9), (102, None)):
+        bot._health_loss_tracker.observe(health, now)
+        execute(bot, analysis(.9), now)
+    bot.gamepad.damage_control.assert_not_called()
+    observe(bot, .9, 103)
+    bot.gamepad.damage_control.assert_called_once()
+
+
+def test_non_battle_hazard_or_old_damage_never_sends_r():
+    bot = make_bot()
+    for now, hp in ((100, 1.0), (101, .9), (102, .9)):
+        bot._health_loss_tracker.observe(hp, now)
+    snapshot = analysis(on_fire=True)
+    snapshot.in_battle = False
+    execute(bot, snapshot, 102)
+    bot.gamepad.damage_control.assert_not_called()
+
+
+def test_long_aim_fresh_frames_keep_servicing_r_without_repeating_health_ocr():
+    import numpy as np
+
+    bot = make_bot()
+    bot.vision = SimpleNamespace(is_on_fire=lambda _frame: False,
+                                is_flooding=lambda _frame: False)
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    for now, hp in ((100, 1.0), (101, .998), (102, .996)):
+        with patch("bot.time.monotonic", return_value=now):
+            assert bot._check_survival_frame(frame, hp, observed_at=now)
+    bot.gamepad.damage_control.assert_called_once()
+    with patch("bot.time.monotonic", return_value=110):
+        assert not bot._check_survival_frame(frame, .5, observed_at=102)
+        assert not bot._check_survival_frame(frame, 0, observed_at=110)
+    assert bot.gamepad.damage_control.call_count == 1

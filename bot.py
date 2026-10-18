@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -420,8 +421,10 @@ class BattleBot:
         self._cached_health = 1.0
         self._health_ocr_valid = False
         self._health_observed_at = float("-inf")
+        self._last_health_ocr_attempt_at = float("-inf")
         self._health_loss_tracker = HealthLossTracker()
         self._health_reading_trace = None
+        self._pending_health_evidence = deque(maxlen=4)
         self._cached_speed_knots: float | None = None
         self._cached_speed_observed_at = 0.0
         self._last_speed_ocr_attempt_at = float("-inf")
@@ -552,6 +555,7 @@ class BattleBot:
             setter(self.intervention.acknowledge_automation)
 
     def _close_round_diagnostics(self) -> None:
+        self._flush_health_transition_evidence()
         recorder = getattr(self, "_trajectory_recorder", None)
         if recorder is not None:
             recorder.close()
@@ -578,8 +582,8 @@ class BattleBot:
         self._torpedo_restore_attempt_at = float("-inf")
         self._torpedo_trace = None
         self._torpedo_observed_frame = None
-        damage_control_cooldown = float(
-            self.strategy.get("damage_control_cooldown_seconds", 80.0)
+        damage_control_retry = float(
+            self.strategy.get("damage_control_retry_seconds", 3.0)
         )
         other_consumable_cooldown = float(
             self.strategy.get(
@@ -587,7 +591,7 @@ class BattleBot:
                 self.strategy.get("heal_cooldown_seconds", 30.0),
             )
         )
-        self.last_damage_control = now - damage_control_cooldown
+        self.last_damage_control = now - damage_control_retry
         self._last_damage_control_attempt = float("-inf")
         self.last_heal = now - other_consumable_cooldown
         self.heal_used = 0
@@ -602,8 +606,10 @@ class BattleBot:
         self._cached_health = 1.0
         self._health_ocr_valid = False
         self._health_observed_at = float("-inf")
+        self._last_health_ocr_attempt_at = float("-inf")
         self._health_loss_tracker.reset()
         self._health_reading_trace = None
+        self._pending_health_evidence = deque(maxlen=4)
         self._cached_speed_knots = None
         self._cached_speed_observed_at = 0.0
         self._last_speed_ocr_attempt_at = float("-inf")
@@ -1351,6 +1357,9 @@ class BattleBot:
         return desired
 
     def analyze(self) -> BattleAnalysis:
+        flush_health_evidence = getattr(self, "_flush_health_transition_evidence", None)
+        if callable(flush_health_evidence):
+            flush_health_evidence()
         observed_at = time.monotonic()
         try:
             # A stationary ship or tactical-map transition can legitimately
@@ -2029,7 +2038,12 @@ class BattleBot:
 
         health = None
         health_reader = getattr(self.vision, "read_health_fraction", None)
-        if analysis.in_battle and health_reader is not None and self.tick % 3 == 0:
+        health_due = (
+            analysis.in_battle and health_reader is not None
+            and observed_at - self._last_health_ocr_attempt_at >= 1.0
+        )
+        if health_due:
+            self._last_health_ocr_attempt_at = observed_at
             try:
                 health = health_reader(
                     image,
@@ -2044,79 +2058,18 @@ class BattleBot:
             not math.isfinite(float(health)) or not 0.0 <= float(health) <= 1.0
         ):
             health = None
-        if analysis.in_battle and self.tick % 3 == 0:
+        if health_due:
             self._health_loss_tracker.observe(health, observed_at)
         if health is not None:
             health = max(0.0, min(float(health), 1.0))
             if self._health_ocr_valid and abs(health - self._cached_health) >= .08:
-                self._record_health_transition(image, health, observed_at, analysis.hud_layout)
+                self._record_health_transition(
+                    image, health, observed_at, analysis.hud_layout, defer=True,
+                )
             self._cached_health = health
             self._health_ocr_valid = True
             self._health_observed_at = observed_at
-        # Decompose the fire HUD into its two anchors for diagnostics only
-        # when the vision adapter uses the stock detector wholesale;
-        # subclasses that override either hook (tests, custom adapters) must
-        # keep their own semantics.
-        fire_bits = getattr(type(self.vision), "fire_anchor_bits", None)
-        on_fire = getattr(type(self.vision), "is_on_fire", None)
-        stock_bits = getattr(Vision, "fire_anchor_bits", None)
-        stock_fire = getattr(Vision, "is_on_fire", None)
-        if fire_bits is stock_bits and on_fire is stock_fire:
-            dial_anchor, ship_anchor = fire_bits(self.vision, image)
-            self._last_fire_anchors = (bool(dial_anchor), bool(ship_anchor))
-            self._last_fire_status_anchor = bool(
-                self.vision.fire_status_icon_visible(image)
-            )
-        else:
-            # Lightweight adapters may only expose the combined detector.
-            combined = bool(self.vision.is_on_fire(image))
-            self._last_fire_anchors = (combined, combined)
-            self._last_fire_status_anchor = combined
-        # A dial-only orange droplet is not sufficient in live frames: HUD
-        # decorations have repeatedly produced that exact false positive at
-        # full health. Require both independent anchors before spending R.
-        self._fire_samples.append(
-            bool(
-                self._last_fire_status_anchor
-                or all(self._last_fire_anchors)
-            )
-        )
-        analysis.on_fire = (
-            len(self._fire_samples) == self._fire_samples.maxlen
-            and all(self._fire_samples)
-        )
-        flooding_detector = getattr(self.vision, "is_flooding", None)
-        flood_status_detector = getattr(self.vision, "flooding_status_icon_visible", None)
-        self._last_flood_status_anchor = bool(
-            getattr(type(self.vision), "is_flooding", None) is Vision.is_flooding
-            and callable(flood_status_detector)
-            and flood_status_detector(image)
-        )
-        self._flood_status_samples.append(self._last_flood_status_anchor)
-        self._flood_samples.append(
-            bool(flooding_detector is not None and flooding_detector(image))
-        )
-        # A verified damage timer plus its independent ship-status icon can
-        # act after two frames, including before the first HP tick. The older
-        # blue-shape detector still requires four of five frames and HP loss.
-        analysis.flooding = bool(
-            (
-                len(self._flood_status_samples) == self._flood_status_samples.maxlen
-                and all(self._flood_status_samples)
-            )
-            or (
-                len(self._flood_samples) == self._flood_samples.maxlen
-                and sum(self._flood_samples) >= 4
-                and self._health_ocr_valid
-                and 0.0 < self._cached_health < 0.995
-            )
-        )
-        if self._health_ocr_valid and self._cached_health <= 0.0:
-            # Sunk ships can retain orange wreck/HP decoration in the status
-            # ROIs. Death is authoritative and suppresses hazard reporting as
-            # well as every input command.
-            analysis.on_fire = False
-            analysis.flooding = False
+        self._observe_survival_hazards(image, analysis, observed_at)
         if self.tick % 3 == 0:
             self._cached_reload = self.vision.reload_ready(
                 self.vision.find_reload_bar(image)
@@ -2177,32 +2130,64 @@ class BattleBot:
 
         return analysis
 
-    def _record_health_transition(self, image, health, observed_at, layout):
-        """Retain both frames of a large numeric change for OCR diagnosis."""
+    def _record_health_transition(self, image, health, observed_at, layout, *, defer=False):
+        """Snapshot HP evidence now; optionally encode after time-critical input."""
         root = getattr(self, "blockage_diagnostic_root", None)
         if root is None:
             return
         try:
-            trace = getattr(self, "_health_reading_trace", None)
-            if trace is None:
-                trace = self._health_reading_trace = BlockageTrace(
-                    root, "health_reading", maximum=60, context_frames=0,
-                    lossless=True,
-                )
-            details = {
-                "previous_health": self._cached_health, "health": health,
-                "previous_read_age_seconds": round(observed_at - self._health_observed_at, 3),
-                "source": "numeric_hp_change", "hud_layout": layout,
-            }
             previous = self.last_analysis
-            if previous is not None and previous.in_battle:
-                trace.record(previous.image, state=ScreenState.BATTLE,
-                             action="health_change", attempt=self.tick + 1,
-                             phase="before", details={**details, "hud_layout": previous.hud_layout})
-            trace.record(image, state=ScreenState.BATTLE, action="health_change",
-                         attempt=self.tick + 1, phase="after", details=details)
+            before = previous if previous is not None and previous.in_battle else None
+            evidence = {
+                "root": root, "attempt": self.tick + 1,
+                "before_image": None if before is None else before.image,
+                "after_image": image,
+                "before_layout": deepcopy({} if before is None else before.hud_layout),
+                "details": {
+                    "previous_health": self._cached_health, "health": health,
+                    "previous_read_age_seconds": round(observed_at - self._health_observed_at, 3),
+                    "source": "numeric_hp_change", "hud_layout": deepcopy(layout),
+                },
+            }
+            if defer:
+                pending = getattr(self, "_pending_health_evidence", None)
+                if pending is None:
+                    pending = self._pending_health_evidence = deque(maxlen=4)
+                pending.append(evidence)
+            else:
+                BattleBot._write_health_transition_evidence(self, evidence)
         except Exception:
             logger.debug("血量变化诊断暂不可用，继续战斗", exc_info=True)
+
+    def _write_health_transition_evidence(self, evidence):
+        trace = getattr(self, "_health_reading_trace", None)
+        if trace is None:
+            trace = self._health_reading_trace = BlockageTrace(
+                evidence["root"], "health_reading", maximum=60, context_frames=0,
+                lossless=True,
+            )
+        details = evidence["details"]
+        if evidence["before_image"] is not None:
+            trace.record(
+                evidence["before_image"], state=ScreenState.BATTLE,
+                action="health_change", attempt=evidence["attempt"], phase="before",
+                details={**details, "hud_layout": evidence["before_layout"]},
+            )
+        trace.record(
+            evidence["after_image"], state=ScreenState.BATTLE,
+            action="health_change", attempt=evidence["attempt"], phase="after",
+            details=details,
+        )
+
+    def _flush_health_transition_evidence(self):
+        """Write only queued images; never re-observe HP or emit game input."""
+        pending = getattr(self, "_pending_health_evidence", None)
+        while pending:
+            evidence = pending.popleft()
+            try:
+                BattleBot._write_health_transition_evidence(self, evidence)
+            except Exception:
+                logger.debug("延后写入血量变化诊断失败，继续战斗", exc_info=True)
 
     def _stable_island_risk(self):
         """Accept three matching terrain observations from the latest five."""
@@ -2436,6 +2421,7 @@ class BattleBot:
             self._torpedo_acquisition_last_sample = None
         self._health_loss_tracker.reset()
         self._health_observed_at = float("-inf")
+        self._last_health_ocr_attempt_at = float("-inf")
         self._fire_samples.clear()
         self._flood_samples.clear()
         self._flood_status_samples.clear()
@@ -2865,56 +2851,119 @@ class BattleBot:
         # Resume automatic selection only when launcher readiness, target
         # motion, firing arc and post-launch HUD feedback are available.
 
+    def _observe_survival_hazards(self, image, analysis, observed_at):
+        previous_at = getattr(self, "_survival_last_frame_at", float("-inf"))
+        if not analysis.in_battle or observed_at - previous_at > 8.0:
+            self._fire_samples.clear()
+            self._flood_samples.clear()
+            self._flood_status_samples.clear()
+        self._survival_last_frame_at = observed_at
+        if not analysis.in_battle:
+            return
+        # Decompose the fire HUD into its two anchors for diagnostics only
+        # when the vision adapter uses the stock detector wholesale;
+        # subclasses that override either hook (tests, custom adapters) must
+        # keep their own semantics.
+        fire_bits = getattr(type(self.vision), "fire_anchor_bits", None)
+        on_fire = getattr(type(self.vision), "is_on_fire", None)
+        stock_bits = getattr(Vision, "fire_anchor_bits", None)
+        stock_fire = getattr(Vision, "is_on_fire", None)
+        if fire_bits is stock_bits and on_fire is stock_fire:
+            dial_anchor, ship_anchor = fire_bits(self.vision, image)
+            self._last_fire_anchors = (bool(dial_anchor), bool(ship_anchor))
+            self._last_fire_status_anchor = bool(
+                self.vision.fire_status_icon_visible(image)
+            )
+        else:
+            # Lightweight adapters may only expose the combined detector.
+            fire_detector = getattr(self.vision, "is_on_fire", None)
+            combined = bool(callable(fire_detector) and fire_detector(image))
+            self._last_fire_anchors = (combined, combined)
+            self._last_fire_status_anchor = combined
+        # A dial-only orange droplet is not sufficient in live frames: HUD
+        # decorations have repeatedly produced that exact false positive at
+        # full health. Require both independent anchors before spending R.
+        self._fire_samples.append(
+            bool(
+                self._last_fire_status_anchor
+                or all(self._last_fire_anchors)
+            )
+        )
+        analysis.on_fire = (
+            len(self._fire_samples) == self._fire_samples.maxlen
+            and all(self._fire_samples)
+        )
+        flooding_detector = getattr(self.vision, "is_flooding", None)
+        flood_status_detector = getattr(self.vision, "flooding_status_icon_visible", None)
+        self._last_flood_status_anchor = bool(
+            getattr(type(self.vision), "is_flooding", None) is Vision.is_flooding
+            and callable(flood_status_detector)
+            and flood_status_detector(image)
+        )
+        self._flood_status_samples.append(self._last_flood_status_anchor)
+        self._flood_samples.append(
+            bool(flooding_detector is not None and flooding_detector(image))
+        )
+        # A verified damage timer plus its independent ship-status icon can
+        # act after two frames, including before the first HP tick. The older
+        # blue-shape detector still requires four of five frames and HP loss.
+        analysis.flooding = bool(
+            (
+                len(self._flood_status_samples) == self._flood_status_samples.maxlen
+                and all(self._flood_status_samples)
+            )
+            or (
+                len(self._flood_samples) == self._flood_samples.maxlen
+                and sum(self._flood_samples) >= 4
+                and self._health_ocr_valid
+                and 0.0 < self._cached_health < 0.995
+            )
+        )
+        if self._health_ocr_valid and self._cached_health <= 0.0:
+            # Sunk ships can retain orange wreck/HP decoration in the status
+            # ROIs. Death is authoritative and suppresses hazard reporting as
+            # well as every input command.
+            analysis.on_fire = False
+            analysis.flooding = False
+
+    def _check_survival_frame(self, frame, health, observed_at=None) -> bool:
+        """Service R from an already classified, fresh live battle capture.
+
+        Long torpedo aiming loops already read HP to prove the ship is alive.
+        Reuse that observation rather than blocking survival for the whole aim
+        or running numeric OCR twice on the same captured frame.
+        """
+        now = time.monotonic()
+        observed_at = now if observed_at is None else observed_at
+        if (not 0 <= now - observed_at <= 4.0 or health is None
+                or not math.isfinite(health) or not 0 < health <= 1):
+            return False
+        if self.intervention.poll(self.gamepad, now):
+            self.mark_manual_pause()
+            return False
+        self._health_loss_tracker.observe(health, observed_at)
+        if self._health_ocr_valid and abs(health - self._cached_health) >= .08:
+            self._record_health_transition(frame, float(health), observed_at, {}, defer=True)
+        self._cached_health = float(health)
+        self._health_ocr_valid = True
+        self._health_observed_at = observed_at
+        self._last_health_ocr_attempt_at = observed_at
+        height, width = frame.shape[:2]
+        analysis = BattleAnalysis(
+            image=frame, width=width, height=height, in_battle=True,
+            health=float(health), health_recognized=True,
+        )
+        self._observe_survival_hazards(frame, analysis, observed_at)
+        return self._execute_damage_control(analysis, now)
+
     def _execute_survival_consumables(
         self, analysis: BattleAnalysis, now: float
     ) -> bool:
         """Dispatch R/T/smoke even while native autopilot owns steering."""
-        damage_control_cooldown = float(
-            self.strategy.get("damage_control_cooldown_seconds", 80.0)
-        )
-        burst_damage = self._health_loss_tracker.burst_loss(
-            now,
-            minimum_loss=float(self.strategy.get("damage_control_burst_threshold", 0.08)),
-            window_seconds=float(self.strategy.get("damage_control_burst_window_seconds", 8.0)),
-        )
-        sustained_damage = self._health_loss_tracker.sustained_loss(
-            now,
-            minimum_loss=float(self.strategy.get("damage_control_sustained_threshold", 0.02)),
-            window_seconds=float(self.strategy.get("damage_control_sustained_window_seconds", 24.0)),
-        )
-        if (
-            (analysis.on_fire or analysis.flooding or burst_damage or sustained_damage)
-            and not (analysis.health_recognized and analysis.health <= 0)
-            and now - self.last_damage_control >= damage_control_cooldown
-            and now - self._last_damage_control_attempt >= 2.0
-            and hasattr(self.gamepad, "damage_control")
-        ):
-            if self.intervention.poll(self.gamepad, time.monotonic()):
-                self.mark_manual_pause()
-                return False
-            self._last_damage_control_attempt = now
-            try:
-                dispatched = self.gamepad.damage_control()
-            except (RuntimeError, OSError):
-                logger.warning("R 损管输入未完成，保留受损证据，稍后重新尝试", exc_info=True)
-                return False
-            if dispatched is False:
-                logger.warning("R 损管输入未发送，保留受损证据，稍后重新尝试")
-                return False
-            self.last_damage_control = max(now, time.monotonic())
-            self._health_loss_tracker.reset()
-            logger.info(
-                "检测到%s，尝试 R 损害管制",
-                "着火/漏水"
-                if analysis.on_fire and analysis.flooding
-                else "着火"
-                if analysis.on_fire
-                else "漏水"
-                if analysis.flooding
-                else "短时间大幅掉血（新鲜血量复核通过）"
-                if burst_damage
-                else "持续掉血（新鲜血量累计下降达到阈值）",
-            )
+        if not analysis.in_battle or analysis.ended:
+            return True
+        if not self._execute_damage_control(analysis, now):
+            return False
 
         other_cooldown = float(
             self.strategy.get(
@@ -2976,6 +3025,62 @@ class BattleBot:
                 "那不勒斯使用 4 号位烟雾 (HP: %.0f%%)",
                 analysis.health * 100,
             )
+        return True
+
+    def _execute_damage_control(self, analysis, now) -> bool:
+        if (not analysis.in_battle or analysis.ended
+                or (analysis.health_recognized and analysis.health <= 0)):
+            return True
+        # A sent key does not prove that the game activated R. The game owns
+        # its actual cooldown; retry only while fresh damage/hazard evidence
+        # remains, instead of assuming one key press succeeded for 80 seconds.
+        retry_seconds = max(1.0, float(
+            self.strategy.get("damage_control_retry_seconds", 3.0)
+        ))
+        burst_damage = self._health_loss_tracker.burst_loss(
+            now,
+            minimum_loss=float(self.strategy.get("damage_control_burst_threshold", 0.08)),
+            window_seconds=float(self.strategy.get("damage_control_burst_window_seconds", 8.0)),
+        )
+        sustained_damage = self._health_loss_tracker.sustained_loss(
+            now,
+            minimum_loss=float(self.strategy.get("damage_control_sustained_threshold", 0.003)),
+            window_seconds=float(self.strategy.get("damage_control_sustained_window_seconds", 8.0)),
+        )
+        if (
+            (analysis.on_fire or analysis.flooding or burst_damage or sustained_damage)
+            and not (analysis.health_recognized and analysis.health <= 0)
+            and now - self.last_damage_control >= retry_seconds
+            and now - self._last_damage_control_attempt >= retry_seconds
+            and hasattr(self.gamepad, "damage_control")
+        ):
+            if self.intervention.poll(self.gamepad, time.monotonic()):
+                self.mark_manual_pause()
+                return False
+            self._last_damage_control_attempt = now
+            try:
+                dispatched = self.gamepad.damage_control()
+            except (RuntimeError, OSError):
+                logger.warning("R 损管输入未完成，保留受损证据，稍后重新尝试", exc_info=True)
+                return False
+            if dispatched is False:
+                logger.warning("R 损管输入未发送，保留受损证据，稍后重新尝试")
+                return False
+            self.last_damage_control = max(now, time.monotonic())
+            self._health_loss_tracker.reset()
+            logger.info(
+                "检测到%s，尝试 R 损害管制",
+                "着火/漏水"
+                if analysis.on_fire and analysis.flooding
+                else "着火"
+                if analysis.on_fire
+                else "漏水"
+                if analysis.flooding
+                else "短时间大幅掉血（新鲜血量复核通过）"
+                if burst_damage
+                else "持续掉血（新鲜血量累计下降达到阈值）",
+            )
+
         return True
 
     def _engage_visible_enemy(self, analysis: BattleAnalysis, now: float):
@@ -3189,6 +3294,11 @@ class BattleBot:
         self._torpedo_frame_reject_reason = "intervention"
         if self._torpedo_paused():
             return None
+        flush_health = getattr(self, "_flush_health_transition_evidence", None)
+        if callable(flush_health):
+            flush_health()
+        if self._torpedo_paused():
+            return None
         self._torpedo_frame_reject_reason = "capture_failed"
         frame = self.vision.grab(self.hwnd, allow_stale=True)
         self._torpedo_frame_captured_at = time.monotonic()
@@ -3212,6 +3322,11 @@ class BattleBot:
         health = reader(frame, getattr(self.distance_reader, "backend", None))
         if health is None or not math.isfinite(health) or not 0 < health <= 1:
             self._torpedo_frame_reject_reason = "alive_health_unconfirmed"
+            return None
+        survival_check = getattr(self, "_check_survival_frame", None)
+        if (callable(survival_check) and survival_check(
+                frame, health, observed_at=self._torpedo_frame_captured_at) is False):
+            self._torpedo_frame_reject_reason = "survival_input_cancelled"
             return None
         if self._torpedo_paused():
             self._torpedo_frame_reject_reason = "intervention"
@@ -3386,6 +3501,25 @@ class BattleBot:
         before = None
         last_frame = None
         fired = False
+        # Lossless PNG encoding can consume the remaining input freshness of
+        # an otherwise valid HUD frame. Encode a previous observation before
+        # capturing the next one, or after the final fire/restore inputs.
+        diagnostic_frames = []
+
+        def record(frame, phase, **details):
+            diagnostic_frames.append((frame, phase, details))
+
+        def flush_records():
+            # Survival has already consumed each captured HP observation in
+            # _torpedo_frame. Re-feeding that same image here would counterfeit
+            # independent hazard samples. Poll takeover before this disk work
+            # and let the next new capture provide the next survival sample.
+            paused = bool(diagnostic_frames) and self._torpedo_paused()
+            for evidence_frame, phase, details in diagnostic_frames:
+                self._record_torpedo_frame(evidence_frame, phase, **details)
+            diagnostic_frames.clear()
+            return not paused
+
         # The asynchronous median triggers a check, never authorizes firing.
         # Start with current range, then compare consecutive current images.
         self._torpedo_fresh_distance = None
@@ -3414,7 +3548,7 @@ class BattleBot:
                 target, distance = observed
                 if index == 0:
                     time.sleep(.15)
-            self._record_torpedo_frame(before, "before", target=target, distance_km=distance)
+            record(before, "before", target=target, distance_km=distance)
             cancel_reason = "intervention"
             if self._torpedo_paused():
                 return
@@ -3430,12 +3564,19 @@ class BattleBot:
                 self.strategy.get("torpedo_alignment_timeout_seconds", 30.0),
             )))
             previous_aligned = None
-            previous_centered_at = None
+            selection_observations = 0
+            selection_confirmed = False
             locked = False
             previous_error = None
             worsening = 0
             moves = 0
             for _ in range(12):
+                # Saving the previous frame here cannot age the input proof
+                # of the next capture, and bounds memory/disk backlog so HP
+                # checks continue throughout a longer aiming attempt.
+                if not flush_records():
+                    cancel_reason = "intervention"
+                    return
                 cancel_reason = "alignment_timeout"
                 if time.monotonic() > deadline:
                     break
@@ -3458,7 +3599,7 @@ class BattleBot:
                 if not self._torpedo_frame_fresh():
                     cancel_reason = "recognition_frame_stale"
                     return
-                self._record_torpedo_frame(
+                record(
                     frame, "observation", target=target, distance_km=distance,
                     selected=status.selected, loaded=status.loaded_arc,
                     bearing_available=getattr(status, "bearing_available", True),
@@ -3467,37 +3608,33 @@ class BattleBot:
                     aligned=status.safe_to_fire,
                     frame_age_seconds=time.monotonic() - self._torpedo_frame_captured_at,
                 )
-                if (status.weapon_is_torpedo is not True or not status.selected
-                        or not status.loaded_arc or (status.cooldown_seconds or 0) > 0):
+                selection_observations += 1
+                if (status.cooldown_seconds or 0) > 0 or status.weapon_is_torpedo is False:
                     cancel_reason = "weapon_not_ready"
                     return
-                # The game draws the white lead band inside the translucent
-                # green launch fan, which tints it green. The white detector
-                # then cannot see the band exactly when the shot is aligned.
-                # Two consecutive fresh frames that hold the target under the
-                # reticle with a loaded, bearing-available launcher are the
-                # same alignment proof the band would have supplied.
+                if (status.weapon_is_torpedo is not True or not status.selected
+                        or not status.loaded_arc):
+                    # Slot selection and the firing fan do not necessarily
+                    # appear in the first image after pressing 3. A bounded
+                    # re-observation permits that transition without treating
+                    # a missing cue as permission to aim or shoot.
+                    previous_aligned = None
+                    if not selection_confirmed and selection_observations < 3:
+                        time.sleep(.18)
+                        continue
+                    cancel_reason = "weapon_not_ready"
+                    return
+                selection_confirmed = True
                 centered_tolerance = max(10, analysis.width * .008)
-                centered_proof = (
-                    status.lead_point is None
-                    and status.weapon_is_torpedo is True and status.selected
-                    and status.loaded_arc and status.bearing_available is True
-                    and not (status.cooldown_seconds or 0) > 0
-                    and status.aim_point is not None
-                    and status.reticle_point is not None
-                    and abs(target[0] - status.reticle_point[0]) <= centered_tolerance
-                )
-                if status.safe_to_fire or centered_proof:
+                # Target-centering alone supplies no torpedo lead. Only the
+                # actual prediction line aligned with the available green
+                # firing fan can establish either consecutive fire proof.
+                if status.safe_to_fire:
                     previous_error = None
                     worsening = 0
-                    if status.safe_to_fire:
-                        stable = (previous_aligned is not None and math.dist(
-                            previous_aligned.lead_point, status.lead_point,
-                        ) <= max(18, analysis.width * .02))
-                    else:
-                        stable = (previous_centered_at is not None
-                                  and abs(previous_centered_at - target[0])
-                                  <= centered_tolerance)
+                    stable = (previous_aligned is not None and math.dist(
+                        previous_aligned.lead_point, status.lead_point,
+                    ) <= max(18, analysis.width * .02))
                     if stable:
                         if self._torpedo_paused():
                             cancel_reason = "intervention"
@@ -3506,7 +3643,7 @@ class BattleBot:
                         if (rect["width"], rect["height"]) != size:
                             cancel_reason = "client_resized"
                             return
-                        self._record_torpedo_frame(frame, "before", aligned=True, firing=True)
+                        record(frame, "before", aligned=True, firing=True)
                         cancel_reason = "fire_input_cancelled"
                         if (not self._torpedo_input_allowed(size, deadline)
                                 or self.gamepad.fire_torpedo() is False):
@@ -3534,7 +3671,7 @@ class BattleBot:
                             if not confirmed:
                                 cooldown = confirm_torpedo_reload(after, status, backend)
                                 confirmed = cooldown is not None and cooldown > 0
-                            self._record_torpedo_frame(
+                            record(
                                 after, "after", fired=True, confirmed=confirmed,
                                 cooldown=cooldown,
                             )
@@ -3543,12 +3680,10 @@ class BattleBot:
                             else:
                                 logger.info("鱼雷发射输入已派发，装填反馈未确认；等待下次 HUD 复核")
                         return
-                    previous_aligned = status if status.safe_to_fire else None
-                    previous_centered_at = None if status.safe_to_fire else target[0]
+                    previous_aligned = status
                     time.sleep(.18)
                     continue
                 previous_aligned = None
-                previous_centered_at = None
                 if moves >= 8:
                     cancel_reason = "alignment_step_limit"
                     break
@@ -3575,10 +3710,10 @@ class BattleBot:
                         cancel_reason = "prediction_or_aim_missing"
                         return
                     error = target[0] - reticle[0]
-                    if abs(error) <= max(15, analysis.width * .04):
+                    if abs(error) <= max(15, analysis.width * .04) and not locked:
                         central = [p for p in self.vision.find_enemies_in_viewport(frame)
                                    if abs(p[0] - reticle[0]) <= analysis.width * .07]
-                        if (locked or len(central) != 1
+                        if (len(central) != 1
                                 or not self._torpedo_input_allowed(size, deadline)):
                             cancel_reason = "target_lock_unconfirmed"
                             return
@@ -3586,6 +3721,12 @@ class BattleBot:
                             return
                         locked = True
                         time.sleep(.2)
+                        continue
+                    if abs(error) <= centered_tolerance:
+                        # X has already been sent for this unique target.
+                        # Let its prediction appear; never fire merely because
+                        # the ship is under the reticle, or toggle X repeatedly.
+                        time.sleep(.18)
                         continue
                 # Bringing a side target into the firing view needs larger
                 # bounded steps; once both axes exist, use fine alignment.
@@ -3618,13 +3759,17 @@ class BattleBot:
             if last_frame is None and getattr(self, "_torpedo_restore_pending", False):
                 last_frame = getattr(self, "_torpedo_observed_frame", None)
             if last_frame is not None:
-                self._record_torpedo_frame(last_frame, "result", fired=fired,
-                                           cancel_reason=None if fired else cancel_reason)
+                record(last_frame, "result", fired=fired,
+                       cancel_reason=None if fired else cancel_reason)
             if not fired and getattr(self, "_torpedo_restore_pending", False):
                 self.events.publish("torpedo.aim_cancelled", reason=cancel_reason,
                                     target_distance_km=distance)
             if getattr(self, "_torpedo_restore_pending", False):
                 self._restore_torpedo_guns()
+            flush_records()
+            flush_health = getattr(self, "_flush_health_transition_evidence", None)
+            if callable(flush_health):
+                flush_health()
 
     def _finish_tick(self, analysis: BattleAnalysis):
         command = self.last_movement_command
@@ -3713,6 +3858,9 @@ class BattleBot:
                 "已确认" if self.movement_verified else "等待",
             )
         self.tick += 1
+        flush_health_evidence = getattr(self, "_flush_health_transition_evidence", None)
+        if callable(flush_health_evidence):
+            flush_health_evidence()
 
     @property
     def current_movement_mode(self) -> str:
@@ -3760,13 +3908,13 @@ class BattleBot:
 
     @property
     def damage_control_ready(self) -> bool:
-        cooldown = float(
-            self.strategy.get("damage_control_cooldown_seconds", 80.0)
-        )
+        retry_seconds = max(1.0, float(
+            self.strategy.get("damage_control_retry_seconds", 3.0)
+        ))
         now = time.monotonic()
         return (
-            now - self.last_damage_control >= cooldown
-            and now - self._last_damage_control_attempt >= 2.0
+            now - self.last_damage_control >= retry_seconds
+            and now - self._last_damage_control_attempt >= retry_seconds
         )
 
     @property

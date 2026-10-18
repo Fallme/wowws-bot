@@ -643,6 +643,7 @@ def test_confirmed_hazard_uses_damage_control_without_waiting_for_hp_drop():
         on_fire=True,
         player_position=(100, 100),
         map_center_bearing=0.0,
+        in_battle=True,
     )
 
     bot._execute_rules(analysis, now)
@@ -651,7 +652,7 @@ def test_confirmed_hazard_uses_damage_control_without_waiting_for_hp_drop():
     assert gamepad.damage_control_uses == 1
 
 
-def test_sustained_damage_fallback_uses_r_once_with_autopilot_and_no_fire_icon():
+def test_new_sustained_damage_retries_r_with_autopilot_and_no_fire_icon():
     gamepad = SurvivalGamepad()
     bot = BattleBot(1, {"strategy": {}}, vision=object(), gamepad=gamepad)
     bot.intervention = SimpleNamespace(poll=lambda *_args: False)
@@ -662,6 +663,7 @@ def test_sustained_damage_fallback_uses_r_once_with_autopilot_and_no_fire_icon()
         bot._health_loss_tracker.observe(hp, now + i * 3)
         analysis = BattleAnalysis(image=None, width=2560, height=1494,
                                   health=hp, health_recognized=True,
+                                  in_battle=True,
                                   autopilot_enabled=True)
         bot._execute_rules(analysis, now + i * 3)
     assert gamepad.damage_control_uses == 1
@@ -669,7 +671,7 @@ def test_sustained_damage_fallback_uses_r_once_with_autopilot_and_no_fire_icon()
     for i, hp in enumerate([.96, .95, .94, .93]):
         bot._health_loss_tracker.observe(hp, now + 12 + i * 3)
         bot._execute_survival_consumables(analysis, now + 12 + i * 3)
-    assert gamepad.damage_control_uses == 1
+    assert gamepad.damage_control_uses == 2
     bot.mark_manual_pause()
     assert not bot._health_loss_tracker.samples
 
@@ -702,6 +704,7 @@ def test_survival_consumables_still_run_while_native_autopilot_owns_steering():
         on_fire=True,
         autopilot_enabled=True,
         player_position=(100, 100),
+        in_battle=True,
     )
 
     bot._execute_rules(analysis, now)
@@ -735,6 +738,7 @@ def test_other_consumables_wait_for_meaningful_damage_then_retry_every_thirty_se
             height=1600,
             health=health,
             health_recognized=True,
+            in_battle=True,
         )
 
     assert bot._execute_survival_consumables(analysis_at(1.0), now)

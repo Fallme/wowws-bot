@@ -3,14 +3,25 @@ import pytest
 from core.survival import HealthLossTracker
 
 
-def test_requires_three_decreases_in_four_fresh_readings():
+def test_two_confirmed_decreases_over_two_seconds_are_sustained_damage():
     tracker = HealthLossTracker()
-    for i, hp in enumerate([1.0, .99, .98]):
-        tracker.observe(hp, i * 3)
-        assert not tracker.sustained_loss(i * 3)
-    tracker.observe(.97, 9)
-    assert tracker.sustained_loss(9)
-    assert not tracker.sustained_loss(18)
+    tracker.observe(1.0, 0)
+    tracker.observe(.998, 1)
+    assert not tracker.sustained_loss(1)
+    tracker.observe(.996, 2)
+    assert tracker.sustained_loss(2)
+    assert not tracker.sustained_loss(11)
+
+
+def test_missing_ocr_does_not_clear_independent_damage_samples_or_extend_freshness():
+    tracker = HealthLossTracker()
+    tracker.observe(1.0, 0)
+    tracker.observe(.998, 1)
+    tracker.observe(None, 2)
+    tracker.observe(.996, 3)
+    assert tracker.sustained_loss(3)
+    tracker.observe(None, 12)
+    assert not tracker.sustained_loss(12)
 
 
 @pytest.mark.parametrize('value', [None, 0, float('nan'), .99, 1.0])

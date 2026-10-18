@@ -83,11 +83,11 @@ pommern:
     capture_arrival_distance_km: 4.5
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
-    damage_control_cooldown_seconds: 80
+    damage_control_retry_seconds: 3 # 仅表示按键尝试间隔，游戏自身判断实际冷却
     damage_control_burst_threshold: 0.08 # 8秒内掉最大血量8%，下一次新鲜读数复核
     damage_control_burst_window_seconds: 8
-    damage_control_sustained_threshold: 0.02 # 24秒内至少3次下降，累计掉最大血量2%
-    damage_control_sustained_window_seconds: 24
+    damage_control_sustained_threshold: 0.003 # 至少2秒、2次独立下降，累计掉最大血量0.3%
+    damage_control_sustained_window_seconds: 8
     heal_threshold: 0.50            # 兼容旧配置
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段
@@ -180,11 +180,11 @@ napoli:
     capture_arrival_distance_km: 4.5
     course_minimum_travel_pixels: 5.0
     post_battle_grace_seconds: 900
-    damage_control_cooldown_seconds: 80
+    damage_control_retry_seconds: 3
     damage_control_burst_threshold: 0.08
     damage_control_burst_window_seconds: 8
-    damage_control_sustained_threshold: 0.02
-    damage_control_sustained_window_seconds: 24
+    damage_control_sustained_threshold: 0.003
+    damage_control_sustained_window_seconds: 8
     heal_threshold: 0.55            # 兼容旧配置
     heal_loss_step: 0.20            # 兼容旧配置；当前受损后按30秒周期尝试其他消耗品
     heal_cooldown_seconds: 30       # 兼容旧字段

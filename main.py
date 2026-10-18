@@ -20,7 +20,7 @@ from core.input import configured_input_backend
 from core.feedback import SafetyFault
 from core.frame_guard import CaptureFault
 from core.blockage_diagnostics import BlockageTrace
-from core.overlay_hints import escape_close_hint
+from core.overlay_hints import escape_close_hint, port_subpage_title
 from core.launcher import launch_game, last_launch_client
 from core.results import BattleRewards, ResultRewardReader
 from core.tactical_geometry import TacticalMapGeometry, detect_tactical_map_geometry
@@ -574,6 +574,13 @@ def classify_runtime_screen(bot, image) -> ScreenState:
     """Classify normal game pages plus OCR-confirmed first-login rewards."""
     state = bot.vision.classify_screen(image)
     backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    if state in {ScreenState.PORT, ScreenState.BATTLE, ScreenState.LOADING,
+                 ScreenState.UNKNOWN, ScreenState.EXIT_CONFIRMATION, ScreenState.RESULTS}:
+        # Port subpage scenery can imitate battle/port ROIs or modal buttons.
+        # Their own back link and title identify a port subpage, which
+        # must be closed before driving, ship selection or battle entry.
+        if port_subpage_title(image, backend) is not None:
+            return ScreenState.UNKNOWN
     # Some loading-tip artwork resembles result buttons. The exact current
     # start-action text is stronger proof that no battle has finished yet.
     if state == ScreenState.RESULTS and loading_start_confirmed(bot, image):
@@ -771,6 +778,8 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
     consecutive = 0
     selector_consecutive = 0
     survey_consecutive = 0
+    subpage_consecutive = 0
+    previous_subpage = None
     backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
     while time.monotonic() < deadline:
         if operation_stopped(bot):
@@ -793,6 +802,23 @@ def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
             time.sleep(2)
             continue
         last_state = classify_runtime_screen(bot, image)
+        subpage = (port_subpage_title(image, backend)
+                   if last_state == ScreenState.UNKNOWN else None)
+        subpage_consecutive = (
+            subpage_consecutive + 1 if subpage and subpage == previous_subpage
+            else 1 if subpage else 0
+        )
+        previous_subpage = subpage
+        if subpage_consecutive >= 2:
+            logger.info("启动恢复：已确认%s页面，按角落 Esc 提示返回港口", subpage)
+            recovered = dismiss_unknown_overlay(bot, attempts=2)
+            subpage_consecutive = 0
+            previous_subpage = None
+            previous_state = ScreenState.UNKNOWN
+            consecutive = 0
+            if recovered == ScreenState.UNKNOWN:
+                time.sleep(2)
+            continue
 
         # The optional post-battle satisfaction survey is neither a result
         # page nor a port.  Exact OCR lets us dismiss only this known dialog;
@@ -1201,6 +1227,12 @@ def reset_opening_autopilot_attempts(bot):
     if getattr(bot, "_opening_autopilot_budget_active", False):
         return
     setattr(bot, "_opening_autopilot_budget_active", True)
+    clear_static_map = getattr(bot, "begin_tactical_map_static_capture", None)
+    if callable(clear_static_map):
+        # This hook runs only for a confirmed new round, before state/pose
+        # checks can abort M setup. A consumed setup budget alone must never
+        # make the previous round's map valid for the new match.
+        clear_static_map()
     setattr(bot, "_tactical_map_attempted_this_battle", False)
     if not getattr(bot, "_opening_autopilot_retry_pending", False):
         setattr(bot, "_tactical_map_attempts_used", 0)
@@ -2323,6 +2355,13 @@ def configure_opening_autopilot(
             setattr(bot, "_tactical_map_left_open", True)
             setattr(bot, "_tactical_map_attempts_used", attempt_number)
             setattr(bot, "_opening_autopilot_pending_target", normalized_target)
+            # Invalidate the previous battle's coastlines as soon as this
+            # battle starts sampling M. Grid measurement can fail for all
+            # three attempts; it must not preserve the old map through the
+            # loading-to-HUD handoff and stop fallback driving in open water.
+            if not static_capture_started and begin_static_capture is not None:
+                begin_static_capture()
+                static_capture_started = True
             time.sleep(0.90)
 
             tactical_static_frames = []
@@ -2386,10 +2425,6 @@ def configure_opening_autopilot(
             local_x, local_y = tactical_map_local_point(
                 width, height, normalized_target, geometry=geometry,
             )
-
-            if not static_capture_started and begin_static_capture is not None:
-                begin_static_capture()
-                static_capture_started = True
 
             if intervention is not None and intervention.poll(bot.gamepad):
                 mark_pause = getattr(bot, "mark_manual_pause", None)

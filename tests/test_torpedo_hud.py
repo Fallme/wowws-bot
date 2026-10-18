@@ -62,6 +62,7 @@ def policy(monkeypatch):
     instance._torpedo_restore_pending = False
     instance._torpedo_trace = None
     instance._record_torpedo_frame = Mock()
+    instance._check_survival_frame = Mock(return_value=True)
     instance.mark_manual_pause = Mock()
     instance.events = SimpleNamespace(publish=Mock())
     context = SimpleNamespace(bot=instance, calls=calls, frames=frames, paused=paused,
@@ -101,14 +102,14 @@ def test_weak_green_line_and_white_triangle_do_not_prove_safe_torpedo_hud():
     assert not inspect_torpedo_hud(before, before, (500, 300)).safe_to_fire
 
 
-def test_centered_target_without_white_band_proves_alignment_on_two_fresh_frames(policy):
-    # The game tints the white lead band green where it overlaps the loaded
-    # fan, so an aligned shot can have no detectable lead_point at all.
+def test_centered_target_without_white_band_does_not_replace_prediction_evidence(policy):
+    # A ship under the reticle is not evidence of the white torpedo lead.
+    # Keep observing after one lock instead of firing from centering alone.
     policy.states = [hud(lead=None, aim=(509, 305)),
-                     hud(lead=None, aim=(509, 305)),
-                     hud(loaded=False, cooldown=90)]
+                     hud(lead=None, aim=(509, 305))]
     run(policy)
-    policy.bot.gamepad.fire_torpedo.assert_called_once()
+    policy.bot.gamepad.fire_torpedo.assert_not_called()
+    policy.bot.gamepad.lock.assert_called_once()
     policy.bot.gamepad.aim_relative.assert_not_called()
 
 
@@ -306,10 +307,11 @@ def test_second_capability_observation_must_also_confirm_weapon(policy):
 
 
 def test_pause_at_final_firing_boundary_blocks_launch_and_restore(policy):
-    def record(_frame, _phase, **details):
-        if details.get("firing"):
-            policy.paused["value"] = True
-    policy.bot._record_torpedo_frame.side_effect = record
+    input_allowed = policy.bot._torpedo_input_allowed
+    def pause_before_input(size, deadline):
+        policy.paused["value"] = True
+        return input_allowed(size, deadline)
+    policy.bot._torpedo_input_allowed = pause_before_input
     run(policy)
     policy.bot.gamepad.torpedo.assert_called_once()
     policy.bot.gamepad.fire_torpedo.assert_not_called()
@@ -318,7 +320,7 @@ def test_pause_at_final_firing_boundary_blocks_launch_and_restore(policy):
     assert policy.bot._last_torpedo_release == 0
 
 
-@pytest.mark.parametrize("slow_step", ["distance", "hud", "final_record"])
+@pytest.mark.parametrize("slow_step", ["distance", "hud", "final_guard"])
 def test_recognition_or_evidence_passing_deadline_cannot_fire(policy, monkeypatch, slow_step):
     clock = {"value": 1000.0}
     monkeypatch.setattr(bot_module.time, "monotonic", lambda: clock["value"])
@@ -342,10 +344,11 @@ def test_recognition_or_evidence_passing_deadline_cannot_fire(policy, monkeypatc
             return status
         policy.inspect.side_effect = inspect
     else:
-        def record(_frame, _phase, **details):
-            if details.get("firing"):
-                clock["value"] = 1015.0
-        policy.bot._record_torpedo_frame.side_effect = record
+        input_allowed = policy.bot._torpedo_input_allowed
+        def slow_final_guard(size, deadline):
+            clock["value"] = 1015.0
+            return input_allowed(size, deadline)
+        policy.bot._torpedo_input_allowed = slow_final_guard
     run(policy)
     policy.bot.gamepad.fire_torpedo.assert_not_called()
     policy.bot.gamepad.main_gun.assert_called_once()
@@ -366,10 +369,11 @@ def test_after_shot_results_frame_cannot_confirm_launch_or_receive_restore_key(p
 
 
 def test_window_resize_at_final_firing_boundary_cancels_launch(policy):
-    def record(_frame, _phase, **details):
-        if details.get("firing"):
-            policy.rect.return_value = {"left": 40, "top": 30, "width": 1100, "height": 600}
-    policy.bot._record_torpedo_frame.side_effect = record
+    input_allowed = policy.bot._torpedo_input_allowed
+    def resize_before_input(size, deadline):
+        policy.rect.return_value = {"left": 40, "top": 30, "width": 1100, "height": 600}
+        return input_allowed(size, deadline)
+    policy.bot._torpedo_input_allowed = resize_before_input
     run(policy)
     policy.bot.gamepad.fire_torpedo.assert_not_called()
     policy.bot.gamepad.main_gun.assert_not_called()
@@ -411,15 +415,16 @@ def test_slow_aiming_defers_navigation_until_next_fresh_analysis(policy, monkeyp
 
 
 @pytest.mark.parametrize("action", ["aim_relative", "lock"])
-def test_observation_evidence_timeout_blocks_aim_and_lock_input(policy, monkeypatch, action):
+def test_observation_recognition_timeout_blocks_aim_and_lock_input(policy, monkeypatch, action):
     clock = {"value": 1000.0}
     monkeypatch.setattr(bot_module.time, "monotonic", lambda: clock["value"])
     policy.states = [hud(aligned=False, lead=(580, 305), aim=(490, 305))
                      if action == "aim_relative" else hud(lead=None, aim=None)]
-    def record(_frame, phase, **_details):
-        if phase == "observation":
-            clock["value"] = 1015.0
-    policy.bot._record_torpedo_frame.side_effect = record
+    normal_inspect = policy.inspect.side_effect
+    def inspect(*args):
+        clock["value"] += 15
+        return normal_inspect(*args)
+    policy.inspect.side_effect = inspect
     run(policy)
     getattr(policy.bot.gamepad, action).assert_not_called()
     policy.bot.gamepad.fire_torpedo.assert_not_called()
