@@ -21,6 +21,9 @@ def camera(monkeypatch):
     instance.map_span_km = 50
     instance.hwnd = 7
     instance._torpedo_restore_pending = False
+    # Camera-search tests do not build the survival/consumable state that the
+    # newer _torpedo_frame hook expects; that integration has dedicated tests.
+    instance._check_survival_frame = None
     instance._battle_capture_zone_layout = []
     instance._reset_torpedo_acquisition()
     clock = {"value": 1000.}

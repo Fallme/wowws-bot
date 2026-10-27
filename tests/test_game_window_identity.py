@@ -98,20 +98,49 @@ def test_custom_regional_process_name_can_be_added(monkeypatch):
     assert window.is_game_window(404)
 
 
-def test_completion_close_posts_wm_close_only_to_verified_game(monkeypatch):
-    messages = []
+def test_completion_close_force_terminates_only_the_verified_game(monkeypatch):
+    calls = []
     monkeypatch.setattr(main, "is_game_window", lambda hwnd: hwnd == 202)
     monkeypatch.setattr(
-        main.ctypes,
-        "windll",
-        SimpleNamespace(
-            user32=SimpleNamespace(
-                PostMessageW=lambda *args: messages.append(args) or 1
-            )
-        ),
+        main, "window_process_identity",
+        lambda hwnd: (4242, "worldofwarships64.exe", r"E:\Games\wows64.exe"),
+    )
+    monkeypatch.setattr(
+        main, "force_terminate_process_tree",
+        lambda pid: calls.append(pid) or True,
     )
 
     assert main.close_game_window_after_plan(202)
-    assert messages == [(202, 0x0010, 0, 0)]
+    assert calls == [4242]
+    # An unverified window handle never reaches the process lookup.
     assert not main.close_game_window_after_plan(101)
-    assert messages == [(202, 0x0010, 0, 0)]
+    assert calls == [4242]
+
+
+def test_completion_close_refuses_a_non_game_process(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "is_game_window", lambda hwnd: True)
+    monkeypatch.setattr(
+        main, "window_process_identity",
+        lambda hwnd: (777, "chrome.exe", r"C:\chrome.exe"),
+    )
+    monkeypatch.setattr(
+        main, "force_terminate_process_tree",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert not main.close_game_window_after_plan(202)
+    assert calls == []
+
+
+def test_completion_close_reports_a_failed_termination(monkeypatch):
+    monkeypatch.setattr(main, "is_game_window", lambda hwnd: True)
+    monkeypatch.setattr(
+        main, "window_process_identity",
+        lambda hwnd: (4242, "worldofwarships64.exe", r"E:\Games\wows64.exe"),
+    )
+    monkeypatch.setattr(
+        main, "force_terminate_process_tree", lambda pid: False,
+    )
+
+    assert not main.close_game_window_after_plan(202)

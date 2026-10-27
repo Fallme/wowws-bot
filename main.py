@@ -1,9 +1,11 @@
 """World of Warships bot entry point and high-level lifecycle."""
 
 import ctypes
+import ctypes.wintypes
 import logging
 import math
 import os
+import subprocess
 import time
 from runtime_control import shutdown_after_plan
 from dataclasses import dataclass, replace
@@ -28,6 +30,7 @@ from core.ui import ScreenState
 from core.battle_phase import BattlePhase, BattlePhaseTracker
 from core.window import (
     activate_window,
+    configured_game_process_names,
     ensure_game_window_foreground,
     find_game_window,
     get_client_rect,
@@ -38,6 +41,7 @@ from core.window import (
     set_automation_input_observer,
     set_interaction_pause_guard,
     window_message_click,
+    window_process_identity,
 )
 from port_navigator import (
     claim_daily_reward,
@@ -374,32 +378,69 @@ def refresh_game_window(bot: BattleBot, *, maximize: bool = True) -> bool:
     return True
 
 
-def close_game_window_after_plan(hwnd) -> bool:
-    """Gracefully close only the verified game process window.
+def force_terminate_process_tree(pid: int) -> bool:
+    """Kill the verified game process without its normal exit flow.
 
-    This is called solely after a configured run reaches its plan target.  It
-    never runs for Web stop, keyboard pause, recovery failure, or an unknown
-    HWND, so the opt-in cannot close a browser/video window by title mistake.
+    The client can ignore a posted window close or sit on its own quit
+    confirmation at the end of a run.  taskkill /T also reaps child helpers;
+    TerminateProcess is the fallback when taskkill is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(int(pid))],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("taskkill 强杀游戏失败，改用 TerminateProcess", exc_info=True)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [
+        ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [
+        ctypes.wintypes.HANDLE, ctypes.wintypes.UINT,
+    ]
+    kernel32.TerminateProcess.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    handle = kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.TerminateProcess(handle, 1))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def close_game_window_after_plan(hwnd) -> bool:
+    """Force-terminate the verified game process after the run plan ends.
+
+    Only reached after a configured run completes its plan. The normal client
+    exit flow (window close → in-game confirmation) is deliberately skipped:
+    it can stay open indefinitely once the bot has stopped sending input, so
+    the option appeared to do nothing. The window's own executable is verified
+    as the World of Warships client before anything is killed.
     """
     try:
         if not hwnd or not is_game_window(int(hwnd)):
             logger.warning("完成后关闭游戏已勾选，但当前句柄不是已验证游戏窗口")
             return False
-        posted = bool(
-            ctypes.windll.user32.PostMessageW(
-                int(hwnd),
-                0x0010,  # WM_CLOSE
-                0,
-                0,
+        pid, image, _path = window_process_identity(int(hwnd))
+        if not pid or image not in configured_game_process_names():
+            logger.warning(
+                "完成后关闭游戏已勾选，但窗口进程不是战舰世界 (%s)；拒绝强制结束",
+                image or "unknown",
             )
-        )
-        if posted:
-            logger.info("运行计划完成，已向《战舰世界》发送关闭窗口请求")
-        else:
-            logger.warning("运行计划完成，但关闭游戏窗口请求未被系统接受")
-        return posted
+            return False
+        if force_terminate_process_tree(pid):
+            logger.info("运行计划完成，已强制结束《战舰世界》进程树 (PID %s)", pid)
+            return True
+        logger.warning("运行计划完成，但强制结束游戏进程失败 (PID %s)", pid)
+        return False
     except (AttributeError, OSError, TypeError, ValueError):
-        logger.exception("运行计划完成，但关闭游戏窗口失败")
+        logger.exception("运行计划完成，但强制关闭游戏失败")
         return False
 
 
