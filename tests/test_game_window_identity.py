@@ -144,3 +144,33 @@ def test_completion_close_reports_a_failed_termination(monkeypatch):
     )
 
     assert not main.close_game_window_after_plan(202)
+
+
+def test_platform_close_terminates_each_known_image(monkeypatch):
+    calls = []
+
+    def run(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(returncode=0 if args[-1] == "wgc.exe" else 128)
+
+    monkeypatch.setattr(
+        main, "platform_process_names",
+        lambda: ("wgc.exe", "wgc_renderer_host.exe"),
+    )
+    monkeypatch.setattr(main.subprocess, "run", run)
+
+    assert main.close_wargaming_platform_after_plan()
+    assert calls == [
+        ["taskkill", "/F", "/T", "/IM", "wgc.exe"],
+        ["taskkill", "/F", "/T", "/IM", "wgc_renderer_host.exe"],
+    ]
+
+
+def test_platform_close_is_a_no_op_when_absent(monkeypatch):
+    monkeypatch.setattr(main, "platform_process_names", lambda: ("wgc.exe",))
+    monkeypatch.setattr(
+        main.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=128),
+    )
+
+    assert not main.close_wargaming_platform_after_plan()

@@ -1,0 +1,384 @@
+/* Visual refinement layer.
+   Cosmetic overrides only: colours, typography, shadows, borders and
+   interaction feedback.  Grid tracks, paddings and element sizes are left to
+   the original layout so the console keeps its structure. */
+
+:root {
+  --bg: #060e13;
+  --panel: #0b171c;
+  --line: #203640;
+  --text: #edf4f3;
+  --muted: #80969c;
+  --accent: #f2bb5b;
+  --accent-2: #cf8a2e;
+  --green: #5fd3a3;
+  --cyan: #6fc7cd;
+  --danger: #eb7a6e;
+  --shadow: 0 22px 56px #0007;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background:
+    radial-gradient(1100px 620px at 12% -12%, #16414d55 0%, transparent 58%),
+    radial-gradient(900px 520px at 108% 8%, #6b481f3d 0%, transparent 55%),
+    linear-gradient(150deg, #050b0e 0%, #091419 50%, #061014 100%);
+  font-family: "Inter", "HarmonyOS Sans SC", "MiSans", "PingFang SC",
+    "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: #f2bb5b40;
+  color: #fff;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a424c #081216;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #081216;
+  border-radius: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(#2d4650, #213842);
+  border: 2px solid #081216;
+  border-radius: 8px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a5965;
+}
+
+button,
+input,
+select {
+  transition: border-color 0.2s ease, background-color 0.2s ease,
+    color 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px #f2bb5b42;
+}
+
+.masthead {
+  border-bottom-color: #1f333b;
+}
+
+.brand-monogram {
+  box-shadow: 0 0 24px #f2bb5b33, 0 1px 0 #ffffff2e inset;
+}
+
+.brand-lockup h1 {
+  text-shadow: 0 2px 18px #0007;
+}
+
+.system-chip {
+  background: #0b1519d9;
+  box-shadow: 0 8px 26px #0005, 0 1px 0 #ffffff0a inset;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+.deck-card {
+  border-color: #223c47;
+  background: linear-gradient(158deg, #12252d 0%, #0a161b 60%, #081217 100%);
+  box-shadow: 0 22px 56px #0007, 0 1px 0 #ffffff0d inset;
+  transition: border-color 0.25s ease, box-shadow 0.3s ease,
+    transform 0.3s ease;
+}
+
+.deck-card::before {
+  background: linear-gradient(90deg, var(--accent), #f2bb5b00 58%);
+  opacity: 0.85;
+}
+
+@media (hover: hover) {
+  .deck-card:hover {
+    transform: translateY(-2px);
+    border-color: #2c4d5a;
+    box-shadow: 0 30px 72px #0008, 0 1px 0 #ffffff12 inset;
+  }
+}
+
+.section-title > span {
+  border-right-color: #53656c;
+  color: var(--accent);
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 16px #f2bb5b55;
+}
+
+.section-title h2 {
+  color: #f1f6f5;
+}
+
+.stop-plan {
+  border-color: #294049;
+  background: linear-gradient(160deg, #081317d9, #060f13e6);
+}
+
+.tab-switch {
+  background: #040b0e;
+  box-shadow: inset 0 1px 3px #0007;
+}
+
+.limit-tab {
+  color: #778d94;
+}
+
+.limit-tab:hover {
+  color: #c7d4d5;
+}
+
+.limit-tab.active {
+  color: #15191a;
+  background: linear-gradient(105deg, #f6c96f, #d68f33);
+  box-shadow: 0 4px 14px #d68f3338, 0 1px 0 #fff5 inset;
+}
+
+.number-control button {
+  border-color: #334a54;
+  background: #0f1e25;
+}
+
+.number-control button:hover {
+  border-color: #7a5a2e;
+  background: #16282f;
+  color: var(--accent);
+}
+
+.number-control input {
+  border-bottom-color: #b5853f;
+}
+
+.number-control input:focus {
+  border-bottom-color: var(--accent);
+  box-shadow: 0 1px 0 var(--accent), 0 10px 20px #0004;
+}
+
+.choice,
+.ship-choice {
+  border-color: #263d46;
+  background: linear-gradient(150deg, #0a171c, #081216);
+}
+
+.choice:hover,
+.ship-choice:hover {
+  border-color: #4d6b76;
+  background: linear-gradient(150deg, #0d1c22, #09151a);
+}
+
+.choice.selected,
+.ship-choice.selected {
+  border-color: #b5853f;
+  background: linear-gradient(110deg, #f2bb5b1f, #0d1a1f);
+  box-shadow: inset 3px 0 var(--accent), 0 6px 20px #f2bb5b12;
+}
+
+.tab-switch,
+.quick-battle-toggle,
+.readiness,
+.log-pane,
+.progress-panel,
+.telemetry-grid,
+.operation-banner {
+  border-color: #263f49;
+}
+
+.quick-battle-toggle {
+  background: linear-gradient(150deg, #0a171c, #070f13);
+}
+
+.quick-battle-toggle:hover {
+  border-color: #3e5c68;
+}
+
+.quick-battle-toggle:has(input:checked) {
+  border-color: #7a5a2e;
+  background: linear-gradient(115deg, #f2bb5b16, #09161a);
+}
+
+.quick-battle-toggle input {
+  accent-color: var(--accent);
+}
+
+.readiness {
+  background: linear-gradient(150deg, #2a1a16d9, #1b110fd9);
+}
+
+.readiness.ready {
+  border-color: #2b6a55;
+  background: linear-gradient(150deg, #102c23, #0a1d18);
+}
+
+.start-button {
+  color: #17191a;
+  background: linear-gradient(105deg, #f7cf79, #d68f33);
+  box-shadow: 0 10px 26px #d68f3333, 0 1px 0 #fff6 inset;
+}
+
+.start-button:hover:not(:disabled) {
+  filter: brightness(1.06);
+  box-shadow: 0 14px 34px #d68f3347, 0 1px 0 #fff7 inset;
+}
+
+.start-button:active:not(:disabled) {
+  filter: brightness(0.98);
+}
+
+.start-button:disabled,
+.stop-button:disabled {
+  filter: saturate(0.55) brightness(0.78);
+  opacity: 0.45;
+}
+
+.stop-button {
+  background: linear-gradient(180deg, #4d2a2c, #3b2123);
+  box-shadow: 0 1px 0 #ffffff10 inset;
+}
+
+.stop-button:hover:not(:disabled) {
+  background: linear-gradient(180deg, #5a3134, #452629);
+  color: #ffc3bc;
+}
+
+.operation-banner {
+  background: linear-gradient(120deg, #08151a, #071116);
+  box-shadow: 0 1px 0 #ffffff08 inset;
+}
+
+.operation-copy strong {
+  color: #f5c968;
+  text-shadow: 0 0 24px #f2bb5b26;
+}
+
+.progress-panel {
+  background: linear-gradient(160deg, #081419, #060f13);
+}
+
+.progress-track {
+  background: #172b33;
+  box-shadow: inset 0 1px 2px #0008;
+}
+
+.progress-track span {
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  box-shadow: 0 0 12px #f2bb5b5c;
+}
+
+.telemetry-grid {
+  background: #223b46;
+}
+
+.telemetry-grid > div {
+  background: linear-gradient(160deg, #0a171c, #081318);
+  transition: background-color 0.2s ease;
+}
+
+.telemetry-grid > div:hover {
+  background: #0c1c23;
+}
+
+.telemetry-grid small {
+  color: #7a9198;
+}
+
+.telemetry-grid strong {
+  color: #e9f1f0;
+}
+
+.reward-total {
+  border-color: #2a424c;
+  background: linear-gradient(125deg, #102127, #081318);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease,
+    transform 0.25s ease;
+}
+
+@media (hover: hover) {
+  .reward-total:hover {
+    transform: translateY(-1px);
+    border-color: #3d5f6b;
+    box-shadow: 0 14px 34px #0006;
+  }
+}
+
+.reward-total strong {
+  text-shadow: 0 2px 20px #0006;
+}
+
+.task-history-heading {
+  border-bottom-color: #2b434c;
+}
+
+.history-row {
+  border-color: #2b444e;
+  background: linear-gradient(150deg, #0a171c, #071216);
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.history-row:hover {
+  border-color: #3e616e;
+  background: #0b1a20;
+}
+
+.log-pane {
+  background: linear-gradient(170deg, #071317, #050e12);
+  box-shadow: inset 0 1px 0 #ffffff07;
+}
+
+.log-pane pre {
+  color: #86b3ae;
+}
+
+.log-pane pre::selection {
+  background: #f2bb5b38;
+}
+
+.toast {
+  background: #12262d;
+  box-shadow: 0 18px 44px #0007;
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+.toast.show {
+  animation: toast-in 0.25s ease both;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

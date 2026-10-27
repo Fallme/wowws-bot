@@ -5,6 +5,7 @@ import ctypes.wintypes
 import logging
 import math
 import os
+import re
 import subprocess
 import time
 from runtime_control import shutdown_after_plan
@@ -442,6 +443,51 @@ def close_game_window_after_plan(hwnd) -> bool:
     except (AttributeError, OSError, TypeError, ValueError):
         logger.exception("运行计划完成，但强制关闭游戏失败")
         return False
+
+
+DEFAULT_PLATFORM_PROCESS_NAMES = (
+    "wgc.exe",
+    "wgc_renderer_host.exe",
+    "wargamingerrormonitor.exe",
+)
+
+
+def platform_process_names() -> tuple[str, ...]:
+    """Image names that make up the Wargaming Game Center platform."""
+    configured = os.environ.get("WOWS_PLATFORM_PROCESS_NAMES", "")
+    additions = [
+        Path(value.strip().strip('"')).name.casefold()
+        for value in re.split(r"[,;]", configured)
+        if value.strip()
+    ]
+    return tuple(dict.fromkeys((*DEFAULT_PLATFORM_PROCESS_NAMES, *additions)))
+
+
+def close_wargaming_platform_after_plan() -> bool:
+    """Close the Wargaming Game Center alongside the completed game.
+
+    The launcher keeps its renderer hosts and error monitor alive after the
+    game exits, so the completion option would otherwise leave the platform
+    window behind. Only the known WGC image names are terminated; a missing
+    process is not an error.
+    """
+    closed = []
+    for name in platform_process_names():
+        try:
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", name],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug("关闭 Wargaming 平台进程失败: %s", name, exc_info=True)
+            continue
+        if result.returncode == 0:
+            closed.append(name)
+    if closed:
+        logger.info("运行计划完成，已关闭 Wargaming 平台进程: %s", ", ".join(closed))
+        return True
+    logger.info("运行计划完成，Wargaming 平台未在运行")
+    return False
 
 
 def operation_stopped(bot) -> bool:
@@ -5252,6 +5298,7 @@ def run():
         shutdown_bot(bot)
         if plan_completed and limits.close_game_when_done:
             close_game_window_after_plan(bot.hwnd)
+            close_wargaming_platform_after_plan()
         logger.info("Bot 已停止")
         shutdown_after_plan(limits, plan_completed)
 
