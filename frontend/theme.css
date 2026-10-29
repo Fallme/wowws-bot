@@ -1,13 +1,13 @@
 /* Endfield-inspired light system.
-   Near-white surfaces, black typography, chartreuse accent blocks, hairline
-   rules and a slim left icon rail. Cosmetic layer only: the three-column
+   Near-white surfaces, black typography, gold accent blocks, light-grey
+   differentiation and hairline rules. Cosmetic layer only: the three-column
    layout, element sizes and spacing keep their original structure. No
    transitions, animations, lifts or pulses. */
 
 :root {
   --bg: #f5f6f7;
   --surface: #ffffff;
-  --surface-2: #fafbfb;
+  --surface-2: #f4f5f6;
   --glass: rgba(255, 255, 255, 0.86);
   --glass-soft: rgba(255, 255, 255, 0.7);
   --ink: #111315;
@@ -16,10 +16,8 @@
   --faint: #a0a5aa;
   --line: #e4e6e8;
   --line-2: #d3d7da;
-  --accent: #d9e21f;
-  --accent-deep: #6f7400;
-  --cyan: #39d7f7;
-  --green: #2f8a62;
+  --accent: #d9b24c;
+  --accent-deep: #7a5c0a;
   --red: #c1453b;
   --radius: 8px;
 }
@@ -34,7 +32,6 @@ html {
 }
 
 body {
-  padding-left: 56px;
   background: var(--bg);
   color: var(--ink);
   font-family: "Inter", "HarmonyOS Sans SC", "MiSans", "PingFang SC",
@@ -99,103 +96,7 @@ select:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgba(217, 226, 31, 0.55);
-}
-
-/* ── Left icon rail ─────────────────────────────────────── */
-
-.side-rail {
-  position: fixed;
-  inset: 0 auto 0 0;
-  z-index: 30;
-  width: 56px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 14px 0 16px;
-  border-right: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.92);
-  -webkit-backdrop-filter: blur(20px);
-  backdrop-filter: blur(20px);
-}
-
-.rail-logo {
-  width: 32px;
-  height: 34px;
-  display: grid;
-  place-items: center;
-  background: var(--ink);
-  color: #fff;
-  font: 900 15px/1 Georgia, "Microsoft YaHei";
-  clip-path: polygon(0 0, 100% 0, 100% 72%, 50% 100%, 0 72%);
-}
-
-.rail-icons {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  margin-top: 28px;
-  color: #a2a7ac;
-}
-
-.rail-icon {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 4px;
-}
-
-.rail-icon.active {
-  color: var(--ink);
-  background: #f1f2f3;
-  box-shadow: inset 2px 0 var(--accent);
-}
-
-.rail-icon svg {
-  width: 18px;
-  height: 18px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.4;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.rail-bottom {
-  margin-top: auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  color: var(--muted);
-}
-
-.rail-launch {
-  width: 34px;
-  height: 34px;
-  display: grid;
-  place-items: center;
-  background: var(--ink);
-  color: var(--accent);
-  font-size: 11px;
-}
-
-.rail-bottom small {
-  writing-mode: vertical-rl;
-  color: var(--ink-2);
-  font-size: 9px;
-  letter-spacing: 0.22em;
-}
-
-@media (max-width: 1250px) {
-  body {
-    padding-left: 0;
-  }
-
-  .side-rail {
-    display: none;
-  }
+  box-shadow: 0 0 0 4px rgba(217, 178, 76, 0.55);
 }
 
 /* ── Header ─────────────────────────────────────────────── */
@@ -235,7 +136,7 @@ select:focus-visible,
 
 .system-chip.live .pulse {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(217, 226, 31, 0.4);
+  box-shadow: 0 0 0 3px rgba(217, 178, 76, 0.4);
 }
 
 .system-chip small {
@@ -306,9 +207,9 @@ select:focus-visible,
   color: var(--ink-2);
 }
 
-/* The modal reference uses a thin cyan separator under its black header. */
+/* Gold separator under the live header. */
 .live-card > .section-title {
-  border-bottom: 2px solid var(--cyan);
+  border-bottom: 2px solid var(--accent);
 }
 
 /* ── Controls ───────────────────────────────────────────── */
@@ -340,7 +241,7 @@ select:focus-visible,
 .choice.selected,
 .ship-choice.selected {
   border-color: var(--ink);
-  background: #fcfdf0;
+  background: var(--surface-2);
   box-shadow: inset 3px 0 var(--accent);
 }
 
@@ -357,7 +258,7 @@ select:focus-visible,
 
 .choice small.detected,
 .launcher-choice small.detected {
-  color: var(--green);
+  color: var(--accent-deep);
 }
 
 .choice small.missing,
@@ -367,7 +268,7 @@ select:focus-visible,
 
 .stop-plan {
   border: 1px solid var(--line);
-  background: var(--surface);
+  background: var(--surface-2);
 }
 
 .tab-switch {
@@ -443,7 +344,7 @@ select:focus-visible,
 }
 
 .readiness.ready > span {
-  background: var(--green);
+  background: var(--accent);
   box-shadow: none;
 }
 
@@ -585,9 +486,9 @@ select:focus-visible,
   border: 1px solid var(--line-2);
   border-radius: 4px;
   background:
-    repeating-linear-gradient(0deg, rgba(17, 20, 23, 0.05) 0 1px, transparent 1px 24px),
-    repeating-linear-gradient(90deg, rgba(17, 20, 23, 0.05) 0 1px, transparent 1px 24px),
-    var(--surface-2);
+    repeating-linear-gradient(0deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    #eceef0;
   box-shadow: none;
   overflow: hidden;
 }
@@ -632,7 +533,7 @@ select:focus-visible,
 
 .capture-zone-marker {
   border: 1px solid var(--ink);
-  background: rgba(217, 226, 31, 0.35);
+  background: rgba(217, 178, 76, 0.32);
   color: var(--ink);
 }
 
@@ -654,8 +555,8 @@ select:focus-visible,
 }
 
 .radar-zone.friendly {
-  color: var(--green);
-  border-color: rgba(47, 138, 98, 0.5);
+  color: var(--accent-deep);
+  border-color: rgba(217, 178, 76, 0.5);
 }
 
 .radar-zone.neutral {
@@ -769,8 +670,8 @@ select:focus-visible,
 }
 
 .task-badge.running {
-  color: var(--green);
-  border-color: rgba(47, 138, 98, 0.4);
+  color: var(--accent-deep);
+  border-color: rgba(217, 178, 76, 0.4);
   background: var(--surface);
 }
 
@@ -887,7 +788,7 @@ select:focus-visible,
 }
 
 .history-rewards .history-free-xp {
-  border-left-color: var(--green);
+  border-left-color: #b7bdc2;
 }
 
 .history-rewards .history-credit i,
@@ -946,7 +847,7 @@ select:focus-visible,
 
 .quick-battle-toggle:has(input:checked) {
   border-color: var(--ink);
-  background: #fcfdf0;
+  background: var(--surface-2);
 }
 
 .quick-battle-toggle input {
@@ -1041,7 +942,7 @@ select:focus-visible,
 
 .custom-ship-fields input:focus {
   border-color: var(--ink);
-  box-shadow: 0 0 0 3px rgba(217, 226, 31, 0.45);
+  box-shadow: 0 0 0 3px rgba(217, 178, 76, 0.45);
 }
 
 .custom-ship-fields .range-input span {
@@ -1075,7 +976,7 @@ select:focus-visible,
 }
 
 .ocr-toolbar-label.active {
-  color: var(--green);
+  color: var(--accent-deep);
 }
 
 .ocr-device-switch {
@@ -1129,4 +1030,9 @@ select:focus-visible,
 
 .toast.error {
   border-left-color: var(--red);
+}
+
+/* Any live-minimap variant keeps the same light-grey tactical surface. */
+.route-visual.has-live-minimap {
+  background: #eceef0;
 }
