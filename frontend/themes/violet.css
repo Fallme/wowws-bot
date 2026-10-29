@@ -1,0 +1,59 @@
+/* Muted violet palette on the light surface layer. */
+@import url("light-gold.css");
+
+:root {
+  --bg: #efedf4;
+  --surface: #ffffff;
+  --surface-2: #f4f2f8;
+  --ink: #1a1720;
+  --ink-2: #4a4654;
+  --muted: #7a7488;
+  --faint: #a29cad;
+  --line: #e1ddea;
+  --line-2: #d1cbe0;
+  --accent: #9a8ac6;
+  --accent-deep: #5a4a85;
+  --red: #b04a42;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.system-chip.live .pulse {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.custom-ship-fields input:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.route-visual,
+.route-visual.has-live-minimap {
+  background:
+    repeating-linear-gradient(0deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(17, 20, 23, 0.055) 0 1px, transparent 1px 24px),
+    #eae7f1;
+}
+
+.route-ring {
+  border-color: #d3cfe0;
+}
+
+.radar-island {
+  background: #e6e2ee;
+  border-color: #d1cbe0;
+}
+
+.capture-zone-marker {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.radar-zone.friendly {
+  color: var(--accent-deep);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}

@@ -1,22 +1,5 @@
-/* Arknights dark theme: near-black flat surfaces with gold accents. */
-@import url("endfield.css");
-
-:root {
-  --bg: #0c0e10;
-  --surface: #15181b;
-  --surface-2: #1b1f22;
-  --glass: rgba(21, 24, 27, 0.9);
-  --glass-soft: rgba(21, 24, 27, 0.75);
-  --ink: #f2f4f5;
-  --ink-2: #c3c9cd;
-  --muted: #8b9297;
-  --faint: #6b7277;
-  --line: #2a2f33;
-  --line-2: #3a4045;
-  --accent: #e2b84f;
-  --accent-deep: #e2b84f;
-  --red: #e06d61;
-}
+/* Shared flat dark surface layer. Individual dark palettes only set tokens. */
+@import url("light-gold.css");
 
 html {
   color-scheme: dark;
@@ -71,7 +54,7 @@ body::before {
 
 .system-chip.live .pulse {
   background: var(--accent);
-  box-shadow: 0 0 0 3px rgba(226, 184, 79, 0.32);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .human-alert button,
@@ -125,7 +108,7 @@ body::before {
 }
 
 .quick-battle-toggle:has(input:checked) {
-  background: rgba(226, 184, 79, 0.08);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
   border-color: var(--accent);
 }
 
@@ -177,7 +160,7 @@ body::before {
 
 .capture-zone-marker {
   border-color: var(--accent);
-  background: rgba(226, 184, 79, 0.25);
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
   color: var(--ink);
 }
 
@@ -194,7 +177,7 @@ body::before {
 
 .radar-zone.friendly {
   color: var(--accent);
-  border-color: rgba(226, 184, 79, 0.5);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
 .radar-zone.neutral {
@@ -225,7 +208,7 @@ body::before {
 }
 
 .custom-ship-fields input:focus {
-  box-shadow: 0 0 0 3px rgba(226, 184, 79, 0.35);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .toast {
@@ -261,4 +244,16 @@ body::before {
 .log-pane pre::selection {
   background: var(--accent);
   color: #111315;
+}
+
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.custom-ship-fields input:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
 }

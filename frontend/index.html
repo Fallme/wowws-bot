@@ -8,27 +8,37 @@
     <title>战舰自动化控制台</title>
     <link rel="stylesheet" href="/styles.css?v=20260927_2" />
     <link rel="stylesheet" href="/custom_ship.css?v=20260927_2" />
-    <link rel="stylesheet" href="/themes/base.css?v=20261029_1" />
+    <link rel="stylesheet" href="/themes/base.css?v=20261029_2" />
     <script>
       (function () {
-        var themes = ["classic", "endfield", "arknights", "mono"];
+        var themes = [
+          "classic", "light-gold", "mid-grey", "mono",
+          "navy", "amber", "teal", "violet"
+        ];
+        var aliases = { endfield: "light-gold", arknights: "mid-grey" };
         var colors = {
           classic: "#0c171c",
-          endfield: "#f5f6f7",
-          arknights: "#0c0e10",
-          mono: "#ffffff"
+          "light-gold": "#f5f6f7",
+          "mid-grey": "#6d7276",
+          mono: "#ffffff",
+          navy: "#0e1622",
+          amber: "#1c1511",
+          teal: "#e7efee",
+          violet: "#efedf4"
         };
-        var theme = "endfield";
+        var theme = "light-gold";
         try {
-          var query = new URLSearchParams(location.search).get("theme");
-          var saved = localStorage.getItem("wowsConsoleTheme");
+          var query = new URLSearchParams(location.search).get("theme") || "";
+          var saved = localStorage.getItem("wowsConsoleTheme") || "";
+          query = aliases[query] || query;
+          saved = aliases[saved] || saved;
           if (themes.indexOf(query) >= 0) theme = query;
           else if (themes.indexOf(saved) >= 0) theme = saved;
         } catch (error) {}
         document.documentElement.dataset.theme = theme;
         document.write(
           '<link id="themeStylesheet" rel="stylesheet" href="/themes/' +
-            theme + '.css?v=20261029_1">'
+            theme + '.css?v=20261029_2">'
         );
         var meta = document.getElementById("themeColorMeta");
         if (meta) meta.setAttribute("content", colors[theme]);
@@ -43,11 +53,20 @@
           <div><p>LOCAL BATTLE AUTOMATION</p><h1>战舰自动化控制台</h1></div>
         </div>
         <div class="header-tools">
-          <div class="theme-switcher" role="group" aria-label="切换界面主题">
-            <button type="button" class="theme-option" data-theme-option="classic" aria-pressed="false" title="经典黑"><i class="swatch"></i><span>经典黑</span></button>
-            <button type="button" class="theme-option active" data-theme-option="endfield" aria-pressed="true" title="终末地"><i class="swatch"></i><span>终末地</span></button>
-            <button type="button" class="theme-option" data-theme-option="arknights" aria-pressed="false" title="方舟黑"><i class="swatch"></i><span>方舟黑</span></button>
-            <button type="button" class="theme-option" data-theme-option="mono" aria-pressed="false" title="极简白"><i class="swatch"></i><span>极简白</span></button>
+          <div class="theme-picker" id="themePicker">
+            <button type="button" class="theme-trigger" id="themeTrigger" aria-haspopup="listbox" aria-expanded="false" title="切换界面主题">
+              <i class="swatch"></i><span id="themeCurrentLabel">浅金</span><b class="caret">▾</b>
+            </button>
+            <div class="theme-menu" id="themeMenu" role="listbox" aria-label="界面主题" hidden>
+              <button type="button" class="theme-option" role="option" data-theme-option="classic" aria-selected="false"><i class="swatch"></i><span>黑金</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="light-gold" aria-selected="true"><i class="swatch"></i><span>浅金</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="mid-grey" aria-selected="false"><i class="swatch"></i><span>中灰</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="mono" aria-selected="false"><i class="swatch"></i><span>灰白</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="navy" aria-selected="false"><i class="swatch"></i><span>深蓝</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="amber" aria-selected="false"><i class="swatch"></i><span>暖褐</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="teal" aria-selected="false"><i class="swatch"></i><span>青灰</span><b class="check">✓</b></button>
+              <button type="button" class="theme-option" role="option" data-theme-option="violet" aria-selected="false"><i class="swatch"></i><span>紫灰</span><b class="check">✓</b></button>
+            </div>
           </div>
           <div class="system-chip" id="systemChip">
             <span class="pulse"></span>
@@ -170,6 +189,6 @@
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/theme-switcher.js?v=20261029_1" defer></script><script src="/app.js?v=20260927_2" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/theme-switcher.js?v=20261029_2" defer></script><script src="/app.js?v=20260927_2" defer></script>
   </body>
 </html>

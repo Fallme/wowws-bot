@@ -1,5 +1,5 @@
-/* Mono light theme: the Endfield light layout with grey accents only. */
-@import url("endfield.css");
+/* Grey-white light palette with neutral accents. */
+@import url("light-gold.css");
 
 :root {
   --accent: #c7ccd1;

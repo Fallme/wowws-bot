@@ -1,0 +1,43 @@
+/* Medium grey palette: the flat dark layer lifted to mid-grey surfaces. */
+@import url("dark-base.css");
+
+:root {
+  --bg: #6d7276;
+  --surface: #787d81;
+  --surface-2: #83888c;
+  --glass: rgba(120, 125, 130, 0.92);
+  --glass-soft: rgba(120, 125, 130, 0.78);
+  --ink: #f7f8f9;
+  --ink-2: #e4e7e9;
+  --muted: #d2d6d9;
+  --faint: #c0c5c9;
+  --line: #5f6468;
+  --line-2: #54595e;
+  --accent: #f0c95f;
+  --accent-deep: #ffd97a;
+  --red: #ffb3aa;
+}
+
+/* Keep the tactical map in the same medium-grey family. */
+.route-visual,
+.route-visual.has-live-minimap {
+  border-color: #4f5458;
+  background:
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.06) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.06) 0 1px, transparent 1px 24px),
+    #5f6468;
+}
+
+.route-ring {
+  border-color: #7c8287;
+}
+
+.radar-island {
+  background: #6f7478;
+  border-color: #54595e;
+}
+
+.radar-zone {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #9aa0a5;
+}

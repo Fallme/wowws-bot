@@ -1,0 +1,19 @@
+/* Warm brown palette on the shared flat dark layer. */
+@import url("dark-base.css");
+
+:root {
+  --bg: #1c1511;
+  --surface: #2a2019;
+  --surface-2: #35281f;
+  --glass: rgba(42, 32, 25, 0.92);
+  --glass-soft: rgba(42, 32, 25, 0.78);
+  --ink: #f7efe7;
+  --ink-2: #dccbb9;
+  --muted: #b9a691;
+  --faint: #9b8875;
+  --line: #3f3025;
+  --line-2: #54402f;
+  --accent: #e0a458;
+  --accent-deep: #f0bd7a;
+  --red: #e07a6a;
+}

@@ -1,0 +1,19 @@
+/* Deep blue palette on the shared flat dark layer. */
+@import url("dark-base.css");
+
+:root {
+  --bg: #0e1622;
+  --surface: #152233;
+  --surface-2: #1b2a3e;
+  --glass: rgba(21, 34, 51, 0.92);
+  --glass-soft: rgba(21, 34, 51, 0.78);
+  --ink: #eaf2fb;
+  --ink-2: #c4d3e2;
+  --muted: #93a6ba;
+  --faint: #7b8ea2;
+  --line: #263a52;
+  --line-2: #314969;
+  --accent: #7fb6dd;
+  --accent-deep: #a8d3f0;
+  --red: #e58b83;
+}
