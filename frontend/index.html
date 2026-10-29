@@ -3,12 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f5f6f7" />
+    <meta name="theme-color" id="themeColorMeta" content="#f5f6f7" />
     <meta name="description" content="战舰世界本地自动作战控制台" />
     <title>战舰自动化控制台</title>
     <link rel="stylesheet" href="/styles.css?v=20260927_2" />
     <link rel="stylesheet" href="/custom_ship.css?v=20260927_2" />
-    <link rel="stylesheet" href="/theme.css?v=20261029_8" />
+    <link rel="stylesheet" href="/themes/base.css?v=20261029_1" />
+    <script>
+      (function () {
+        var themes = ["classic", "endfield", "arknights", "mono"];
+        var colors = {
+          classic: "#0c171c",
+          endfield: "#f5f6f7",
+          arknights: "#0c0e10",
+          mono: "#ffffff"
+        };
+        var theme = "endfield";
+        try {
+          var query = new URLSearchParams(location.search).get("theme");
+          var saved = localStorage.getItem("wowsConsoleTheme");
+          if (themes.indexOf(query) >= 0) theme = query;
+          else if (themes.indexOf(saved) >= 0) theme = saved;
+        } catch (error) {}
+        document.documentElement.dataset.theme = theme;
+        document.write(
+          '<link id="themeStylesheet" rel="stylesheet" href="/themes/' +
+            theme + '.css?v=20261029_1">'
+        );
+        var meta = document.getElementById("themeColorMeta");
+        if (meta) meta.setAttribute("content", colors[theme]);
+      })();
+    </script>
   </head>
   <body>
     <main class="app-shell">
@@ -17,10 +42,18 @@
           <span class="brand-monogram">W</span>
           <div><p>LOCAL BATTLE AUTOMATION</p><h1>战舰自动化控制台</h1></div>
         </div>
-        <div class="system-chip" id="systemChip">
-          <span class="pulse"></span>
-          <div><small>系统状态</small><strong id="systemStatus">待机</strong></div>
-          <time id="clock">--:--:--</time>
+        <div class="header-tools">
+          <div class="theme-switcher" role="group" aria-label="切换界面主题">
+            <button type="button" class="theme-option" data-theme-option="classic" aria-pressed="false" title="经典黑"><i class="swatch"></i><span>经典黑</span></button>
+            <button type="button" class="theme-option active" data-theme-option="endfield" aria-pressed="true" title="终末地"><i class="swatch"></i><span>终末地</span></button>
+            <button type="button" class="theme-option" data-theme-option="arknights" aria-pressed="false" title="方舟黑"><i class="swatch"></i><span>方舟黑</span></button>
+            <button type="button" class="theme-option" data-theme-option="mono" aria-pressed="false" title="极简白"><i class="swatch"></i><span>极简白</span></button>
+          </div>
+          <div class="system-chip" id="systemChip">
+            <span class="pulse"></span>
+            <div><small>系统状态</small><strong id="systemStatus">待机</strong></div>
+            <time id="clock">--:--:--</time>
+          </div>
         </div>
       </header>
 
@@ -137,6 +170,6 @@
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/app.js?v=20260927_2" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/theme-switcher.js?v=20261029_1" defer></script><script src="/app.js?v=20260927_2" defer></script>
   </body>
 </html>

@@ -1,0 +1,43 @@
+/* Mono light theme: the Endfield light layout with grey accents only. */
+@import url("endfield.css");
+
+:root {
+  --accent: #c7ccd1;
+  --accent-deep: #4f565b;
+  --red: #b04a42;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  box-shadow: 0 0 0 4px rgba(140, 148, 155, 0.45);
+}
+
+.system-chip.live .pulse {
+  background: #8f979e;
+  box-shadow: 0 0 0 3px rgba(143, 151, 158, 0.35);
+}
+
+.custom-ship-fields input:focus {
+  box-shadow: 0 0 0 3px rgba(140, 148, 155, 0.4);
+}
+
+.choice.selected,
+.ship-choice.selected {
+  box-shadow: inset 3px 0 #111315;
+}
+
+.capture-zone-marker {
+  border-color: #111315;
+  background: rgba(150, 158, 165, 0.28);
+}
+
+.radar-zone.friendly {
+  color: var(--accent-deep);
+  border-color: rgba(120, 130, 138, 0.5);
+}
+
+.readiness.ready > span {
+  background: #8f979e;
+}

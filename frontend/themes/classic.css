@@ -1,0 +1,5 @@
+/* Classic dark theme: the original styles.css + custom_ship.css surface.
+   Only the shared no-motion and theme-picker rules from base.css apply here. */
+html {
+  color-scheme: dark;
+}

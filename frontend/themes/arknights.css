@@ -1,0 +1,264 @@
+/* Arknights dark theme: near-black flat surfaces with gold accents. */
+@import url("endfield.css");
+
+:root {
+  --bg: #0c0e10;
+  --surface: #15181b;
+  --surface-2: #1b1f22;
+  --glass: rgba(21, 24, 27, 0.9);
+  --glass-soft: rgba(21, 24, 27, 0.75);
+  --ink: #f2f4f5;
+  --ink-2: #c3c9cd;
+  --muted: #8b9297;
+  --faint: #6b7277;
+  --line: #2a2f33;
+  --line-2: #3a4045;
+  --accent: #e2b84f;
+  --accent-deep: #e2b84f;
+  --red: #e06d61;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body::before {
+  background: repeating-radial-gradient(
+    circle at 55% 45%,
+    transparent 0 26px,
+    rgba(255, 255, 255, 0.045) 27px 28px
+  );
+}
+
+::selection {
+  background: var(--accent);
+  color: #111315;
+}
+
+* {
+  scrollbar-color: #4a5055 #15181b;
+}
+
+*::-webkit-scrollbar-track {
+  background: #15181b;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #4a5055;
+  border-color: #15181b;
+}
+
+.brand-monogram {
+  background: var(--accent);
+  color: #111315;
+}
+
+.deck-card {
+  background: var(--glass);
+  border-color: var(--line);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+.system-chip {
+  background: var(--glass);
+  border-color: var(--line);
+}
+
+.system-chip.live .pulse {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(226, 184, 79, 0.32);
+}
+
+.human-alert button,
+.start-button,
+.save-preset-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111315;
+}
+
+.start-button b {
+  color: #111315;
+}
+
+.start-button:hover:not(:disabled),
+.save-preset-button:hover {
+  background: #eec65e;
+  border-color: #eec65e;
+  color: #111315;
+}
+
+.stop-button {
+  border-color: var(--line-2);
+  background: transparent;
+  color: var(--ink);
+}
+
+.stop-button:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111315;
+}
+
+.tab-switch,
+.ship-selector-tabs,
+.ocr-device-switch {
+  background: #1f2326;
+}
+
+.limit-tab.active,
+.ship-selector-tab.active,
+.ocr-device-switch button[aria-pressed="true"] {
+  background: var(--accent);
+  color: #111315;
+}
+
+.number-control button:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111315;
+}
+
+.quick-battle-toggle:has(input:checked) {
+  background: rgba(226, 184, 79, 0.08);
+  border-color: var(--accent);
+}
+
+.quick-battle-toggle input {
+  accent-color: var(--accent);
+}
+
+.progress-track {
+  background: #23282c;
+}
+
+.progress-track span {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.route-visual,
+.route-visual.has-live-minimap {
+  border-color: var(--line-2);
+  background:
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 24px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 24px),
+    #171b1e;
+}
+
+.route-ring {
+  border-color: #343a3f;
+}
+
+.route-line {
+  background: var(--ink);
+}
+
+.route-node {
+  background: var(--surface);
+  border-color: var(--line-2);
+  color: var(--ink-2);
+}
+
+.route-node.goal {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111315;
+}
+
+.map-center-marker {
+  color: var(--accent);
+}
+
+.capture-zone-marker {
+  border-color: var(--accent);
+  background: rgba(226, 184, 79, 0.25);
+  color: var(--ink);
+}
+
+.radar-zone {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: #3a4045;
+  color: var(--ink);
+}
+
+.radar-zone.hostile {
+  color: var(--red);
+  border-color: rgba(224, 109, 97, 0.5);
+}
+
+.radar-zone.friendly {
+  color: var(--accent);
+  border-color: rgba(226, 184, 79, 0.5);
+}
+
+.radar-zone.neutral {
+  color: var(--ink-2);
+}
+
+.radar-island {
+  background: #2a3034;
+  border-color: #3a4045;
+}
+
+.ship-preset-scroll {
+  scrollbar-color: #4a5055 #15181b;
+}
+
+.ship-preset-scroll::-webkit-scrollbar-track {
+  background: #15181b;
+}
+
+.ship-preset-scroll::-webkit-scrollbar-thumb {
+  background: #4a5055;
+}
+
+.custom-ship-fields input {
+  background: #15181b;
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+
+.custom-ship-fields input:focus {
+  box-shadow: 0 0 0 3px rgba(226, 184, 79, 0.35);
+}
+
+.toast {
+  background: rgba(21, 24, 27, 0.95);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.task-badge.completed,
+.history-row.victory b,
+.history-row.task.completed b {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111315;
+}
+
+.task-badge.running,
+.launcher-choice small.detected,
+.ocr-toolbar-label.active,
+.history-quick-note {
+  color: var(--accent) !important;
+}
+
+.readiness.ready > span {
+  background: var(--accent);
+}
+
+.live-card > .log-pane pre {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.log-pane pre::selection {
+  background: var(--accent);
+  color: #111315;
+}

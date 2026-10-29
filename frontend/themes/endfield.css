@@ -22,11 +22,6 @@
   --radius: 8px;
 }
 
-*, *::before, *::after {
-  transition: none !important;
-  animation: none !important;
-}
-
 html {
   color-scheme: light;
 }

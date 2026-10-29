@@ -1,0 +1,86 @@
+/* Shared theme chrome: no motion + the theme picker.
+   Loaded after styles.css for every theme. */
+
+*,
+*::before,
+*::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+.header-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.theme-switcher {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line, #21343d);
+  border-radius: 999px;
+  background: var(--glass, rgba(255, 255, 255, 0.04));
+}
+
+.theme-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted, #778d94);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.theme-option:hover {
+  color: var(--ink, var(--text, #e8efee));
+}
+
+.theme-option.active {
+  background: var(--accent, #eeb54b);
+  color: #111315;
+}
+
+.theme-option .swatch {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(127, 136, 143, 0.55);
+  border-radius: 50%;
+}
+
+.theme-option[data-theme-option="classic"] .swatch {
+  background: linear-gradient(135deg, #0b1519 50%, #eeb54b 50%);
+}
+
+.theme-option[data-theme-option="endfield"] .swatch {
+  background: linear-gradient(135deg, #f5f6f7 50%, #d9b24c 50%);
+}
+
+.theme-option[data-theme-option="arknights"] .swatch {
+  background: linear-gradient(135deg, #0c0e10 50%, #e2b84f 50%);
+}
+
+.theme-option[data-theme-option="mono"] .swatch {
+  background: linear-gradient(135deg, #ffffff 50%, #a9b0b6 50%);
+}
+
+@media (max-width: 1250px) {
+  .theme-option {
+    padding: 5px 7px;
+  }
+
+  .theme-option span {
+    display: none;
+  }
+}
