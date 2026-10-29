@@ -389,7 +389,7 @@ def force_terminate_process_tree(pid: int) -> bool:
     try:
         result = subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(int(pid))],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, timeout=10,
         )
         if result.returncode == 0:
             return True
@@ -476,7 +476,7 @@ def close_wargaming_platform_after_plan() -> bool:
         try:
             result = subprocess.run(
                 ["taskkill", "/F", "/T", "/IM", name],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
             logger.debug("关闭 Wargaming 平台进程失败: %s", name, exc_info=True)
