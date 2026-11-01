@@ -8,7 +8,7 @@
     <title>战舰自动化控制台</title>
     <link rel="stylesheet" href="/styles.css?v=20260927_2" />
     <link rel="stylesheet" href="/custom_ship.css?v=20260927_2" />
-    <link rel="stylesheet" href="/themes/base.css?v=20261029_2" />
+    <link rel="stylesheet" href="/themes/base.css?v=20261101_1" />
     <script>
       (function () {
         var themes = [
@@ -53,6 +53,25 @@
           <div><p>LOCAL BATTLE AUTOMATION</p><h1>战舰自动化控制台</h1></div>
         </div>
         <div class="header-tools">
+          <div class="update-panel" id="updatePanel">
+            <button type="button" class="update-chip" id="updateChip" aria-haspopup="dialog" aria-expanded="false" title="检查更新">
+              <span class="update-dot" id="updateDot"></span><span id="updateVersion">更新</span>
+            </button>
+            <div class="update-popover" id="updatePopover" role="dialog" aria-label="版本更新" hidden>
+              <div class="update-head"><strong>版本更新</strong><button type="button" class="update-close" id="updateClose" aria-label="关闭">×</button></div>
+              <dl class="update-rows">
+                <div><dt>当前版本</dt><dd id="updateCurrent">—</dd></div>
+                <div><dt>最新版本</dt><dd id="updateLatest">—</dd></div>
+                <div><dt>最近提交</dt><dd id="updateCommit">—</dd></div>
+                <div><dt>活跃用户</dt><dd id="updateActive">—</dd></div>
+              </dl>
+              <p class="update-note" id="updateNote">正在读取更新信息…</p>
+              <div class="update-actions">
+                <button type="button" class="update-check" id="updateCheck">重新检查</button>
+                <a class="update-link" id="updateLink" href="https://github.com/Fallme/wowws-bot" target="_blank" rel="noopener">打开仓库</a>
+              </div>
+            </div>
+          </div>
           <div class="theme-picker" id="themePicker">
             <button type="button" class="theme-trigger" id="themeTrigger" aria-haspopup="listbox" aria-expanded="false" title="切换界面主题">
               <i class="swatch"></i><span id="themeCurrentLabel">浅金</span><b class="caret">▾</b>
@@ -189,6 +208,6 @@
         </article>
       </section>
     </main>
-    <div class="toast" id="toast" role="status"></div><script src="/theme-switcher.js?v=20261029_2" defer></script><script src="/app.js?v=20260927_2" defer></script>
+    <div class="toast" id="toast" role="status"></div><script src="/update-panel.js?v=20261101_1" defer></script><script src="/theme-switcher.js?v=20261029_2" defer></script><script src="/app.js?v=20260927_2" defer></script>
   </body>
 </html>

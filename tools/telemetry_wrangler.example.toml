@@ -1,0 +1,9 @@
+# Copy to tools/wrangler.toml, fill the KV namespace id, then:
+#   npx wrangler deploy --config tools/wrangler.toml
+name = "wowws-telemetry"
+main = "telemetry_worker.js"
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "TELEMETRY"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

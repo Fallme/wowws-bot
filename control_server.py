@@ -19,10 +19,11 @@ import webbrowser
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
+from core import updater
 from core.calibration import CalibrationStore
 from core.launcher import launcher_statuses, normalize_launch_client, last_launch_client, remember_launch_client
 from core.window import find_game_window
@@ -1465,6 +1466,17 @@ class ControlHandler(SimpleHTTPRequestHandler):
         if path == "/api/dashboard":
             self._json(STORE.dashboard())
             return
+        if path == "/api/update":
+            query = parse_qs(urlparse(self.path).query)
+            refresh = str((query.get("refresh") or ["0"])[0]).lower() in {
+                "1", "true", "yes", "on",
+            }
+            try:
+                self._json(updater.check_for_updates(force=refresh))
+            except Exception as error:
+                logger.warning("更新检查失败: %s", error)
+                self._json({"error": str(error)})
+            return
         if path == "/api/screenshots":
             self._json(screenshot_storage_status())
             return
@@ -1596,6 +1608,7 @@ def main():
             time.sleep(0.2)
     url = f"http://{host}:{port}"
     print(f"战舰控制台已启动: {url}")
+    updater.start_auto()
     if (
         os.environ.get("WOWS_PANEL_NO_BROWSER") != "1"
         and "--no-browser" not in sys.argv
@@ -1606,6 +1619,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        updater.stop_auto()
         server.server_close()
 
 

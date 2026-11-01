@@ -109,6 +109,7 @@ WG 版只直接启动游戏本体。旧环境变量 `WOWS_WGC_LAUNCH_MODE=launch
 ## 五、控制台怎么看
 
 - **主题切换**：右上角可在「黑金 / 浅金 / 中灰 / 灰白 / 深蓝 / 暖褐 / 青灰 / 紫灰」八套配色间切换，选择保存在浏览器本地；也可用 `?theme=classic|light-gold|mid-grey|mono|navy|amber|teal|violet` 直接指定。
+- **版本更新**：控制台每次启动会在后台向仓库检查一次最新版本（启动后约 1 秒开始，不阻塞网页打开）。发现新版本时，右上角“更新”按钮显示红点，按钮文字变为“可更新”；点开可查看当前版本、最新版本、最近提交和活跃用户统计。手动“重新检查”会忽略缓存立即请求。正常检查结果缓存 6 小时，失败后 15 分钟再试，避免频繁请求 GitHub。
 - **当前状态**：任务现在处于启动、准备、战斗、结算、回港还是暂停阶段。
 - **地图区域**：开局打开 M 地图并用五帧投票锁定本局山体和占领点；自身位置、白色航向箭头和敌舰位置由右下角小地图持续更新。白箭头偶发漏一帧时会短时沿用最近可靠位置。
 - **定位容错**：黄色射程圈仅作辅助；没有黄色圈时，唯一且形状明确的白色箭头仍可定位。箭头暂时不可识别不会阻塞已经确认的战斗入局；加载页保护和航点点击前的定位检查仍保留。
@@ -168,7 +169,9 @@ $env:WOWS_PYTHON = 'D:\Python311\python.exe'
 
 ### 想更新程序
 
-使用 Git 的用户执行 `git pull --ff-only`；下载 ZIP 的用户重新下载并解压到新文件夹。个人运行数据默认保存在项目内的 `data/` 和 `runtime/`，这些目录不会上传到 Git。
+先看控制台右上角“更新”：红点表示仓库已有新版本，点开可核对当前/最新版本和最近提交。更新方式：使用 Git 的用户执行 `git pull --ff-only`；下载 ZIP 的用户重新下载并解压到新文件夹。个人运行数据默认保存在项目内的 `data/` 和 `runtime/`，这些目录不会上传到 Git。
+
+维护者发布新版本时，同步修改项目根目录的 `VERSION`（例如 `2026.11.01.1`）并推送到 `main`。部署端启动后会读取该文件并与本地 `VERSION` 比较；不需要额外接口。检查依次尝试 jsDelivr、raw.githubusercontent.com 和 ghproxy.net，网络不通时只影响更新提示，不影响战斗任务。
 
 ## 八、数据与隐私
 
@@ -184,6 +187,8 @@ training_assets/user_captures/ 用户反馈截图
 
 每局确认完成后会封存该局证据并删除更早的局，只保留最近完整一局；进行中的局不会中途清理。需要释放全部空间时，可在任务停止后使用控制台的“清理截图”。
 
+更新检查只读取仓库中的公开 `VERSION` 和最近提交，不会上传本机数据；结果保存在 `data/update_status.json`。如果维护者配置了可选的匿名心跳，部署端最多每 12 小时发送一次随机安装编号、程序版本和操作系统类型（`data/install_id` 本地生成），不包含账号、舰船、战斗记录或截图。未配置 `WOWS_HEARTBEAT_URL` 时不会发送任何心跳。GitHub 的 14 天克隆/访问统计只有在维护者提供只读 token 时才会显示，用于粗略判断使用量；token 可放在环境变量 `WOWS_GITHUB_TOKEN` 或 `data/github_token`，该文件已被 Git 忽略。
+
 阻塞诊断另存于 `E:/aimemo/docs/screenshots/wows_blockages/`，覆盖未知遮挡、战斗菜单、收益读取、普通回港、快速回港和结算导航。每个阻塞序列最多保留 60 帧，包含近期缓存画面、恢复动作前后截图和最终状态；`observations.jsonl` 记录识别状态、动作、次数及时间，便于后续回放分析。收益读取序列 `result_rewards_*` 额外记录当前截图、HUD 判定、资源投票和最终共识。阻塞目录独立于每局截图，不随旧局封存清理，也不受控制台“清理截图”影响。
 
 未知页面只有在顶部角落确认 `Esc ×`、`Esc 关闭` 或 `Esc 返回` 等关闭提示后，才允许累计最多三次 Esc；每次按键前都重新截图复核，提示消失即停止。没有提示或存在比赛计时、血量等实时战斗证据时只保留截图观察。沉没后的观战画面仍属于战斗，底部 `Esc 离开战斗` 不作为关闭遮挡的依据。已知战斗菜单/离场框也须重新截图并核对中心文字；快速战斗主动离场继续使用其专门流程。暂停或停止时暂停截图和操作。
@@ -198,6 +203,39 @@ training_assets/user_captures/ 用户反馈截图
 ```
 
 离线截图回放不会查找游戏窗口，也不会发送键盘或鼠标操作。
+
+## 维护者：更新与活跃统计
+
+更新检查的仓库默认是 `Fallme/wowws-bot`，可用 `WOWS_UPDATE_REPO=owner/repo` 覆盖。相关环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `WOWS_UPDATE_REPO` | `Fallme/wowws-bot` | 检查 `VERSION` 和 `main` 提交的仓库 |
+| `WOWS_UPDATE_CHECK_HOURS` | `6` | 正常检查缓存时长；每次进程启动仍会强制检查一次 |
+| `WOWS_UPDATE_RETRY_MINUTES` | `15` | 检查失败后的重试间隔 |
+| `WOWS_GITHUB_TOKEN` | 空 | 可选，只读 token；用于显示 14 天克隆/访问量，并提高 API 限额 |
+| `WOWS_HEARTBEAT_URL` | 空 | 可选，匿名心跳 POST 地址；为空时禁用 |
+| `WOWS_HEARTBEAT_HOURS` | `12` | 同一安装两次心跳的最小间隔 |
+| `WOWS_TELEMETRY_STATS_URL` | 空 | 可选，读取 `active_7d` / `active_30d` / `total` 的统计地址 |
+
+GitHub 只提供 14 天的流量汇总，无法区分唯一安装，所以“活跃用户”需要自建计数。仓库内附带一个可选的 Cloudflare Worker：`tools/telemetry_worker.js`。它使用 KV 保存匿名安装编号的最后出现时间，并返回 7 天、30 天活跃数和累计数。
+
+```powershell
+cd tools
+npx wrangler kv namespace create TELEMETRY
+# 把返回的 id 填进 tools/wrangler.toml（可从 telemetry_wrangler.example.toml 复制）
+npx wrangler deploy --config tools/wrangler.toml
+```
+
+部署后把 Worker 地址配置到启动环境，例如：
+
+```powershell
+$env:WOWS_HEARTBEAT_URL = 'https://<worker>.workers.dev/heartbeat'
+$env:WOWS_TELEMETRY_STATS_URL = 'https://<worker>.workers.dev/stats'
+```
+
+控制台会把统计结果显示在“版本更新”面板的“活跃用户”一行；没有配置时显示“未配置统计”。心跳只包含随机编号、版本和平台，统计接口只返回聚合数字。
+
 
 ## 使用提醒
 
