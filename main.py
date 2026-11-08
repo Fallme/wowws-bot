@@ -211,6 +211,26 @@ def count_quick_battle_for_plan(
     return max(0, int(completed_rounds))
 
 
+def is_quick_round_already_counted(
+    *,
+    counted: bool,
+    counted_start,
+    current_start,
+) -> bool:
+    """Prevent the same death/requeue page from counting a round twice."""
+
+    if not counted:
+        return False
+    if current_start is None:
+        return True
+    if counted_start is None:
+        return False
+    try:
+        return abs(float(current_start) - float(counted_start)) < 5.0
+    except (TypeError, ValueError):
+        return False
+
+
 def count_settled_battle_for_plan(
     completed_rounds: int,
     *,
@@ -828,15 +848,37 @@ def observe_battle_phase(bot, image, state):
     tracker = getattr(bot, "_battle_phase_tracker", None)
     if tracker is None:
         tracker = bot._battle_phase_tracker = BattlePhaseTracker()
+    observed_at = time.monotonic()
+    if state != ScreenState.BATTLE:
+        # A loading/port/result boundary invalidates a fallback assumption
+        # made for the previous HUD.
+        bot._battle_phase_assumed_active = False
+    if state in {ScreenState.LOADING, ScreenState.PORT, ScreenState.RESULTS}:
+        bot._battle_hud_since = None
+        bot._battle_started_monotonic = None
+        bot._battle_start_source = None
+        bot._battle_clock_confirmations = 0
+        bot._last_battle_clock_seconds = None
+        bot._last_battle_clock_at = None
+        bot._last_logged_battle_clock = None
     clock = None
+    clock_ms = 0.0
     if state == ScreenState.BATTLE:
         backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
         reader = getattr(bot.vision, "read_battle_clock_seconds", None)
         if callable(reader) and backend is not None:
+            clock_started = time.perf_counter()
             try:
                 clock = reader(image, backend)
             except Exception:
                 logger.debug("战斗阶段计时 OCR 暂不可用", exc_info=True)
+            finally:
+                clock_ms = (time.perf_counter() - clock_started) * 1000.0
+            if clock is None:
+                last_failure_log = getattr(bot, "_battle_clock_failure_log_at", None)
+                if last_failure_log is None or observed_at - last_failure_log >= 15.0:
+                    logger.info("对局计时 OCR 未识别，耗时 %.0fms；继续复核战斗状态", clock_ms)
+                    bot._battle_clock_failure_log_at = observed_at
     active_evidence = bool(getattr(bot, "_round_control_initialized", False))
     if state == ScreenState.BATTLE and clock is not None and clock <= 60 and not active_evidence:
         try:
@@ -847,7 +889,70 @@ def observe_battle_phase(bot, image, state):
             active_evidence = (speed is not None and abs(speed) > 2) or (health is not None and health < 0.99)
         except Exception:
             logger.debug("短计时战斗证据暂不可用", exc_info=True)
-    phase = tracker.observe(state, clock, time.monotonic(), active_evidence=active_evidence)
+    if state == ScreenState.BATTLE and getattr(bot, "_battle_hud_since", None) is None:
+        # The first stable HUD frame is the fallback anchor when the match
+        # clock never becomes readable; it is at worst the preparation
+        # boundary, never the later M-map/OCR handoff.
+        bot._battle_hud_since = observed_at
+    phase = tracker.observe(state, clock, observed_at, active_evidence=active_evidence)
+    if state == ScreenState.BATTLE and getattr(
+        bot, "_battle_phase_assumed_active", False
+    ):
+        # The clock detector can fail completely on another HUD scale. Once
+        # the battle controller has verified a stable HUD, live player marker
+        # and no closing overlay, do not let an unreadable timer stop driving.
+        phase = BattlePhase.ACTIVE
+    if clock is not None and state == ScreenState.BATTLE:
+        previous_clock = getattr(bot, "_last_battle_clock_seconds", None)
+        previous_at = getattr(bot, "_last_battle_clock_at", None)
+        consistent = bool(
+            previous_clock is not None
+            and previous_at is not None
+            and 0 < int(previous_clock) - int(clock)
+            <= (observed_at - float(previous_at)) + 2
+        )
+        confirmations = int(
+            getattr(bot, "_battle_clock_confirmations", 0)
+        )
+        bot._battle_clock_confirmations = confirmations + 1 if consistent else 0
+        bot._last_battle_clock_seconds = clock
+        bot._last_battle_clock_at = observed_at
+        last_logged = getattr(bot, "_last_logged_battle_clock", None)
+        last_logged_at = float(
+            getattr(bot, "_last_logged_battle_clock_at", 0.0) or 0.0
+        )
+        if (
+            last_logged is None
+            or abs(int(clock) - int(last_logged)) >= 5
+            or observed_at - last_logged_at >= 30.0
+        ):
+            logger.info(
+                "对局时间识别: %02d:%02d（%d 秒） OCR %.0fms",
+                int(clock) // 60,
+                int(clock) % 60,
+                int(clock),
+                clock_ms,
+            )
+            bot._last_logged_battle_clock = int(clock)
+            bot._last_logged_battle_clock_at = observed_at
+    if state == ScreenState.BATTLE and phase == BattlePhase.ACTIVE:
+        existing_start = getattr(bot, "_battle_started_monotonic", None)
+        source = getattr(bot, "_battle_start_source", None)
+        if (clock is not None and 0 <= clock <= 20 * 60
+                and int(getattr(bot, "_battle_clock_confirmations", 0)) >= 1):
+            # The game clock is the authoritative match start, but require a
+            # second consistent decrement before anchoring. A single noisy
+            # MM:SS token must not move the start earlier and abort a healthy
+            # quick battle. Once anchored, later jitter never ratchets it.
+            derived_start = observed_at - (20 * 60 - clock)
+            if source != "clock" or existing_start is None:
+                bot._battle_started_monotonic = derived_start
+                bot._battle_start_source = "clock"
+        elif existing_start is None:
+            bot._battle_started_monotonic = float(
+                getattr(bot, "_battle_hud_since", observed_at)
+            )
+            bot._battle_start_source = "hud"
     if phase != getattr(bot, "_observed_battle_phase", None):
         logger.info("战斗阶段: %s | 比赛计时=%s", phase.value, clock)
         bot._observed_battle_phase = phase
@@ -855,6 +960,56 @@ def observe_battle_phase(bot, image, state):
         if reporter is not None:
             reporter.update(reporter.status.state, reporter.status.message, battle_phase=phase.value)
     return phase
+
+
+def battle_phase_clock_fallback_ready(bot, image):
+    """Check whether a stable battle HUD can be driven without its clock.
+
+    This is deliberately narrower than the ordinary battle classifier: it
+    needs the real lower-right minimap player marker, rejects a verified
+    corner-Esc overlay and refuses a dead/spectator ship. The caller applies
+    the elapsed-time bound before calling it.
+    """
+    vision = getattr(bot, "vision", None)
+    find_minimap = getattr(vision, "find_minimap", None)
+    find_player_pose = getattr(vision, "find_player_pose_on_minimap", None)
+    if not callable(find_minimap) or not callable(find_player_pose):
+        return False, "no_minimap_detector"
+    try:
+        minimap = find_minimap(image)
+        pose = (
+            find_player_pose(minimap)
+            if minimap is not None and getattr(minimap, "size", 0)
+            else None
+        )
+    except Exception:
+        logger.debug("计时兜底检查玩家箭头失败", exc_info=True)
+        return False, "minimap_pose_error"
+    try:
+        hint = recovery_escape_hint(bot, image, ScreenState.UNKNOWN)
+    except Exception:
+        logger.debug("计时兜底检查角落 Esc 失败", exc_info=True)
+        hint = None
+    if hint is not None:
+        return False, "corner_escape_hint"
+    health_reader = getattr(vision, "read_health_fraction", None)
+    health = None
+    if callable(health_reader):
+        try:
+            health = health_reader(
+                image,
+                getattr(getattr(bot, "distance_reader", None), "backend", None),
+            )
+        except Exception:
+            logger.debug("计时兜底检查生命值失败", exc_info=True)
+            health = None
+        if health is not None and float(health) <= 0.0:
+            return False, "ship_dead"
+    # A readable player HUD is an independent live-battle anchor when the
+    # minimap marker detector itself is unavailable on this HUD scale.
+    if pose is None and health is None:
+        return False, "player_marker_unavailable"
+    return True, ""
 
 
 def wait_for_recognized_screen(bot: BattleBot, timeout: float = 300.0):
@@ -1462,10 +1617,62 @@ def wait_for_battle(
         if state == ScreenState.BATTLE:
             unknown_frames = 0
             if callable(getattr(bot.vision, "read_battle_clock_seconds", None)):
-                if observe_battle_phase(bot, image, state) != BattlePhase.ACTIVE:
-                    battle_frames = 0
-                    clock_frames = 0
-                    continue
+                phase = observe_battle_phase(bot, image, state)
+                if phase != BattlePhase.ACTIVE:
+                    phase_now = time.monotonic()
+                    phase_strategy = getattr(bot, "strategy", None) or {}
+                    fallback_seconds = max(20.0, float(
+                        phase_strategy.get(
+                            "battle_phase_clock_fallback_seconds", 45.0,
+                        )
+                    ))
+                    if phase == BattlePhase.PREPARING:
+                        phase_since = getattr(
+                            bot, "_battle_phase_preparing_since", None,
+                        )
+                        if phase_since is None:
+                            bot._battle_phase_preparing_since = phase_since = phase_now
+                    else:
+                        phase_since = getattr(
+                            bot, "_battle_phase_unconfirmed_since", None,
+                        )
+                        if phase_since is None:
+                            bot._battle_phase_unconfirmed_since = phase_since = phase_now
+                    if (
+                        phase_now - phase_since >= fallback_seconds
+                        and not loading_start_confirmed(bot, image)
+                    ):
+                        ready, reason = battle_phase_clock_fallback_ready(
+                            bot, image
+                        )
+                        if ready:
+                            bot._battle_phase_assumed_active = True
+                            bot._battle_phase_unconfirmed_since = None
+                            bot._battle_phase_preparing_since = None
+                            logger.warning(
+                                "等待战斗 HUD 时计时 OCR 连续 %.0f 秒不可用；"
+                                "稳定 HUD、玩家标记/生命值和存活状态通过复核，"
+                                "按已开战继续",
+                                phase_now - phase_since,
+                            )
+                        else:
+                            if phase == BattlePhase.PREPARING:
+                                bot._battle_phase_preparing_since = phase_now
+                            else:
+                                bot._battle_phase_unconfirmed_since = phase_now
+                            logger.warning(
+                                "等待战斗 HUD 时计时 OCR 不可用超过 %.0f 秒，"
+                                "兜底证据不足（%s）；继续只读观察",
+                                phase_now - phase_since,
+                                reason,
+                            )
+                    if not getattr(bot, "_battle_phase_assumed_active", False):
+                        battle_frames = 0
+                        clock_frames = 0
+                        continue
+                else:
+                    bot._battle_phase_unconfirmed_since = None
+                    bot._battle_phase_preparing_since = None
             if require_new_round and not loading_seen:
                 battle_frames = 0
                 clock_frames = 0
@@ -1690,29 +1897,63 @@ def run_battle(
         if control_state != ScreenState.BATTLE:
             logger.warning("战斗动作互锁：最新画面已不是战斗，撤销驾驶并重新分流")
             bot._battle_phase_unconfirmed_since = None
+            bot._battle_phase_preparing_since = None
+            bot._battle_phase_assumed_active = False
             return "resume_state"
         if loading_start_confirmed(bot, control_frame):
             logger.warning("战斗动作互锁：最新画面仍带开始战斗按钮，撤销驾驶并重新分流")
             bot._battle_phase_unconfirmed_since = None
+            bot._battle_phase_preparing_since = None
+            bot._battle_phase_assumed_active = False
             return "resume_state"
         if callable(getattr(bot.vision, "read_battle_clock_seconds", None)):
             phase = observe_battle_phase(bot, control_frame, control_state)
+            strategy = getattr(bot, "strategy", None) or {}
+            fallback_seconds = max(20.0, float(
+                strategy.get("battle_phase_clock_fallback_seconds", 45.0)
+            ))
+            now_monotonic = time.monotonic()
             if phase == BattlePhase.UNKNOWN:
                 # A port close-up / hub page can satisfy the broad battle-HUD
                 # anchors while carrying no match clock. Waiting forever keeps
                 # re-entering this same branch. After a bounded observation,
                 # use the verified corner Esc hint (numeric-HUD veto included)
                 # to back out instead of looping.
-                now_monotonic = time.monotonic()
                 since = getattr(bot, "_battle_phase_unconfirmed_since", None)
                 if since is None:
                     bot._battle_phase_unconfirmed_since = since = now_monotonic
                 wait_seconds = max(8.0, float(
-                    getattr(bot, "strategy", {}).get(
+                    strategy.get(
                         "battle_phase_unconfirmed_escape_seconds", 12.0,
                     )
                 ))
-                if now_monotonic - since >= wait_seconds:
+                if now_monotonic - since >= fallback_seconds:
+                    ready, reason = battle_phase_clock_fallback_ready(
+                        bot, control_frame
+                    )
+                    if ready:
+                        bot._battle_phase_assumed_active = True
+                        bot._battle_phase_unconfirmed_since = None
+                        bot._battle_phase_preparing_since = None
+                        bot._battle_phase_escape_attempts = 0
+                        phase = BattlePhase.ACTIVE
+                        logger.warning(
+                            "战斗计时 OCR 连续 %.0f 秒不可用；稳定 HUD、玩家标记/生命值"
+                            "和存活状态均已确认，按已开战接管驾驶",
+                            now_monotonic - since,
+                        )
+                    else:
+                        # Retry the bounded observation later instead of
+                        # logging and reclassifying every control frame.
+                        bot._battle_phase_unconfirmed_since = now_monotonic
+                        logger.warning(
+                            "战斗计时 OCR 不可用超过 %.0f 秒，但兜底证据不足"
+                            "（%s）；保持只读，稍后重新检查",
+                            now_monotonic - since,
+                            reason,
+                        )
+                        return "resume_state"
+                elif now_monotonic - since >= wait_seconds:
                     attempts = int(getattr(bot, "_battle_phase_escape_attempts", 0))
                     hint = None
                     if attempts < 3 and not operation_paused(bot):
@@ -1738,14 +1979,45 @@ def run_battle(
                 else:
                     logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
                 return "resume_state"
+            if phase == BattlePhase.PREPARING:
+                # PREPARING is the legitimate pre-battle countdown. It must
+                # still be bounded: a clock OCR that sticks at 20:00 on a
+                # different HUD scale otherwise parks the ship for the whole
+                # match. The same independent HUD/pose proof unlocks driving.
+                prep_since = getattr(bot, "_battle_phase_preparing_since", None)
+                if prep_since is None:
+                    bot._battle_phase_preparing_since = prep_since = now_monotonic
+                if now_monotonic - prep_since >= fallback_seconds:
+                    ready, reason = battle_phase_clock_fallback_ready(
+                        bot, control_frame
+                    )
+                    if ready:
+                        bot._battle_phase_assumed_active = True
+                        bot._battle_phase_unconfirmed_since = None
+                        bot._battle_phase_preparing_since = None
+                        phase = BattlePhase.ACTIVE
+                        logger.warning(
+                            "战斗计时连续 %.0f 秒停留在准备值；稳定 HUD、玩家标记/生命值"
+                            "和存活状态均已确认，按已开战接管驾驶",
+                            now_monotonic - prep_since,
+                        )
+                    else:
+                        bot._battle_phase_preparing_since = now_monotonic
+                        logger.warning(
+                            "战斗计时连续 %.0f 秒未推进，但兜底证据不足"
+                            "（%s）；保持只读，稍后重新检查",
+                            now_monotonic - prep_since,
+                            reason,
+                        )
+                        return "resume_state"
+                else:
+                    bot._battle_phase_unconfirmed_since = None
+                    logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
+                    return "resume_state"
             if phase == BattlePhase.ACTIVE:
                 bot._battle_phase_unconfirmed_since = None
+                bot._battle_phase_preparing_since = None
                 bot._battle_phase_escape_attempts = 0
-            else:
-                # PREPARING is the legitimate pre-battle countdown.
-                bot._battle_phase_unconfirmed_since = None
-                logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
-                return "resume_state"
         # A run can be restarted while the previous match is still in the
         # spectator/death HUD.  That screen retains enough battle anchors to
         # classify as BATTLE, but it is not a live ship and must never trigger
@@ -1764,6 +2036,25 @@ def run_battle(
                 logger.debug("战斗接管前生命值探测失败", exc_info=True)
         if dead_at_start:
             logger.info("接管前已确认舰船生命值为0；跳过全速重发和自动驾驶配置，等待结算")
+        if quick_battle and not dead_at_start:
+            clock_start = getattr(bot, "_battle_started_monotonic", None)
+            if clock_start is not None:
+                elapsed = max(0.0, time.monotonic() - float(clock_start))
+                limit = max(30.0, float(quick_seconds))
+                if elapsed >= limit:
+                    match_clock = getattr(bot, "_last_battle_clock_seconds", None)
+                    logger.info(
+                        "快速战斗接入时对局已运行 %.0f 秒，直接退出本局；"
+                        "不统计收益 | 游戏计时=%s",
+                        elapsed,
+                        (
+                            f"{int(match_clock) // 60:02d}:{int(match_clock) % 60:02d}"
+                            if match_clock is not None
+                            and 0 <= match_clock <= 20 * 60
+                            else "未知"
+                        ),
+                    )
+                    return "quick_timeout"
         if ((resume_existing or getattr(bot, "_opening_autopilot_retry_pending", False)) and not dead_at_start
                 and not getattr(bot, "opening_autopilot_active", False)
                 and not getattr(bot, "native_autopilot_abandoned", False)):
@@ -1842,6 +2133,16 @@ def run_battle(
     preconfigured_target_normalized = getattr(
         bot, "opening_autopilot_target_normalized", None
     )
+    assumed_battle_phase = bool(
+        getattr(bot, "_battle_phase_assumed_active", False)
+    )
+    battle_hud_since = getattr(bot, "_battle_hud_since", None)
+    battle_started_monotonic = getattr(
+        bot, "_battle_started_monotonic", None
+    )
+    battle_start_source = getattr(bot, "_battle_start_source", None)
+    battle_clock_at_start = getattr(bot, "_last_battle_clock_seconds", None)
+    battle_clock_observed_at = getattr(bot, "_last_battle_clock_at", None)
     setattr(bot, "_opening_autopilot_preconfigured", False)
     setattr(bot, "_opening_autopilot_attempted", False)
     setattr(bot, "_opening_motion_prestarted", False)
@@ -1861,6 +2162,16 @@ def run_battle(
         except TypeError:
             # Compatibility for small test doubles and third-party adapters.
             bot.reset()
+        # reset() clears per-round phase state. This fallback was verified on
+        # the very HUD that caused this reset, so carry it across the handoff;
+        # otherwise configure_opening_autopilot would wait for the same
+        # unreadable clock for another minute.
+        bot._battle_phase_assumed_active = assumed_battle_phase
+        bot._battle_hud_since = battle_hud_since
+        bot._battle_started_monotonic = battle_started_monotonic
+        bot._battle_start_source = battle_start_source
+        bot._last_battle_clock_seconds = battle_clock_at_start
+        bot._last_battle_clock_at = battle_clock_observed_at
         setattr(bot, "_round_control_initialized", True)
         if preconfigured_autopilot:
             enable = getattr(bot, "enable_opening_autopilot", None)
@@ -1982,16 +2293,50 @@ def run_battle(
         bot.last_movement_reason = "自动航行设置失败，通用驾驶向地图中央接管"
         logger.warning("战术地图自动航行设置失败，通用驾驶向地图中央接管")
     last_progress = 0.0
-    quick_started_at = (
-        float(getattr(bot, "battle_start_time", time.monotonic()))
-        if resume_existing
-        else time.monotonic()
-    )
+    derived_battle_start = getattr(bot, "_battle_started_monotonic", None)
+    if derived_battle_start is not None:
+        # Prefer the in-game clock estimate. It is anchored to 20:00, so
+        # loading, tactical-map setup and OCR time cannot extend a quick
+        # battle past its five-minute budget.
+        quick_started_at = float(derived_battle_start)
+    else:
+        quick_started_at = (
+            float(getattr(bot, "battle_start_time", time.monotonic()))
+            if resume_existing
+            else time.monotonic()
+        )
     quick_deadline = (
         quick_started_at + max(30.0, float(quick_seconds))
         if quick_battle
         else None
     )
+    if quick_battle:
+        match_clock = getattr(bot, "_last_battle_clock_seconds", None)
+        if match_clock is not None and 0 <= match_clock <= 20 * 60:
+            remaining = max(
+                0.0,
+                float(quick_seconds) - (20 * 60 - int(match_clock)),
+            )
+            logger.info(
+                "快速战斗计时: 对局已进行约 %d 秒（游戏计时 %02d:%02d），"
+                "距离五分钟退出还剩约 %.0f 秒",
+                20 * 60 - int(match_clock),
+                int(match_clock) // 60,
+                int(match_clock) % 60,
+                remaining,
+            )
+        else:
+            source_text = (
+                "首次战斗 HUD"
+                if getattr(bot, "_battle_start_source", None) == "hud"
+                else "控制接管时刻"
+            )
+            logger.info(
+                "快速战斗计时: 游戏计时暂不可用，按%s起算，"
+                "本次控制最多 %.0f 秒",
+                source_text,
+                max(0.0, quick_deadline - quick_started_at),
+            )
     # A normal battle must also have an absolute upper bound.  If the scene
     # classifier keeps reporting BATTLE after the match ended (result-page OCR
     # never stabilises, a sunk ship is misread as alive, or the battle-HUD
@@ -2016,7 +2361,18 @@ def run_battle(
             return False
         now = time.monotonic()
         if quick_deadline is not None and now >= quick_deadline:
-            logger.info("快速战斗已运行五分钟，退出本局回港；不统计收益")
+            match_clock = getattr(bot, "_last_battle_clock_seconds", None)
+            clock_text = (
+                f"{int(match_clock) // 60:02d}:{int(match_clock) % 60:02d}"
+                if match_clock is not None and 0 <= match_clock <= 20 * 60
+                else "未知"
+            )
+            logger.info(
+                "快速战斗已运行五分钟，退出本局回港；不统计收益 | "
+                "对局计时=%.0fs 游戏计时=%s",
+                max(0.0, now - quick_started_at),
+                clock_text,
+            )
             return "quick_timeout"
         if battle_deadline is not None and now >= battle_deadline:
             logger.warning(
@@ -2337,6 +2693,7 @@ def configure_opening_autopilot(
                     setattr(bot, "_opening_autopilot_attempted", False)
                     return False
             else:
+                setattr(bot, "_autopilot_waiting_for_start", False)
                 setattr(bot, "_opening_autopilot_attempted", False)
                 logger.warning("尚未确认正式开战，保留自动航行机会并重新识别")
                 return False
@@ -3884,6 +4241,8 @@ def run():
     battle_recovery_failures = 0
     battle_timeout_count = 0
     quick_closure_failures = 0
+    quick_round_counted = False
+    quick_counted_round_start = None
     daily_reward_failures = 0
     # Once matchmaking/loading/battle has been committed, PORT is not allowed
     # to start selection again until settlement positively closes this round.
@@ -4201,6 +4560,66 @@ def run():
                     reporter.update(
                         "returning",
                         "已确认本局结算并回到港口；本局已计数，收益记为未识别",
+                        current_round=current_round,
+                        completed_rounds=completed_rounds,
+                        rewards_status=(
+                            "skipped" if limits.quick_battle else "unrecognized"
+                        ),
+                        rewards_round=(
+                            0 if limits.quick_battle else current_round
+                        ),
+                        last_rewards={},
+                        last_outcome="unknown",
+                    )
+                    if should_stop():
+                        manually_stopped = user_stop_requested()
+                        plan_completed = not manually_stopped
+                        reporter.update(
+                            "stopped" if manually_stopped else "completed",
+                            "已按用户要求安全停止"
+                            if manually_stopped
+                            else "运行计划已完成",
+                            current_round=current_round,
+                            completed_rounds=completed_rounds,
+                            movement_mode="idle",
+                            movement_reason="计划已完成，控制已安全释放",
+                            route_phase="unplanned",
+                            route_progress=0.0,
+                            route_waypoint=0,
+                            route_arrived=False,
+                            inside_capture_point=False,
+                            paused_by_user=False,
+                            manual_intervention_active=False,
+                            manual_intervention_latched=False,
+                        )
+                        return 0
+                    continue
+                if round_in_progress and not round_result_seen:
+                    # recover_current_scene returns PORT for an active round
+                    # only when the OCR-verified 加入战斗 button is present.
+                    # That proves the previous match really ended even though
+                    # the results page was missed during a pause/focus loss.
+                    # Close it once before preparing the next match; otherwise
+                    # the plan silently loses a round and re-enters a port
+                    # while still holding the old round lock.
+                    completed_rounds = max(0, int(completed_rounds)) + 1
+                    finalize_round_diagnostics(
+                        bot,
+                        current_round,
+                        outcome="unknown",
+                    )
+                    round_in_progress = False
+                    round_entry_pending = False
+                    round_result_seen = False
+                    setattr(bot, "_round_control_initialized", False)
+                    logger.warning(
+                        "已凭 OCR 确认的港口加入战斗按钮闭合本局；"
+                        "结算页缺失，收益/胜负未知，计入计划进度: %s",
+                        completed_rounds,
+                    )
+                    reporter.update(
+                        "returning",
+                        "已确认回到港口；本局按完成计入，收益/胜负未知",
                         current_round=current_round,
                         completed_rounds=completed_rounds,
                         rewards_status=(
@@ -4812,28 +5231,48 @@ def run():
                             "快速战斗连续 3 次无法确认离开本局，已安全终止任务"
                         )
                     continue
-                completed_rounds = count_quick_battle_for_plan(
-                    completed_rounds,
-                    battle_finished,
-                    closure_confirmed=True,
+                current_round_start = getattr(
+                    bot, "_battle_started_monotonic", None
                 )
-                quick_closure_failures = 0
-                finalize_round_diagnostics(
-                    bot,
-                    current_round,
-                    outcome="quick_battle",
+                already_counted = is_quick_round_already_counted(
+                    counted=quick_round_counted,
+                    counted_start=quick_counted_round_start,
+                    current_start=current_round_start,
                 )
+                if already_counted:
+                    logger.warning(
+                        "同一快速战斗已完成计数；本次只继续退出/续局，不重复计入局数"
+                    )
+                    quick_closure_failures = 0
+                else:
+                    completed_rounds = count_quick_battle_for_plan(
+                        completed_rounds,
+                        battle_finished,
+                        closure_confirmed=True,
+                    )
+                    quick_round_counted = True
+                    quick_counted_round_start = current_round_start
+                    quick_closure_failures = 0
+                    finalize_round_diagnostics(
+                        bot,
+                        current_round,
+                        outcome="quick_battle",
+                    )
+                    logger.info(
+                        "快速战斗已确认离开，本局计入计划进度: %s",
+                        completed_rounds,
+                    )
                 round_in_progress = False
                 round_entry_pending = False
                 round_result_seen = False
                 setattr(bot, "_round_control_initialized", False)
-                logger.info(
-                    "快速战斗已确认离开，本局计入计划进度: %s",
-                    completed_rounds,
-                )
                 reporter.update(
                     "returning",
-                    "快速战斗已确认结束并计入计划局数；本局不统计收益",
+                    (
+                        "同一快速战斗已计数，继续进入下一局"
+                        if already_counted
+                        else "快速战斗已确认结束并计入计划局数；本局不统计收益"
+                    ),
                     current_round=current_round,
                     completed_rounds=completed_rounds,
                     rewards_status="skipped",

@@ -138,6 +138,31 @@ def test_reverse_stops_before_replanning_and_waits_for_live_pose():
     assert backend.actual_notch > 0
 
 
+def test_navigation_blocked_releases_suspect_island_layer_after_timeout():
+    bot, _ = native_bot()
+    bot.opening_autopilot_active = False
+    bot.native_autopilot_abandoned = True
+    bot._battle_map_islands = ["bad layer"]
+    bot.strategy["navigation_blocked_fallback_seconds"] = 10.0
+    bot._navigation_blocked_since = 100.0
+    blocked = analysis(navigation_blocked=True)
+
+    bot._execute_rules(blocked, 105.0)
+    assert bot._last_movement_mode == "navigation_blocked"
+    assert "未找到连续可通航路线" in bot.last_movement_reason
+    assert bot._battle_map_islands == ["bad layer"]
+    assert not bot.generic_center_route_active
+
+    bot._execute_rules(blocked, 111.0)
+    assert bot._battle_map_islands == []
+    assert bot.generic_center_route_active
+    assert bot._navigation_blocked_since is None
+    assert bot._navigation_blocked_released
+    bot._last_movement_mode = "planner"
+    bot._execute_rules(blocked, 112.0)
+    assert bot._last_movement_mode != "navigation_blocked"
+
+
 def test_user_pause_prevents_even_reverse_input():
     bot, backend = native_bot()
     bot.stuck_recovery.begin_reverse(100)

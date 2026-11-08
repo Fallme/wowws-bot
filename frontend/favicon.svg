@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">战舰自动化控制台</title>
+  <desc id="desc">深色圆角底、金色盾牌与 W 字标</desc>
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6d27a"/>
+      <stop offset="0.55" stop-color="#eeb54b"/>
+      <stop offset="1" stop-color="#c78028"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0c171c"/>
+  <rect x="1.2" y="1.2" width="61.6" height="61.6" rx="13"
+        fill="none" stroke="#eeb54b" stroke-opacity="0.34" stroke-width="1.2"/>
+  <path d="M32 8.5 L51.5 14.8 L48.5 44.5 L32 55.5 L15.5 44.5 L12.5 14.8 Z"
+        fill="url(#gold)" stroke="#f6d27a" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M19.5 21.5 L26.2 42.2 L32 30.5 L37.8 42.2 L44.5 21.5"
+        fill="none" stroke="#0c171c" stroke-width="5.6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -151,6 +151,22 @@ def test_one_frame_layout_is_computed_once_and_no_previous_frame_is_reused():
     json.dumps(first.diagnostics())
 
 
+@pytest.mark.parametrize("width,height,scale", CASES)
+def test_approximate_ocr_regions_scale_with_resolution_and_stay_on_screen(
+    width, height, scale,
+):
+    image, _, _ = hud_frame(width, height, scale)
+    layout = detect_hud_layout(image)
+    for name in ("clock", "health_text", "speed", "autopilot_text"):
+        x1, y1, x2, y2 = layout.approximate_rect(name)
+        assert 0 <= x1 < x2 <= width
+        assert 0 <= y1 < y2 <= height
+        assert x2 - x1 >= width * .15
+        assert y2 - y1 >= height * .03
+    assert layout.approximate_crop(image, "clock").size > 0
+    assert layout.approximate_crop(image, "health_text").size > 0
+
+
 def test_inferred_clock_stays_right_of_capture_timers_and_rejects_conflicts():
     image, _, _ = hud_frame(1920, 1080, 1.25)
     layout = detect_hud_layout(image)
@@ -169,6 +185,105 @@ def test_inferred_clock_stays_right_of_capture_timers_and_rejects_conflicts():
     assert Vision.read_battle_clock_seconds(image, Backend([
         OcrToken("19:58", .99, box), OcrToken("1:15", .99, box)])) is None
     assert Vision.read_battle_clock_seconds(image, Backend([OcrToken("19:58", .40, box)])) is None
+
+
+def _marker_only_backend(marker, tokens):
+    class Backend:
+        def recognize(self, crop):
+            if np.any(np.all(crop == marker, axis=2)):
+                return tokens
+            return []
+    return Backend()
+
+
+def test_clock_approximate_right_top_region_recovers_when_precise_crop_misses():
+    image = np.full((2160, 3840, 3), 45, np.uint8)
+    layout = detect_hud_layout(image)
+    precise = layout.rect("clock")
+    approximate = layout.approximate_rect("clock")
+    assert approximate != precise
+    # The marker is deliberately below the precise clock band but inside the
+    # generous right-top fallback used for compact HUDs on a 4K framebuffer.
+    marker = (approximate[0] + 20, approximate[3] - 20)
+    image[marker[1]:marker[1] + 6, marker[0]:marker[0] + 6] = (255, 255, 255)
+    token = OcrToken("19:58", .99, ((10, 5), (100, 5), (100, 30), (10, 30)))
+    assert Vision.read_battle_clock_seconds(
+        image, _marker_only_backend((255, 255, 255), [token])
+    ) == 1198
+
+
+def test_health_approximate_lower_left_region_recovers_when_precise_crop_misses():
+    image = np.full((2160, 3840, 3), 45, np.uint8)
+    layout = detect_hud_layout(image)
+    precise = layout.rect("health_text")
+    approximate = layout.approximate_rect("health_text")
+    assert approximate != precise
+    marker = (approximate[0] + 900, approximate[1] + 75)
+    image[marker[1]:marker[1] + 6, marker[0]:marker[0] + 6] = (235, 0, 235)
+    token = OcrToken(
+        "40 000 / 80 000", .99,
+        ((50, 50), (260, 50), (260, 80), (50, 80)),
+    )
+    assert Vision.read_health_fraction(
+        image, _marker_only_backend((235, 0, 235), [token])
+    ) == .5
+
+
+def test_health_approximate_region_is_not_blocked_by_engine_telegraph_fraction():
+    image = np.full((600, 1000, 3), 45, np.uint8)
+    layout = detect_hud_layout(image)
+    precise = layout.rect("health_text")
+    approximate = layout.approximate_rect("health_text")
+    gear = (precise[0] + 5, precise[1] + 5)
+    hp = (approximate[0] + 250, approximate[1] + 5)
+    image[gear[1]:gear[1] + 6, gear[0]:gear[0] + 6] = (0, 0, 255)
+    image[hp[1]:hp[1] + 6, hp[0]:hp[0] + 6] = (235, 0, 235)
+
+    class Backend:
+        def recognize(self, crop):
+            if np.any(np.all(crop == (235, 0, 235), axis=2)):
+                return [OcrToken("40 000 / 80 000", .99,
+                                 ((10, 10), (220, 10), (220, 40), (10, 40)))]
+            if np.any(np.all(crop == (0, 0, 255), axis=2)):
+                return [OcrToken("3/4", .99,
+                                 ((10, 10), (40, 10), (40, 30), (10, 30)))]
+            return []
+
+    assert Vision.read_health_fraction(image, Backend()) == .5
+
+
+def test_autopilot_approximate_lower_left_region_recovers_when_precise_crop_misses():
+    image = np.full((2160, 3840, 3), 45, np.uint8)
+    layout = detect_hud_layout(image)
+    precise = layout.rect("autopilot_text")
+    approximate = layout.approximate_rect("autopilot_text")
+    assert approximate != precise
+    marker = (approximate[0] + 1300, approximate[1] + 50)
+    image[marker[1]:marker[1] + 6, marker[0]:marker[0] + 6] = (0, 255, 0)
+    token = OcrToken("自动驾驶 启用", .99)
+    assert Vision.read_autopilot_enabled_text(
+        image, _marker_only_backend((0, 255, 0), [token])
+    ) is True
+
+
+def test_speed_approximate_lower_left_region_requires_a_real_telegraph_column():
+    image = np.full((2160, 3840, 3), 45, np.uint8)
+    layout = detect_hud_layout(image)
+    precise = layout.rect("speed")
+    approximate = layout.approximate_rect("speed")
+    assert approximate != precise
+    marker = (approximate[0] + 900, approximate[1] + 50)
+    image[marker[1]:marker[1] + 6, marker[0]:marker[0] + 6] = (240, 230, 0)
+    glyph = 10
+    tokens = []
+    for index, label in enumerate(("FULL", "3/4", "1/2", "1/4")):
+        y = 100 + index * 20
+        tokens.append(OcrToken(label, .99, ((1000, y), (1030, y), (1030, y + glyph), (1000, y + glyph))))
+    tokens.append(OcrToken("23.4 kts", .99, ((1050, 125), (1100, 125), (1100, 135), (1050, 135))))
+    assert Vision.read_speed_knots(
+        image, _marker_only_backend((240, 230, 0), tokens)
+    ) == 23.4
+
 
 
 @pytest.mark.parametrize("name", ["fire_dual_anchor.jpg", "fire_live_siberia.jpg", "fire_live_2k.jpg"])

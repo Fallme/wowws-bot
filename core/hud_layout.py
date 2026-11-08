@@ -36,6 +36,31 @@ _RECTS = {
     "minimap": (.73, .565, 1, 1, "right_bottom"),
 }
 
+# Approximate search regions for OCR. These deliberately ignore measured
+# translations: when the scale anchors are unavailable or the client UI is
+# compact on a large framebuffer, a generous normalized region still contains
+# the real HUD text. Readers try the precise crop first and only fall back to
+# these regions after it produces no trustworthy parse.
+_APPROX_RECTS = {
+    "health_bar": (0.0, .70, .32, .96),
+    "health_text": (0.0, .66, .32, .96),
+    "speed": (.02, .70, .36, 1.0),
+    "autopilot": (0.0, .70, .38, .98),
+    "autopilot_text": (0.0, .58, .44, 1.0),
+    "fire_dial": (0.0, .76, .22, 1.0),
+    "flood_left": (0.0, .72, .24, .98),
+    "player": (0.0, .58, .38, 1.0),
+    "fire_ship": (.10, .42, .82, 1.0),
+    "fire_status": (.34, .66, .66, .94),
+    "flood_center": (.36, .70, .64, .98),
+    "rudder_q": (.30, .60, .51, .92),
+    "rudder_e": (.49, .60, .70, .92),
+    "consumables": (.22, .70, .78, 1.0),
+    "clock": (.66, 0.0, 1.0, .18),
+    "score_clock": (.28, 0.0, .72, .18),
+    "minimap": (.62, .46, 1.0, 1.0),
+}
+
 
 @dataclass(frozen=True)
 class HudLayout:
@@ -82,8 +107,26 @@ class HudLayout:
         left, top, right, bottom, group = _RECTS[name]
         return self.map_rect((left * 2560, top * 1494, right * 2560, bottom * 1494), group)
 
+    def approximate_rect(self, name):
+        """A generous resolution-normalized search region for OCR fallback."""
+        left, top, right, bottom = _APPROX_RECTS.get(
+            name, _RECTS[name][:4]
+        )
+        if name not in _APPROX_RECTS:
+            margin_x, margin_y = .04, .04
+            left, top, right, bottom = (
+                left - margin_x, top - margin_y,
+                right + margin_x, bottom + margin_y,
+            )
+        return self._clip((left * self.width, top * self.height,
+                           right * self.width, bottom * self.height))
+
     def crop(self, image, name):
         x1, y1, x2, y2 = self.rect(name)
+        return image[y1:y2, x1:x2]
+
+    def approximate_crop(self, image, name):
+        x1, y1, x2, y2 = self.approximate_rect(name)
         return image[y1:y2, x1:x2]
 
     def diagnostics(self):

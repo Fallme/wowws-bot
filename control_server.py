@@ -1588,9 +1588,46 @@ class ControlHandler(SimpleHTTPRequestHandler):
             self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
 
+_CONTROL_SERVER_MUTEX = None
+
+
+def acquire_control_server_mutex():
+    """Prevent two consoles from writing the same SQLite database.
+
+    The control store is a single local SQLite file. Two console processes
+    opening it concurrently can turn a transient disk error into a malformed
+    database, so hold a per-session named mutex for the server lifetime.
+    """
+    global _CONTROL_SERVER_MUTEX
+    if os.name != "nt":
+        _CONTROL_SERVER_MUTEX = object()
+        return _CONTROL_SERVER_MUTEX
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.wintypes.LPVOID,
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.LPCWSTR,
+    )
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(
+        None, False, "Local\woWsBotControlServerSingleInstance"
+    )
+    if not handle:
+        return None
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return None
+    _CONTROL_SERVER_MUTEX = handle
+    return handle
+
+
 def main():
     if not ensure_elevated_control_server():
         return
+    if acquire_control_server_mutex() is None:
+        print("控制台已在运行；同一时间只允许一个控制台实例，避免数据库并发损坏")
+        return 1
     host = os.environ.get("WOWS_PANEL_HOST", "127.0.0.1")
     # 8765 falls inside a Windows-reserved port block (Hyper-V/WSL dynamic
     # range 8753-8852) on some machines, which makes bind fail with

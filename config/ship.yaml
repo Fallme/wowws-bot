@@ -58,6 +58,8 @@ pommern:
     autopilot_confirmed_stall_seconds: 20.0 # 低速且新鲜位置连续不变才接管
     autopilot_stall_takeover_seconds: 10.0 # 原生自动航行持续停顿后切换到闭环驾驶
     battle_phase_unconfirmed_escape_seconds: 12.0 # 战斗HUD无法确认开战时凭角落Esc退回
+    battle_phase_clock_fallback_seconds: 45.0 # 计时OCR不可用/停在准备值时按稳定HUD兜底接管
+    navigation_blocked_fallback_seconds: 10.0 # 持续无可通航路线的停车上限，超过后停用可疑山体层
     qe_speed_knots: 30.0            # Q/E航迹预测使用的满速
     qe_rudder_shift_seconds: 15.0   # 中舵到满舵约15秒
     qe_turning_radius_km: 1.0       # 满舵稳态转弯半径
@@ -155,6 +157,8 @@ napoli:
     autopilot_confirmed_stall_seconds: 20.0 # 低速且新鲜位置连续不变才接管
     autopilot_stall_takeover_seconds: 10.0 # 原生自动航行持续停顿后切换到闭环驾驶
     battle_phase_unconfirmed_escape_seconds: 12.0 # 战斗HUD无法确认开战时凭角落Esc退回
+    battle_phase_clock_fallback_seconds: 45.0 # 计时OCR不可用/停在准备值时按稳定HUD兜底接管
+    navigation_blocked_fallback_seconds: 10.0 # 持续无可通航路线的停车上限，超过后停用可疑山体层
     qe_speed_knots: 36.0
     qe_rudder_shift_seconds: 15.0
     qe_turning_radius_km: 1.0

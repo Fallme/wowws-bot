@@ -18,6 +18,8 @@ import unicodedata
 import cv2
 import numpy as np
 
+from core import perf
+
 
 logger = logging.getLogger("ocr")
 
@@ -525,6 +527,7 @@ class TargetDistanceReader:
                 return True
         return False
 
+    @perf.timed("目标距离OCR")
     def read(
         self,
         image,

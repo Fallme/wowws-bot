@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from core import perf
 from core.events import EventBus, JsonlEventRecorder
 from core.trajectory import TrajectoryRecorder
 from core.input import create_input_controller
@@ -503,6 +504,17 @@ class BattleBot:
         self._opening_autopilot_pending_target = None
         self._tactical_map_left_open = False
         self._round_control_initialized = False
+        self._battle_phase_assumed_active = False
+        self._battle_hud_since = None
+        self._battle_started_monotonic = None
+        self._battle_start_source = None
+        self._battle_clock_confirmations = 0
+        self._last_battle_clock_seconds = None
+        self._last_battle_clock_at = None
+        self._last_logged_battle_clock = None
+        self._last_logged_battle_clock_at = 0.0
+        self._navigation_blocked_since = None
+        self._navigation_blocked_released = False
         self.generic_center_route_active = False
         self.movement_feedback_failures = 0
         self._last_movement_mode = None
@@ -635,6 +647,20 @@ class BattleBot:
         self._island_avoidance_rudder = 0.0
         self._capture_zone = None
         self._unknown_since = None
+        self._battle_phase_assumed_active = False
+        self._battle_phase_unconfirmed_since = None
+        self._battle_phase_preparing_since = None
+        self._battle_phase_escape_attempts = 0
+        self._battle_hud_since = None
+        self._battle_started_monotonic = None
+        self._battle_start_source = None
+        self._battle_clock_confirmations = 0
+        self._last_battle_clock_seconds = None
+        self._last_battle_clock_at = None
+        self._last_logged_battle_clock = None
+        self._last_logged_battle_clock_at = 0.0
+        self._navigation_blocked_since = None
+        self._navigation_blocked_released = False
         self._ended_state_streak = 0
         self.movement_verified = False
         self._last_full_speed_reassert = 0.0
@@ -1356,6 +1382,7 @@ class BattleBot:
         self._last_applied_rudder = desired
         return desired
 
+    @perf.timed("战斗分析", slow_ms=500)
     def analyze(self) -> BattleAnalysis:
         flush_health_evidence = getattr(self, "_flush_health_transition_evidence", None)
         if callable(flush_health_evidence):
@@ -2366,6 +2393,7 @@ class BattleBot:
             nearest = candidates[0] if candidates else None
         return target_track, nearest, observation, evidence, stable_distance
 
+    @perf.timed("战斗帧", slow_ms=700)
     def combat_tick(self):
         analysis = self.analyze()
         self.last_analysis = analysis
@@ -2692,14 +2720,58 @@ class BattleBot:
             if self.intervention.poll(self.gamepad, time.monotonic()):
                 self.mark_manual_pause()
                 return
-            self.gamepad.set_movement(0.0, 0.0)
-            self._record_applied_helm(0.0, time.monotonic())
-            self.stuck_recovery.cancel()
-            self.feedback.reset()
-            self.last_movement_command = None
-            self.last_movement_reason = "未找到连续可通航路线，停车等待地形确认，禁止穿岛直行"
-            self._last_movement_mode = "navigation_blocked"
-            return
+            now_blocked = now
+            if self._navigation_blocked_released:
+                # This battle already discarded the suspect static layer.
+                # Keep planning every frame instead of parking in ten-second
+                # cycles if the remaining planner still reports no path.
+                pass
+            else:
+                if self._navigation_blocked_since is None:
+                    self._navigation_blocked_since = now_blocked
+                blocked_for = now_blocked - self._navigation_blocked_since
+                fallback_after = max(4.0, float(
+                    self.strategy.get("navigation_blocked_fallback_seconds", 10.0)
+                ))
+                if blocked_for >= fallback_after:
+                    # A frozen or mis-scaled island layer can report every path
+                    # blocked while the ship sits in open water. Parking forever
+                    # forfeits the whole match, so stop trusting that layer for
+                    # the rest of this battle and hand control to the generic
+                    # objective. Live island-risk detection and the stuck-recovery
+                    # low-speed check still protect the hull.
+                    had_layer = bool(self._battle_map_islands)
+                    self._battle_map_islands = []
+                    self.island_route_planner.reset()
+                    self.engagement_route_planner.reset()
+                    self.enable_generic_center_route(
+                        "连续 %.0f 秒无可通航路线；停用本局可疑山体层，改用通用驾驶"
+                        % blocked_for
+                    )
+                    logger.warning(
+                        "连续 %.0f 秒未找到可通航路线；%s并改用通用驾驶",
+                        blocked_for,
+                        "已停用本局山体层，" if had_layer else "",
+                    )
+                    self._navigation_blocked_since = None
+                    self._navigation_blocked_released = True
+                    # Fall through to the ordinary planner on this frame. The
+                    # next frame rebuilds navigation without the discarded
+                    # layer and will not park again in this battle.
+                else:
+                    self.gamepad.set_movement(0.0, 0.0)
+                    self._record_applied_helm(0.0, time.monotonic())
+                    self.stuck_recovery.cancel()
+                    self.feedback.reset()
+                    self.last_movement_command = None
+                    self.last_movement_reason = (
+                        "未找到连续可通航路线，停车等待地形确认，禁止穿岛直行"
+                    )
+                    self._last_movement_mode = "navigation_blocked"
+                    return
+        else:
+            self._navigation_blocked_since = None
+            self._navigation_blocked_released = False
         enemy_count = analysis.minimap_enemy_count
         command = self.movement.plan(
             SecondaryMovementInput(
@@ -3857,6 +3929,7 @@ class BattleBot:
                 "有" if analysis.torpedoes_incoming else "无",
                 "已确认" if self.movement_verified else "等待",
             )
+        perf.maybe_summary()
         self.tick += 1
         flush_health_evidence = getattr(self, "_flush_health_transition_evidence", None)
         if callable(flush_health_evidence):

@@ -5,7 +5,7 @@ import pytest
 
 from core.battle_phase import BattlePhase, BattlePhaseTracker
 from core.ui import ScreenState
-from main import run_battle, wait_for_battle
+from main import is_quick_round_already_counted, run_battle, wait_for_battle
 
 
 def test_loading_preparation_and_active_are_distinct():
@@ -87,3 +87,129 @@ def test_phase_is_persisted_to_runtime_status(tmp_path):
     args, kwargs = reporter.update.call_args
     inspect.signature(RuntimeReporter.update).bind(reporter, *args, **kwargs)
     assert kwargs["battle_phase"] == "loading"
+
+
+def test_clock_anchors_match_start_before_control_handoff():
+    from main import observe_battle_phase
+
+    bot = SimpleNamespace(
+        vision=SimpleNamespace(
+            read_battle_clock_seconds=Mock(side_effect=[1200, 1198]),
+        ),
+        distance_reader=SimpleNamespace(backend=object()),
+        _round_control_initialized=False,
+        _battle_phase_assumed_active=False,
+    )
+    with patch("main.time.monotonic", side_effect=[1000.0, 1001.0]):
+        assert observe_battle_phase(
+            bot, object(), ScreenState.BATTLE
+        ) == BattlePhase.PREPARING
+        assert observe_battle_phase(
+            bot, object(), ScreenState.BATTLE
+        ) == BattlePhase.ACTIVE
+    # 19:58 at observation time 1001 means the match started at 999, not
+    # when a later loading/setup handoff happened to finish.
+    assert bot._battle_started_monotonic == pytest.approx(999.0)
+    assert bot._last_battle_clock_seconds == 1198
+
+
+def test_quick_round_double_count_guard_keys_on_battle_identity():
+    assert not is_quick_round_already_counted(
+        counted=False, counted_start=None, current_start=1000.0
+    )
+    assert is_quick_round_already_counted(
+        counted=True, counted_start=1000.0, current_start=1002.0
+    )
+    assert not is_quick_round_already_counted(
+        counted=True, counted_start=1000.0, current_start=1010.0
+    )
+    # A re-observed death page after a reset has no start; skip the count.
+    assert is_quick_round_already_counted(
+        counted=True, counted_start=1000.0, current_start=None
+    )
+    # A genuinely new battle with no clock may supply its own HUD start later.
+    assert not is_quick_round_already_counted(
+        counted=True, counted_start=None, current_start=1010.0
+    )
+
+
+def test_quick_battle_uses_clock_derived_start_not_handoff_time():
+    class BattleVision:
+        @staticmethod
+        def grab(_hwnd, *, allow_stale=False):
+            return object()
+
+        @staticmethod
+        def classify_screen(_image):
+            return ScreenState.BATTLE
+
+    class QuickBot:
+        hwnd = 1
+        vision = BattleVision()
+        gamepad = SimpleNamespace()
+        intervention = None
+        battle_start_time = 100.0
+        _battle_started_monotonic = 0.0
+
+        @staticmethod
+        def reset(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def combat_tick():
+            raise AssertionError("clock-derived five-minute deadline must stop combat ticks")
+
+    with (
+        patch("main.ensure_bound_game_foreground", return_value=True),
+        patch("main.configure_opening_autopilot", return_value=True),
+        patch("main.time.monotonic", return_value=301.0),
+    ):
+        assert run_battle(QuickBot(), quick_battle=True) == "quick_timeout"
+
+
+def test_unreadable_clock_uses_first_hud_then_yields_to_clock_anchor():
+    from main import observe_battle_phase
+
+    bot = SimpleNamespace(
+        vision=SimpleNamespace(
+            read_battle_clock_seconds=Mock(side_effect=[None, 1198, 1197]),
+        ),
+        distance_reader=SimpleNamespace(backend=object()),
+        _round_control_initialized=False,
+        _battle_phase_assumed_active=True,
+    )
+    with patch("main.time.monotonic", side_effect=[1000.0, 1005.0, 1006.0]):
+        assert observe_battle_phase(
+            bot, object(), ScreenState.BATTLE
+        ) == BattlePhase.ACTIVE
+        assert bot._battle_start_source == "hud"
+        assert bot._battle_started_monotonic == pytest.approx(1000.0)
+        assert observe_battle_phase(
+            bot, object(), ScreenState.BATTLE
+        ) == BattlePhase.ACTIVE
+        # A single readable clock frame is not enough to replace the HUD
+        # fallback; it must agree with the next decrement.
+        assert bot._battle_start_source == "hud"
+        assert observe_battle_phase(
+            bot, object(), ScreenState.BATTLE
+        ) == BattlePhase.ACTIVE
+        assert bot._battle_start_source == "clock"
+        assert bot._battle_started_monotonic == pytest.approx(1003.0)
+
+
+def test_one_noisy_clock_read_cannot_ratchet_match_start_earlier():
+    from main import observe_battle_phase
+
+    bot = SimpleNamespace(
+        vision=SimpleNamespace(
+            read_battle_clock_seconds=Mock(side_effect=[1200, 1198, 658, 657]),
+        ),
+        distance_reader=SimpleNamespace(backend=object()),
+        _round_control_initialized=False,
+        _battle_phase_assumed_active=False,
+    )
+    with patch("main.time.monotonic", side_effect=[1000.0, 1001.0, 1002.0, 1003.0]):
+        for _ in range(4):
+            observe_battle_phase(bot, object(), ScreenState.BATTLE)
+    assert bot._battle_start_source == "clock"
+    assert bot._battle_started_monotonic == pytest.approx(999.0)

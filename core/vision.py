@@ -13,6 +13,7 @@ from pathlib import Path
 from core.terrain import exclude_player_land, repair_overlay_gaps
 from core.minimap_geometry import minimap_grid_bounds
 from core.hud_layout import detect_hud_layout
+from core import perf
 from core.tactical_geometry import detect_tactical_map_geometry
 
 import cv2
@@ -118,6 +119,7 @@ class Vision:
         """Expose the shared measured HUD and its diagnostic sources."""
         return detect_hud_layout(image)
 
+    @perf.timed("截图", slow_ms=300)
     def grab(self, hwnd, *, allow_stale=False):
         last_reason = "capture_failed"
         for attempt in range(3):
@@ -176,6 +178,7 @@ class Vision:
         )
 
     @staticmethod
+    @perf.timed("自动驾驶OCR")
     def read_autopilot_enabled_text(image, backend) -> bool | None:
         """Read the exact green lower-left ``自动驾驶`` status text.
 
@@ -186,46 +189,71 @@ class Vision:
         """
         if image is None or image.size == 0 or backend is None:
             return None
-        height, width = image.shape[:2]
         layout = detect_hud_layout(image)
-        crop = layout.crop(image, "autopilot_text")
-        if crop.size == 0:
+        candidates = [layout.crop(image, "autopilot_text")]
+        approximate_rect_fn = getattr(layout, "approximate_rect", None)
+        rect_fn = getattr(layout, "rect", None)
+        approximate_rect = (
+            approximate_rect_fn("autopilot_text")
+            if callable(approximate_rect_fn) and callable(rect_fn) else None
+        )
+        if approximate_rect is not None and approximate_rect != rect_fn("autopilot_text"):
+            approximate = layout.approximate_crop(image, "autopilot_text")
+            if approximate.size:
+                candidates.append(approximate)
+        recognized = False
+        failed = False
+        precise_failed = False
+        for index, crop in enumerate(candidates):
+            if crop.size == 0:
+                if index == 0:
+                    precise_failed = True
+                continue
+            try:
+                tokens = backend.recognize(crop)
+                recognized = True
+            except Exception:
+                logger.debug("自动驾驶状态文字 OCR 失败", exc_info=True)
+                failed = True
+                if index == 0:
+                    precise_failed = True
+                continue
+            for token in tokens:
+                text = "".join(str(getattr(token, "text", "") or "").split())
+                if "自动驾驶" not in text or float(
+                    getattr(token, "confidence", 0.0)
+                ) < 0.55:
+                    continue
+                if "启用" in text or "开启" in text:
+                    return True
+                points = np.asarray(getattr(token, "box", ()) or (), dtype=np.float32)
+                if points.shape != (4, 2):
+                    continue
+                x1, y1 = np.floor(points.min(axis=0)).astype(int)
+                x2, y2 = np.ceil(points.max(axis=0)).astype(int)
+                padding = max(2, int(round(layout.scale("autopilot_text") * 3)))
+                x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
+                x2 = min(crop.shape[1], x2 + padding + 1)
+                y2 = min(crop.shape[0], y2 + padding + 1)
+                glyphs = crop[y1:y2, x1:x2]
+                if glyphs.size == 0:
+                    continue
+                hsv = cv2.cvtColor(glyphs, cv2.COLOR_BGR2HSV)
+                green = (
+                    (hsv[:, :, 0] >= 35)
+                    & (hsv[:, :, 0] <= 90)
+                    & (hsv[:, :, 1] > 55)
+                    & (hsv[:, :, 2] > 80)
+                )
+                if int(np.count_nonzero(green)) >= 12 and float(np.mean(green)) >= 0.03:
+                    return True
+        if precise_failed:
+            # The authoritative crop could not be read; do not turn that
+            # uncertainty into a definitive "autopilot absent" result.
             return None
-        try:
-            tokens = backend.recognize(crop)
-        except Exception:
-            logger.debug("自动驾驶状态文字 OCR 失败", exc_info=True)
-            return None
-        for token in tokens:
-            text = "".join(str(getattr(token, "text", "") or "").split())
-            if "自动驾驶" not in text or float(
-                getattr(token, "confidence", 0.0)
-            ) < 0.55:
-                continue
-            if "启用" in text or "开启" in text:
-                return True
-            points = np.asarray(getattr(token, "box", ()) or (), dtype=np.float32)
-            if points.shape != (4, 2):
-                continue
-            x1, y1 = np.floor(points.min(axis=0)).astype(int)
-            x2, y2 = np.ceil(points.max(axis=0)).astype(int)
-            padding = max(2, int(round(layout.scale("autopilot_text") * 3)))
-            x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
-            x2 = min(crop.shape[1], x2 + padding + 1)
-            y2 = min(crop.shape[0], y2 + padding + 1)
-            glyphs = crop[y1:y2, x1:x2]
-            if glyphs.size == 0:
-                continue
-            hsv = cv2.cvtColor(glyphs, cv2.COLOR_BGR2HSV)
-            green = (
-                (hsv[:, :, 0] >= 35)
-                & (hsv[:, :, 0] <= 90)
-                & (hsv[:, :, 1] > 55)
-                & (hsv[:, :, 2] > 80)
-            )
-            if int(np.count_nonzero(green)) >= 12 and float(np.mean(green)) >= 0.03:
-                return True
-        return False
+        if recognized:
+            return False
+        return None if failed else False
 
     @staticmethod
     def detect_rudder_indicator(image) -> str:
@@ -542,6 +570,7 @@ class Vision:
             return None
         return min(central, key=lambda zone: math.dist(zone.center, map_center))
 
+    @perf.timed("玩家箭头", slow_ms=200)
     def find_player_pose_on_minimap(self, minimap):
         """Find a white player arrow, using range rings as supporting evidence.
 
@@ -1599,6 +1628,7 @@ class Vision:
         )
         return any(cv2.contourArea(contour) > 300 for contour in contours)
 
+    @perf.timed("小地图", slow_ms=200)
     def find_minimap(self, image):
         """Keep a canonical grid through jitter; confirm moved UI on fresh frames."""
         height, width = image.shape[:2]
@@ -1965,6 +1995,7 @@ class Vision:
         return min(best_run / max(area.shape[1], 1), 1.0)
 
     @staticmethod
+    @perf.timed("血量OCR")
     def read_health_fraction(image, backend) -> float | None:
         """OCR the player's numeric ``current / maximum`` HP.
 
@@ -1987,7 +2018,9 @@ class Vision:
             crop = image[y1:min(height, y2 + padding), x1:x2]
         if crop.size == 0:
             return None
-        def parse(candidate_image):
+        precise_tracking = {}
+
+        def parse(candidate_image, *, track=None):
             try:
                 tokens = list(backend.recognize(candidate_image) or ())
             except Exception:
@@ -2030,6 +2063,16 @@ class Vision:
                 if not math.isfinite(confidence) or confidence < .45:
                     continue
                 text = normalize(getattr(token, "text", ""))
+                if (track is not None
+                        and re.search(r"\d+\s*/\s*\d+", text)
+                        and not re.fullmatch(r"[1-4]\s*/\s*[1-4]", text.strip())):
+                    # A fraction-like token in the precise crop may be a
+                    # clipped/overlapping HP reading. Fail closed rather than
+                    # re-reading the same tokens against a larger crop, where
+                    # their boxes could suddenly appear valid. The engine
+                    # telegraph uses 1/4..3/4 and must not suppress the
+                    # health fallback when the ROIs overlap.
+                    track["fraction"] = True
                 if box.size and (box.shape != (4, 2) or not np.all(np.isfinite(box))):
                     continue
                 if confidence >= .70:
@@ -2118,25 +2161,55 @@ class Vision:
                                         min(item[1] for item in pieces)))
             return max(joined, key=lambda item: (item[1], item[0]), default=None)
 
-        parsed = parse(crop)
+        parsed = parse(crop, track=precise_tracking)
         if parsed is not None:
             return parsed[2]
         # Test/dummy backends often return a predetermined sequence per call.
         # Restrict visual retries to real OCR backends so deterministic unit
         # contracts remain one crop == one recognition call.
-        if not isinstance(backend, RapidOcrBackend):
-            return None
-        fallbacks = []
-        for variant in numeric_ocr_fallback_variants(crop):
-            candidate = parse(variant)
-            if candidate is None:
-                continue
-            fallbacks.append(candidate)
-            if candidate[1] >= 0.80:
-                break
-        if not fallbacks:
-            return None
-        return max(fallbacks, key=lambda item: (item[1], item[0]))[2]
+        if isinstance(backend, RapidOcrBackend):
+            fallbacks = []
+            for variant in numeric_ocr_fallback_variants(crop):
+                candidate = parse(variant)
+                if candidate is None:
+                    continue
+                fallbacks.append(candidate)
+                if candidate[1] >= 0.80:
+                    break
+            if fallbacks:
+                return max(fallbacks, key=lambda item: (item[1], item[0]))[2]
+        # The measured crop can be wrong when the client keeps a compact HUD
+        # on a large framebuffer or the scale anchor is missing. Retry the
+        # generous lower-left region before giving up; the fraction parser
+        # already rejects non-HP numbers such as gear labels and counts.
+        approximate_rect_fn = getattr(layout, "approximate_rect", None)
+        rect_fn = getattr(layout, "rect", None)
+        approximate_rect = (
+            approximate_rect_fn("health_text")
+            if callable(approximate_rect_fn) and callable(rect_fn) else None
+        )
+        if (approximate_rect is not None
+                and approximate_rect != rect_fn("health_text")
+                and not precise_tracking.get("fraction")):
+            approximate = layout.approximate_crop(image, "health_text")
+            if approximate.size:
+                parsed = parse(approximate)
+                if parsed is not None:
+                    return parsed[2]
+                if isinstance(backend, RapidOcrBackend):
+                    fallbacks = []
+                    for variant in numeric_ocr_fallback_variants(approximate):
+                        candidate = parse(variant)
+                        if candidate is None:
+                            continue
+                        fallbacks.append(candidate)
+                        if candidate[1] >= 0.80:
+                            break
+                    if fallbacks:
+                        return max(
+                            fallbacks, key=lambda item: (item[1], item[0])
+                        )[2]
+        return None
 
     def battle_ended(self, image):
         state = self.classify_screen(image)
@@ -3008,6 +3081,7 @@ class Vision:
         return True
 
     @staticmethod
+    @perf.timed("航速OCR")
     def read_speed_knots(image, backend) -> float | None:
         """Read the player's lower-left speed readout without using viewport targets."""
         if image is None or image.size == 0 or backend is None:
@@ -3015,7 +3089,8 @@ class Vision:
         height, width = image.shape[:2]
         # This is the speed/engine sector left of the ship, deliberately
         # outside the central target labels and lower-right minimap.
-        crop = detect_hud_layout(image).crop(image, "speed")
+        layout = detect_hud_layout(image)
+        crop = layout.crop(image, "speed")
         if crop.size == 0:
             return None
         def parse(candidate_image, *, require_engine=False):
@@ -3118,6 +3193,29 @@ class Vision:
                     break
         if fallbacks:
             return max(fallbacks)[1]
+        approximate_rect_fn = getattr(layout, "approximate_rect", None)
+        rect_fn = getattr(layout, "rect", None)
+        approximate_rect = (
+            approximate_rect_fn("speed")
+            if callable(approximate_rect_fn) and callable(rect_fn) else None
+        )
+        if approximate_rect is not None and approximate_rect != rect_fn("speed"):
+            approximate = layout.approximate_crop(image, "speed")
+            if approximate.size:
+                candidate = parse(approximate, require_engine=True)
+                if candidate is not None:
+                    return candidate[1]
+                if isinstance(backend, RapidOcrBackend):
+                    fallbacks = []
+                    for variant in numeric_ocr_fallback_variants(approximate):
+                        candidate = parse(variant, require_engine=True)
+                        if candidate is None:
+                            continue
+                        fallbacks.append(candidate)
+                        if candidate[0] >= 0.80:
+                            break
+                    if fallbacks:
+                        return max(fallbacks)[1]
         # This is a search domain only: OCR must establish a real telegraph
         # column before any speed can be accepted. Its measured glyph sizes
         # handle UI scaling and displacement independently of framebuffer size.
@@ -3126,6 +3224,7 @@ class Vision:
         return None if candidate is None else candidate[1]
 
     @staticmethod
+    @perf.timed("对局计时OCR")
     def read_battle_clock_seconds(image, backend) -> int | None:
         """Read the active match clock from the top HUD.
 
@@ -3136,13 +3235,21 @@ class Vision:
         """
         if image is None or image.size == 0 or backend is None:
             return None
-        height, width = image.shape[:2]
         # The match timer is the clock in the upper-right HUD. The two values
         # around the top-centre score are capture/base timers and must not be
         # accepted as evidence for a newly started round.
-        top_right = detect_hud_layout(image).crop(image, "clock")
-        if top_right.size == 0:
-            return None
+        layout = detect_hud_layout(image)
+        candidates = [layout.crop(image, "clock")]
+        approximate_rect_fn = getattr(layout, "approximate_rect", None)
+        rect_fn = getattr(layout, "rect", None)
+        approximate_rect = (
+            approximate_rect_fn("clock")
+            if callable(approximate_rect_fn) and callable(rect_fn) else None
+        )
+        if approximate_rect is not None and approximate_rect != rect_fn("clock"):
+            approximate = layout.approximate_crop(image, "clock")
+            if approximate.size:
+                candidates.append(approximate)
 
         pattern = re.compile(r"(?<!\d)([0-2]?\d)\s*[:：\.]\s*([0-5]\d)(?!\d)")
 
@@ -3167,20 +3274,25 @@ class Vision:
             # Two different timers in one crop cannot authorize a match start.
             return max(candidates, default=None) if len({item[1] for item in candidates}) <= 1 else None
 
-        parsed = parse(top_right)
-        if parsed is not None:
-            return parsed[1]
-        if not isinstance(backend, RapidOcrBackend):
-            return None
-        fallbacks = []
-        for variant in numeric_ocr_fallback_variants(top_right):
-            candidate = parse(variant)
-            if candidate is None:
+        for candidate_image in candidates:
+            if candidate_image.size == 0:
                 continue
-            fallbacks.append(candidate)
-            if candidate[0] >= 0.80:
-                break
-        return None if not fallbacks else max(fallbacks)[1]
+            parsed = parse(candidate_image)
+            if parsed is not None:
+                return parsed[1]
+            if not isinstance(backend, RapidOcrBackend):
+                continue
+            fallbacks = []
+            for variant in numeric_ocr_fallback_variants(candidate_image):
+                candidate = parse(variant)
+                if candidate is None:
+                    continue
+                fallbacks.append(candidate)
+                if candidate[0] >= 0.80:
+                    break
+            if fallbacks:
+                return max(fallbacks)[1]
+        return None
 
     def in_exit_confirmation(self, image):
         button = self._crop_region(image, EXIT_CONTINUE_BUTTON)
@@ -3354,6 +3466,7 @@ class Vision:
             and edge_ratio > 0.02
         )
 
+    @perf.timed("场景识别", slow_ms=300)
     def classify_screen(self, image):
         """Classify only states with positive UI evidence; never infer by exclusion."""
         if image is None or image.size == 0:
