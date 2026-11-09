@@ -95,6 +95,48 @@ def finish_blockage_trace(bot, label, image, state, *, attempt=0, outcome="resol
         traces.pop(label, None)
 
 
+def record_battle_start_diagnostic(bot, image, phase, elapsed):
+    """Save the existing game frame and clock-region OCR when start stalls."""
+    if image is None or not getattr(image, "size", 0):
+        return False
+    trace = blockage_trace(bot, "battle_start_unconfirmed")
+    if trace.root is None or trace.count >= trace.maximum:
+        return False
+    now = time.monotonic()
+    last = getattr(bot, "_battle_start_diagnostic_at", None)
+    if last is not None and now - last < 15.0:
+        return False
+    bot._battle_start_diagnostic_at = now
+    height, width = image.shape[:2]
+    x1, y1 = round(width * .66), 0
+    crop = image[y1:round(height * .18), x1:]
+    details = {"phase": getattr(phase, "value", str(phase)),
+               "wait_seconds": round(elapsed, 2),
+               "ocr_region_xyxy": [x1, y1, width, round(height * .18)],
+               "ocr_tokens": []}
+    backend = getattr(getattr(bot, "distance_reader", None), "backend", None)
+    if backend is None:
+        details["ocr_error"] = "backend_unavailable"
+    else:
+        started = time.perf_counter()
+        try:
+            for token in list(backend.recognize(crop) or ())[:100]:
+                box = getattr(token, "box", None)
+                details["ocr_tokens"].append({
+                    "text": str(getattr(token, "text", "")),
+                    "confidence": float(getattr(token, "confidence", 0)),
+                    "box": [[float(p[0]) + x1, float(p[1]) + y1]
+                            for p in (() if box is None else box)],
+                })
+        except Exception as error:
+            details["ocr_error"] = f"{type(error).__name__}: {error}"
+        finally:
+            details["ocr_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            details["ocr_provider"] = str(getattr(backend, "execution_provider", "unknown"))
+    return trace.record(image, state=ScreenState.BATTLE, action="start_unconfirmed",
+                        attempt=0, details=details)
+
+
 def recovery_escape_hint(bot, image, state):
     """Authorize generic recovery only for a visible corner close hint."""
     if state not in {ScreenState.UNKNOWN, ScreenState.LOADING}:
@@ -1631,13 +1673,21 @@ def wait_for_battle(
                             bot, "_battle_phase_preparing_since", None,
                         )
                         if phase_since is None:
-                            bot._battle_phase_preparing_since = phase_since = phase_now
+                            phase_since = getattr(bot, "_battle_phase_unconfirmed_since", None)
+                            if phase_since is None:
+                                phase_since = phase_now
+                            bot._battle_phase_preparing_since = phase_since
                     else:
                         phase_since = getattr(
                             bot, "_battle_phase_unconfirmed_since", None,
                         )
                         if phase_since is None:
-                            bot._battle_phase_unconfirmed_since = phase_since = phase_now
+                            phase_since = getattr(bot, "_battle_phase_preparing_since", None)
+                            if phase_since is None:
+                                phase_since = phase_now
+                            bot._battle_phase_unconfirmed_since = phase_since
+                    if phase_now - phase_since >= 12.0:
+                        record_battle_start_diagnostic(bot, image, phase, phase_now - phase_since)
                     if (
                         phase_now - phase_since >= fallback_seconds
                         and not loading_start_confirmed(bot, image)
@@ -1656,10 +1706,8 @@ def wait_for_battle(
                                 phase_now - phase_since,
                             )
                         else:
-                            if phase == BattlePhase.PREPARING:
-                                bot._battle_phase_preparing_since = phase_now
-                            else:
-                                bot._battle_phase_unconfirmed_since = phase_now
+                            bot._battle_phase_preparing_since = phase_now
+                            bot._battle_phase_unconfirmed_since = phase_now
                             logger.warning(
                                 "等待战斗 HUD 时计时 OCR 不可用超过 %.0f 秒，"
                                 "兜底证据不足（%s）；继续只读观察",
@@ -1921,12 +1969,17 @@ def run_battle(
                 # to back out instead of looping.
                 since = getattr(bot, "_battle_phase_unconfirmed_since", None)
                 if since is None:
-                    bot._battle_phase_unconfirmed_since = since = now_monotonic
+                    since = getattr(bot, "_battle_phase_preparing_since", None)
+                    if since is None:
+                        since = now_monotonic
+                    bot._battle_phase_unconfirmed_since = since
                 wait_seconds = max(8.0, float(
                     strategy.get(
                         "battle_phase_unconfirmed_escape_seconds", 12.0,
                     )
                 ))
+                if now_monotonic - since >= 12.0:
+                    record_battle_start_diagnostic(bot, control_frame, phase, now_monotonic - since)
                 if now_monotonic - since >= fallback_seconds:
                     ready, reason = battle_phase_clock_fallback_ready(
                         bot, control_frame
@@ -1946,6 +1999,7 @@ def run_battle(
                         # Retry the bounded observation later instead of
                         # logging and reclassifying every control frame.
                         bot._battle_phase_unconfirmed_since = now_monotonic
+                        bot._battle_phase_preparing_since = now_monotonic
                         logger.warning(
                             "战斗计时 OCR 不可用超过 %.0f 秒，但兜底证据不足"
                             "（%s）；保持只读，稍后重新检查",
@@ -1986,7 +2040,12 @@ def run_battle(
                 # match. The same independent HUD/pose proof unlocks driving.
                 prep_since = getattr(bot, "_battle_phase_preparing_since", None)
                 if prep_since is None:
-                    bot._battle_phase_preparing_since = prep_since = now_monotonic
+                    prep_since = getattr(bot, "_battle_phase_unconfirmed_since", None)
+                    if prep_since is None:
+                        prep_since = now_monotonic
+                    bot._battle_phase_preparing_since = prep_since
+                if now_monotonic - prep_since >= 12.0:
+                    record_battle_start_diagnostic(bot, control_frame, phase, now_monotonic - prep_since)
                 if now_monotonic - prep_since >= fallback_seconds:
                     ready, reason = battle_phase_clock_fallback_ready(
                         bot, control_frame
@@ -2003,6 +2062,7 @@ def run_battle(
                         )
                     else:
                         bot._battle_phase_preparing_since = now_monotonic
+                        bot._battle_phase_unconfirmed_since = now_monotonic
                         logger.warning(
                             "战斗计时连续 %.0f 秒未推进，但兜底证据不足"
                             "（%s）；保持只读，稍后重新检查",
@@ -2015,6 +2075,9 @@ def run_battle(
                     logger.info("HUD 已出现但正式开战未确认，保留本局且不发送驾驶指令")
                     return "resume_state"
             if phase == BattlePhase.ACTIVE:
+                finish_blockage_trace(bot, "battle_start_unconfirmed", control_frame,
+                                      control_state, outcome="resolved")
+                bot._battle_start_diagnostic_at = None
                 bot._battle_phase_unconfirmed_since = None
                 bot._battle_phase_preparing_since = None
                 bot._battle_phase_escape_attempts = 0

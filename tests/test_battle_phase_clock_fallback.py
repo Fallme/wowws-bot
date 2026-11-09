@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+from unittest.mock import Mock
 
 import main
 from core.battle_phase import BattlePhase, BattlePhaseTracker
@@ -78,6 +79,36 @@ def test_clock_fallback_rejects_corner_escape_overlay(monkeypatch):
     ) == (False, "corner_escape_hint")
 
 
+def test_alternating_unknown_and_preparing_preserves_fallback_timer(monkeypatch):
+    bot = SimpleNamespace(
+        hwnd=1, intervention=None, gamepad=Mock(), strategy={},
+        vision=SimpleNamespace(grab=Mock(return_value=object()),
+                               read_battle_clock_seconds=Mock()),
+        distance_reader=SimpleNamespace(backend=object()),
+    )
+    now = [100.0]
+    monkeypatch.setattr(main.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(main, "ensure_bound_game_foreground", lambda *_: True)
+    monkeypatch.setattr(main, "normalize_tactical_map_overlay", lambda *_: True)
+    monkeypatch.setattr(main, "classify_battle_continuity_screen", lambda *_: ScreenState.BATTLE)
+    monkeypatch.setattr(main, "loading_start_confirmed", lambda *_: False)
+    phases = iter([BattlePhase.UNKNOWN, BattlePhase.PREPARING, BattlePhase.UNKNOWN])
+    monkeypatch.setattr(main, "observe_battle_phase", lambda *_: next(phases))
+    monkeypatch.setattr(main, "recovery_escape_hint", lambda *_: None)
+    fallback = Mock(return_value=(False, "no_live_anchor"))
+    monkeypatch.setattr(main, "battle_phase_clock_fallback_ready", fallback)
+
+    assert main.run_battle(bot, resume_existing=True) == "resume_state"
+    now[0] = 120.0
+    assert main.run_battle(bot, resume_existing=True) == "resume_state"
+    now[0] = 146.0
+    assert main.run_battle(bot, resume_existing=True) == "resume_state"
+    fallback.assert_called_once()
+    assert bot._battle_phase_unconfirmed_since == 146.0
+    assert bot._battle_phase_preparing_since == 146.0
+    assert not bot.gamepad.mock_calls
+
+
 def test_wait_for_battle_uses_fallback_instead_of_waiting_180_seconds(
     monkeypatch,
 ):
@@ -114,6 +145,31 @@ def test_wait_for_battle_uses_fallback_instead_of_waiting_180_seconds(
         bot, timeout=60.0, loading_already_seen=True
     )
     assert clock["now"] >= 45.0
+    assert bot._battle_phase_assumed_active is True
+
+
+def test_wait_for_battle_keeps_timer_when_phase_alternates(monkeypatch):
+    frame = np.zeros((90, 160, 3), np.uint8)
+    bot = SimpleNamespace(
+        hwnd=1, vision=SimpleNamespace(grab=lambda *a, **k: frame,
+                                      read_battle_clock_seconds=lambda *_: None),
+        distance_reader=SimpleNamespace(backend=object()),
+        gamepad=SimpleNamespace(), intervention=None, strategy={},
+    )
+    clock = {"now": 0.0, "count": 0}
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + float(seconds)))
+    monkeypatch.setattr(main, "ensure_capture_foreground", lambda *_: True)
+    monkeypatch.setattr(main, "classify_battle_continuity_screen", lambda *_: ScreenState.BATTLE)
+    monkeypatch.setattr(main, "loading_start_confirmed", lambda *_: False)
+    monkeypatch.setattr(main, "battle_phase_clock_fallback_ready", lambda *_: (True, ""))
+
+    def alternating(*_):
+        clock["count"] += 1
+        return BattlePhase.UNKNOWN if clock["count"] % 2 else BattlePhase.PREPARING
+
+    monkeypatch.setattr(main, "observe_battle_phase", alternating)
+    assert main.wait_for_battle(bot, timeout=60.0, loading_already_seen=True)
     assert bot._battle_phase_assumed_active is True
 
 
